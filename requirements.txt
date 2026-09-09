@@ -1,6 +1,8 @@
 nflreadpy>=0.1.0
 pyarrow>=14.0.0
+polars>=0.20.0
 pandas>=2.0.0
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
 google-genai>=0.1.1
+xgboost>=2.0.0
