@@ -41,19 +41,23 @@ FEATURES = [
     "market_home_prob",
 ]
 
-# 3. Pull Current Season Data for Feature Engineering
+# 3. Pull Play-by-Play & Schedule Data
 CURRENT_SEASON = 2026
-print(f"Loading {CURRENT_SEASON} play-by-play and schedule data...")
+DATA_SEASON = 2025  # Fallback to the latest available completed season for baseline stats
 
-pbp = nfl.load_pbp(seasons=[CURRENT_SEASON]).to_pandas()
-schedules = nfl.load_schedules(seasons=[CURRENT_SEASON]).to_pandas()
+print(f"Loading NFL data (Schedule: {CURRENT_SEASON}, Historical PBP: {DATA_SEASON})...")
 
-pbp_scrimmage = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
-pbp_scrimmage["is_late_down"] = (
-    pbp_scrimmage["down"].isin([3, 4]).astype(int)
-    if "down" in pbp_scrimmage.columns
-    else 0
-)
+try:
+    schedules = nfl.load_schedules(seasons=[CURRENT_SEASON]).to_pandas()
+except Exception:
+    schedules = nfl.load_schedules(seasons=[DATA_SEASON]).to_pandas()
+
+try:
+    pbp = nfl.load_pbp(seasons=[DATA_SEASON]).to_pandas()
+except Exception as e:
+    print(f"Notice: Could not load PBP for {DATA_SEASON}: {e}")
+    pbp = pd.DataFrame()
+
 
 metric_cols = [
     "off_dropback_epa",
