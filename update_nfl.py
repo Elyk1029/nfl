@@ -26,10 +26,10 @@ if os.path.exists(MODEL_FILE):
   print("Loaded nfl_model.json successfully.")
 else:
   raise FileNotFoundError(
-      f"Model file '{MODEL_FILE}' not found in the root directory."
+      f"Model file '{MODEL_FILE}' not found in root directory."
   )
 
-# Features expected by the self-trained walk-forward model
+# 8 Features required by the trained model
 FEATURES = [
     "net_pass_edge",
     "net_rush_edge",
@@ -41,23 +41,33 @@ FEATURES = [
     "market_home_prob",
 ]
 
-# 3. Pull Play-by-Play & Schedule Data
-CURRENT_SEASON = 2026
-DATA_SEASON = 2025  # Fallback to the latest available completed season for baseline stats
+# 3. Pull Schedule & Baseline Play-by-Play Data
+# 2025 provides complete historical efficiency; load_schedules pulls recent/upcoming lines
+DATA_SEASON = 2025
 
-print(f"Loading NFL data (Schedule: {CURRENT_SEASON}, Historical PBP: {DATA_SEASON})...")
+print(f"Loading NFL data (Historical baseline: {DATA_SEASON})...")
 
 try:
-    schedules = nfl.load_schedules(seasons=[CURRENT_SEASON]).to_pandas()
+  schedules = nfl.load_schedules(seasons=True).to_pandas()
 except Exception:
-    schedules = nfl.load_schedules(seasons=[DATA_SEASON]).to_pandas()
+  schedules = nfl.load_schedules(seasons=[DATA_SEASON]).to_pandas()
 
 try:
-    pbp = nfl.load_pbp(seasons=[DATA_SEASON]).to_pandas()
+  pbp = nfl.load_pbp(seasons=[DATA_SEASON]).to_pandas()
 except Exception as e:
-    print(f"Notice: Could not load PBP for {DATA_SEASON}: {e}")
-    pbp = pd.DataFrame()
+  print(f"Notice: Could not load PBP for {DATA_SEASON}: {e}")
+  pbp = pd.DataFrame()
 
+# Clean scrimmage plays and define down leverage
+if not pbp.empty:
+  pbp_scrimmage = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
+  pbp_scrimmage["is_late_down"] = (
+      pbp_scrimmage["down"].isin([3, 4]).astype(int)
+      if "down" in pbp_scrimmage.columns
+      else 0
+  )
+else:
+  pbp_scrimmage = pd.DataFrame()
 
 metric_cols = [
     "off_dropback_epa",
@@ -145,7 +155,12 @@ else:
   )
 
 # 4. Filter Upcoming Unplayed Matchups
-upcoming = schedules[schedules["result"].isna()].head(3).copy()
+upcoming = (
+    schedules[schedules["result"].isna()]
+    .sort_values(["season", "week"])
+    .head(3)
+    .copy()
+)
 
 system_prompt = (
     "You are a quantitative sports handicapper. You are evaluating an upcoming"
@@ -171,12 +186,17 @@ for _, game in upcoming.iterrows():
       (team_perf["team"] == away_team) & (team_perf["week"] == week_num)
   ]
 
+  # Fallback to team's overall recent averages if current week is unplayed
+  if home_row.empty:
+    home_row = team_perf[team_perf["team"] == home_team].tail(1)
+  if away_row.empty:
+    away_row = team_perf[team_perf["team"] == away_team].tail(1)
+
   def get_metric(df, col_name, default=0.0):
     if not df.empty and pd.notna(df[col_name].values[0]):
       return float(df[col_name].values[0])
     return default
 
-  # Situational & Contextual Features
   home_rest = float(game["home_rest"]) if pd.notna(game["home_rest"]) else 7.0
   away_rest = float(game["away_rest"]) if pd.notna(game["away_rest"]) else 7.0
   rest_diff = home_rest - away_rest
