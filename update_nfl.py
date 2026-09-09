@@ -8,7 +8,7 @@ import pandas as pd
 from sqlalchemy import create_engine
 import xgboost as xgb
 
-# 1. Environment & API setup
+# 1. Environment & API Setup
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
 
@@ -18,7 +18,7 @@ if not db_url or not gemini_key:
 engine = create_engine(db_url)
 client = genai.Client(api_key=gemini_key)
 
-# 2. Load trained XGBoost model
+# 2. Load Trained XGBoost Model
 MODEL_FILE = "nfl_model.json"
 model = xgb.XGBClassifier()
 if os.path.exists(MODEL_FILE):
@@ -26,50 +26,130 @@ if os.path.exists(MODEL_FILE):
   print("Loaded nfl_model.json successfully.")
 else:
   raise FileNotFoundError(
-      f"Model file {MODEL_FILE} not found in root directory."
+      f"Model file '{MODEL_FILE}' not found in the root directory."
   )
 
-# 3. Pull recent play-by-play for rolling feature engineering
-print("Calculating current rolling EPA metrics...")
-current_season = 2026
-pbp = nfl.load_pbp(seasons=[current_season]).to_pandas()
-schedules = nfl.load_schedules(seasons=[current_season]).to_pandas()
+# Features expected by the self-trained walk-forward model
+FEATURES = [
+    "net_pass_edge",
+    "net_rush_edge",
+    "net_late_down_edge",
+    "diff_success",
+    "diff_explosive",
+    "rest_diff",
+    "is_divisional",
+    "market_home_prob",
+]
 
-# Filter regular pass/run plays
-pbp_clean = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
+# 3. Pull Current Season Data for Feature Engineering
+CURRENT_SEASON = 2026
+print(f"Loading {CURRENT_SEASON} play-by-play and schedule data...")
 
-if not pbp_clean.empty:
-  team_stats = (
-      pbp_clean.groupby(["week", "posteam"])
-      .agg(off_epa=("epa", "mean"), succ_rate=("success", "mean"))
+pbp = nfl.load_pbp(seasons=[CURRENT_SEASON]).to_pandas()
+schedules = nfl.load_schedules(seasons=[CURRENT_SEASON]).to_pandas()
+
+pbp_scrimmage = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
+pbp_scrimmage["is_late_down"] = (
+    pbp_scrimmage["down"].isin([3, 4]).astype(int)
+    if "down" in pbp_scrimmage.columns
+    else 0
+)
+
+metric_cols = [
+    "off_dropback_epa",
+    "off_rush_epa",
+    "off_success",
+    "off_late_down_epa",
+    "off_explosive",
+    "def_dropback_epa",
+    "def_rush_epa",
+    "def_success",
+    "def_late_down_epa",
+]
+
+if not pbp_scrimmage.empty:
+  # Aggregate team offensive performance
+  off_stats = (
+      pbp_scrimmage.groupby(["week", "posteam"])
+      .agg(
+          off_dropback_epa=(
+              "epa",
+              lambda x: (
+                  x[pbp_scrimmage.loc[x.index, "play_type"] == "pass"].mean()
+              ),
+          ),
+          off_rush_epa=(
+              "epa",
+              lambda x: (
+                  x[pbp_scrimmage.loc[x.index, "play_type"] == "run"].mean()
+              ),
+          ),
+          off_success=("success", "mean"),
+          off_late_down_epa=(
+              "epa",
+              lambda x: (
+                  x[pbp_scrimmage.loc[x.index, "is_late_down"] == 1].mean()
+              ),
+          ),
+          off_explosive=("yards_gained", "std"),
+      )
       .reset_index()
       .rename(columns={"posteam": "team"})
   )
 
-  # Compute strictly lagged rolling metrics
-  team_stats.sort_values(["team", "week"], inplace=True)
-  team_stats["roll_off_epa"] = team_stats.groupby("team")["off_epa"].transform(
-      lambda x: x.shift(1).ewm(span=4, min_periods=1).mean()
-  )
-  team_stats["roll_succ_rate"] = team_stats.groupby("team")[
-      "succ_rate"
-  ].transform(lambda x: x.shift(1).ewm(span=4, min_periods=1).mean())
-else:
-  team_stats = pd.DataFrame(
-      columns=["week", "team", "roll_off_epa", "roll_succ_rate"]
+  # Aggregate defensive performance allowed
+  def_stats = (
+      pbp_scrimmage.groupby(["week", "defteam"])
+      .agg(
+          def_dropback_epa=(
+              "epa",
+              lambda x: (
+                  x[pbp_scrimmage.loc[x.index, "play_type"] == "pass"].mean()
+              ),
+          ),
+          def_rush_epa=(
+              "epa",
+              lambda x: (
+                  x[pbp_scrimmage.loc[x.index, "play_type"] == "run"].mean()
+              ),
+          ),
+          def_success=("success", "mean"),
+          def_late_down_epa=(
+              "epa",
+              lambda x: (
+                  x[pbp_scrimmage.loc[x.index, "is_late_down"] == 1].mean()
+              ),
+          ),
+      )
+      .reset_index()
+      .rename(columns={"defteam": "team"})
   )
 
-# 4. Target upcoming unplayed matchups
+  team_perf = pd.merge(
+      off_stats, def_stats, on=["week", "team"], how="outer"
+  ).fillna(0)
+  team_perf.sort_values(["team", "week"], inplace=True)
+
+  # Strictly lagged 6-game rolling window
+  for col in metric_cols:
+    team_perf[f"roll_{col}"] = team_perf.groupby("team")[col].transform(
+        lambda x: x.shift(1).ewm(span=6, min_periods=1).mean()
+    )
+else:
+  team_perf = pd.DataFrame(
+      columns=["week", "team"] + [f"roll_{c}" for c in metric_cols]
+  )
+
+# 4. Filter Upcoming Unplayed Matchups
 upcoming = schedules[schedules["result"].isna()].head(3).copy()
 
 system_prompt = (
-    "You are a quantitative NFL analyst. You will receive market lines "
-    "along with win probabilities generated by a proprietary XGBoost model "
-    "trained on rolling EPA/play differentials. Synthesize the statistical model "
-    "output with matchup context. Return a structured breakdown:\n"
-    "1. Model Edge (Compare model probability to spread/moneyline)\n"
-    "2. Key Mismatch\n"
-    "3. Value Lean"
+    "You are a quantitative sports handicapper. You are evaluating an upcoming"
+    " NFL matchup using both Vegas market lines and a proprietary machine"
+    " learning model's projected win probability. Compare the model's"
+    " projection against the market line, highlight key situational and trench"
+    " mismatches, and identify whether there is true betting value on the"
+    " Spread or Total."
 )
 
 records = []
@@ -79,57 +159,109 @@ for _, game in upcoming.iterrows():
   matchup = f"{away_team} @ {home_team}"
   week_num = int(game["week"]) if pd.notna(game["week"]) else 1
 
-  # Extract rolling features for home and away
-  home_metrics = team_stats[
-      (team_stats["team"] == home_team) & (team_stats["week"] == week_num)
+  # Extract lagged rolling stats
+  home_row = team_perf[
+      (team_perf["team"] == home_team) & (team_perf["week"] == week_num)
   ]
-  away_metrics = team_stats[
-      (team_stats["team"] == away_team) & (team_stats["week"] == week_num)
+  away_row = team_perf[
+      (team_perf["team"] == away_team) & (team_perf["week"] == week_num)
   ]
 
-  home_epa = (
-      home_metrics["roll_off_epa"].values[0] if not home_metrics.empty else 0.0
-  )
-  home_succ = (
-      home_metrics["roll_succ_rate"].values[0]
-      if not home_metrics.empty
-      else 0.45
-  )
-  away_epa = (
-      away_metrics["roll_off_epa"].values[0] if not away_metrics.empty else 0.0
-  )
-  away_succ = (
-      away_metrics["roll_succ_rate"].values[0]
-      if not away_metrics.empty
-      else 0.45
+  def get_metric(df, col_name, default=0.0):
+    if not df.empty and pd.notna(df[col_name].values[0]):
+      return float(df[col_name].values[0])
+    return default
+
+  # Situational & Contextual Features
+  home_rest = float(game["home_rest"]) if pd.notna(game["home_rest"]) else 7.0
+  away_rest = float(game["away_rest"]) if pd.notna(game["away_rest"]) else 7.0
+  rest_diff = home_rest - away_rest
+  is_divisional = (
+      int(game["div_game"]) if pd.notna(game.get("div_game")) else 0
   )
 
-  diff_epa = float(home_epa - away_epa)
-  diff_succ = float(home_succ - away_succ)
-
-  # Run XGBoost inference
-  feature_input = pd.DataFrame(
-      [[diff_epa, diff_succ]], columns=["diff_epa", "diff_succ"]
+  spread_line = (
+      float(game["spread_line"]) if pd.notna(game["spread_line"]) else 0.0
   )
-  home_win_prob = float(model.predict_proba(feature_input)[0][1])
+  total_line = (
+      float(game["total_line"]) if pd.notna(game["total_line"]) else 44.0
+  )
 
-  print(f"Matchup: {matchup} | Model Home Win Prob: {home_win_prob:.1%}")
+  # Market implied win probability based on closing spread
+  market_home_prob = 1 / (1 + 10 ** (spread_line * 0.035))
 
+  # Metric Differentials matching the 8-feature training model
+  net_pass_edge = (
+      get_metric(home_row, "roll_off_dropback_epa")
+      - get_metric(away_row, "roll_def_dropback_epa")
+  ) - (
+      get_metric(away_row, "roll_off_dropback_epa")
+      - get_metric(home_row, "roll_def_dropback_epa")
+  )
+
+  net_rush_edge = (
+      get_metric(home_row, "roll_off_rush_epa")
+      - get_metric(away_row, "roll_def_rush_epa")
+  ) - (
+      get_metric(away_row, "roll_off_rush_epa")
+      - get_metric(home_row, "roll_def_rush_epa")
+  )
+
+  net_late_down_edge = (
+      get_metric(home_row, "roll_off_late_down_epa")
+      - get_metric(away_row, "roll_def_late_down_epa")
+  ) - (
+      get_metric(away_row, "roll_off_late_down_epa")
+      - get_metric(home_row, "roll_def_late_down_epa")
+  )
+
+  diff_success = get_metric(
+      home_row, "roll_off_success", 0.45
+  ) - get_metric(away_row, "roll_off_success", 0.45)
+  diff_explosive = get_metric(
+      home_row, "roll_off_explosive", 8.0
+  ) - get_metric(away_row, "roll_off_explosive", 8.0)
+
+  # Build Feature Vector
+  feature_row = pd.DataFrame(
+      [[
+          net_pass_edge,
+          net_rush_edge,
+          net_late_down_edge,
+          diff_success,
+          diff_explosive,
+          rest_diff,
+          is_divisional,
+          market_home_prob,
+      ]],
+      columns=FEATURES,
+  )
+
+  # Model Prediction
+  model_home_prob = float(model.predict_proba(feature_row)[0][1])
+
+  print(
+      f"{matchup} | Model Win Prob: {model_home_prob:.1%} | Market Implied:"
+      f" {market_home_prob:.1%}"
+  )
+
+  # Payload for Gemini
   payload = {
       "matchup": matchup,
       "week": week_num,
-      "spread_line": (
-          float(game["spread_line"]) if pd.notna(game["spread_line"]) else 0.0
-      ),
-      "total_line": (
-          float(game["total_line"]) if pd.notna(game["total_line"]) else 0.0
-      ),
-      "model_metrics": {
-          "home_team": home_team,
-          "home_win_probability": f"{home_win_prob:.1%}",
-          "away_win_probability": f"{(1 - home_win_prob):.1%}",
-          "epa_differential": round(diff_epa, 4),
-          "success_rate_differential": round(diff_succ, 4),
+      "spread_line": spread_line,
+      "total_line": total_line,
+      "market_home_win_probability": f"{market_home_prob:.1%}",
+      "model_projections": {
+          "home_win_probability": f"{model_home_prob:.1%}",
+          "away_win_probability": f"{(1 - model_home_prob):.1%}",
+          "probability_edge_vs_market": (
+              f"{(model_home_prob - market_home_prob):+.1%}"
+          ),
+          "net_pass_edge": round(net_pass_edge, 4),
+          "net_rush_edge": round(net_rush_edge, 4),
+          "net_late_down_edge": round(net_late_down_edge, 4),
+          "success_rate_edge": round(diff_success, 4),
       },
   }
 
@@ -145,15 +277,15 @@ for _, game in upcoming.iterrows():
       "game_id": str(game["game_id"]),
       "week": week_num,
       "matchup": matchup,
-      "home_win_prob": home_win_prob,
+      "home_win_prob": model_home_prob,
+      "market_prob": market_home_prob,
       "analysis": response.text,
   })
 
-# 5. Overwrite/Insert into Neon DB
+# 5. Overwrite / Insert Into Neon DB
 if records:
   df_results = pd.DataFrame(records)
-  # Writes results directly to your Neon table
   df_results.to_sql(
       "nfl_weekly_analysis", engine, if_exists="append", index=False
   )
-  print("Neon database updated with model-backed predictions.")
+  print("Neon database updated successfully with model-backed predictions.")
