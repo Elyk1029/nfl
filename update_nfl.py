@@ -164,8 +164,10 @@ for _, game in upcoming.iterrows():
     home_row = team_perf[(team_perf["team"] == home_team) & (team_perf["week"] == week_num)]
     away_row = team_perf[(team_perf["team"] == away_team) & (team_perf["week"] == week_num)]
 
-    if home_row.empty: home_row = team_perf[team_perf["team"] == home_team].tail(1)
-    if away_row.empty: away_row = team_perf[team_perf["team"] == away_team].tail(1)
+    if home_row.empty: 
+        home_row = team_perf[team_perf["team"] == home_team].tail(1)
+    if away_row.empty: 
+        away_row = team_perf[team_perf["team"] == away_team].tail(1)
 
     def get_metric(df, col_name, default=0.0):
         if not df.empty and pd.notna(df[col_name].values[0]):
@@ -265,5 +267,3 @@ if records:
     df_results = pd.DataFrame(records)
     df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
     print("Neon database updated successfully with JSON model-backed predictions.")
-  )
-  print("Neon database updated successfully with model-backed predictions.")
