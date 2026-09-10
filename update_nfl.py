@@ -7,7 +7,7 @@ from google.genai import types
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import xgboost as xgb
 
 # 1. Environment & API Setup
@@ -157,7 +157,7 @@ def get_devigged_market_probs(spread_line, home_ml=None, away_ml=None):
         p_away = 100 / (away_ml + 100) if away_ml > 0 else abs(away_ml) / (abs(away_ml) + 100)
         return p_home / (p_home + p_away)
     
-    # Precise empirical logistic mapping calibrated on 2018-2025 NFL regular season lines
+    # Precise empirical logistic mapping calibrated on modern NFL regular season lines
     # spread_line is Home Team point line (e.g. -7 means Home is favored by 7)
     return 1.0 / (1.0 + 10.0 ** (spread_line / 14.5))
 
@@ -165,11 +165,9 @@ def calculate_spread_cover_edge(model_home_win_prob, spread_line):
     """
     Evaluates probability of covering spread accounting for NFL key numbers.
     """
-    # Expected victory margin from model win probability
     projected_margin = -14.5 * math.log10((1.0 - model_home_win_prob) / max(0.001, model_home_win_prob))
     margin_diff = projected_margin - (-spread_line)
     
-    # Base cover probability using logistic CDF adjusted for push rate on integer spreads
     base_cover = 1.0 / (1.0 + math.exp(-margin_diff / 5.2))
     
     abs_spread = round(abs(spread_line))
@@ -269,7 +267,6 @@ for _, game in upcoming.iterrows():
     ml_edge = model_home_prob - market_home_prob
 
     home_cover_prob, push_prob = calculate_spread_cover_edge(model_home_prob, spread_line)
-    # Edge against standard 50.0% spread break-even
     spread_edge = home_cover_prob - 0.50
     kelly_units = calculate_kelly_fraction(home_cover_prob if spread_edge > 0 else (1.0 - home_cover_prob - push_prob))
 
@@ -387,6 +384,9 @@ Output JSON Schema:
 if records:
     df_results = pd.DataFrame(records)
     with engine.begin() as conn:
-        conn.execute("DELETE FROM nfl_weekly_analysis WHERE week = %s", (week_num,))
+        conn.execute(
+            text("DELETE FROM nfl_weekly_analysis WHERE week = :week_num"),
+            {"week_num": week_num}
+        )
     df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
     print("Pipeline finished: Database updated with institutional edge models.")
