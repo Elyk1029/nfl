@@ -46,7 +46,7 @@ NFL_KEY_PUSH_RATES = {
     2: 0.036
 }
 
-# Standardize NFL team abbreviations across nflreadpy dataframes
+# Standardize NFL team abbreviations
 TEAM_ABBR_MAP = {
     "LAR": "LA",
     "WSH": "WAS",
@@ -63,41 +63,41 @@ def clean_team_abbr(team_str):
     return TEAM_ABBR_MAP.get(team_str, team_str)
 
 BASE_STAFF_MAP = {
-    "ARI": {"HC": "Jonathan Gannon", "OC": "Drew Petzing", "DC": "Nick Rallis", "Scheme": "Multiple / Split-safety"},
-    "ATL": {"HC": "Raheem Morris", "OC": "Zac Robinson", "DC": "Jimmy Lake", "Scheme": "3-4 / Fangio-adjacent Zone"},
-    "BAL": {"HC": "John Harbaugh", "OC": "Todd Monken", "DC": "Zach Orr", "Scheme": "Multiple / Simulated Pressures"},
-    "BUF": {"HC": "Sean McDermott", "OC": "Joe Brady", "DC": "Bobby Babich", "Scheme": "4-2-5 Nickel base Cover 2/4"},
+    "ARI": {"HC": "Mike LaFleur", "OC": "Nathaniel Hackett", "DC": "Nick Rallis", "Scheme": "Multiple / Split-safety"},
+    "ATL": {"HC": "Kevin Stefanski", "OC": "Tommy Rees", "DC": "Jimmy Lake", "Scheme": "3-4 / Fangio-adjacent Zone"},
+    "BAL": {"HC": "Jesse Minter", "OC": "Declan Doyle", "DC": "Anthony Weaver", "Scheme": "Multiple / Ravens Disguised Shell"},
+    "BUF": {"HC": "Joe Brady", "OC": "Pete Carmichael Jr.", "DC": "Jim Leonhard", "Scheme": "4-2-5 Nickel Base Cover 2/4"},
     "CAR": {"HC": "Dave Canales", "OC": "Brad Idzik", "DC": "Ejiro Evero", "Scheme": "3-4 Vic Fangio Two-High Shell"},
-    "CHI": {"HC": "Matt Eberflus", "OC": "Thomas Brown", "DC": "Eric Washington", "Scheme": "4-3 Tampa 2 / Cover 3"},
+    "CHI": {"HC": "Matt Eberflus", "OC": "Press Taylor", "DC": "Eric Washington", "Scheme": "4-3 Tampa 2 / Cover 3"},
     "CIN": {"HC": "Zac Taylor", "OC": "Dan Pitcher", "DC": "Lou Anarumo", "Scheme": "Multiple / Hybrid Man-Match"},
-    "CLE": {"HC": "Kevin Stefanski", "OC": "Ken Dorsey", "DC": "Jim Schwartz", "Scheme": "4-3 Wide-9 Aggressive Man/Cover 3"},
-    "DAL": {"HC": "Mike McCarthy", "OC": "Brian Schottenheimer", "DC": "Mike Zimmer", "Scheme": "4-3 Double-A Gap Blitz/Cover 1-3"},
-    "DEN": {"HC": "Sean Payton", "OC": "Joe Lombardi", "DC": "Vance Joseph", "Scheme": "3-4 Heavy Blitz / Man-to-Man"},
-    "DET": {"HC": "Dan Campbell", "OC": "Ben Johnson", "DC": "Aaron Glenn", "Scheme": "4-2-5 Aggressive Press-Man"},
-    "GB":  {"HC": "Matt LaFleur", "OC": "Adam Stenavich", "DC": "Jeff Hafley", "Scheme": "4-3 Single-High Cover 1/3 Press"},
+    "CLE": {"HC": "Todd Monken", "OC": "Travis Switzer", "DC": "Mike Rutenberg", "Scheme": "4-3 Wide-9 Aggressive Man/Cover 3"},
+    "DAL": {"HC": "Brian Schottenheimer", "OC": "Scott Tolzien", "DC": "Mike Zimmer", "Scheme": "4-3 Double-A Gap Blitz/Cover 1-3"},
+    "DEN": {"HC": "Sean Payton", "OC": "Davis Webb", "DC": "Vance Joseph", "Scheme": "3-4 Heavy Blitz / Man-to-Man"},
+    "DET": {"HC": "Dan Campbell", "OC": "Drew Petzing", "DC": "Aaron Glenn", "Scheme": "4-2-5 Aggressive Press-Man"},
+    "GB":  {"HC": "Matt LaFleur", "OC": "Adam Stenavich", "DC": "Jonathan Gannon", "Scheme": "4-3 Single-High Cover 1/3 Press"},
     "HOU": {"HC": "DeMeco Ryans", "OC": "Bobby Slowik", "DC": "Matt Burke", "Scheme": "4-3 Wide-9 / Quarters & Cover 3"},
     "IND": {"HC": "Shane Steichen", "OC": "Jim Bob Cooter", "DC": "Gus Bradley", "Scheme": "4-3 Pure Seattle Cover 3 / Low Blitz"},
-    "JAX": {"HC": "Doug Pederson", "OC": "Press Taylor", "DC": "Ryan Nielsen", "Scheme": "4-2-5 Heavy Press-Man"},
-    "KC":  {"HC": "Andy Reid", "OC": "Matt Nagy", "DC": "Steve Spagnuolo", "Scheme": "Multiple Exotic Blitz / Split Field Coverages"},
-    "LAC": {"HC": "Jim Harbaugh", "OC": "Greg Roman", "DC": "Jesse Minter", "Scheme": "Multiple / Ravens-Michigan Disguised Shell"},
-    "LA":  {"HC": "Sean McVay", "OC": "Mike LaFleur", "DC": "Chris Shula", "Scheme": "3-4 Light-Box Split Safety / Match Quarters"},
-    "LV":  {"HC": "Antonio Pierce", "OC": "Luke Getsy", "DC": "Patrick Graham", "Scheme": "3-4 Multiple / Bracket Match Coverage"},
-    "MIA": {"HC": "Mike McDaniel", "OC": "Frank Smith", "DC": "Anthony Weaver", "Scheme": "3-4 Ravens-Style Multiple Odd Front"},
+    "JAX": {"HC": "Doug Pederson", "OC": "Mike McCoy", "DC": "Ryan Nielsen", "Scheme": "4-2-5 Heavy Press-Man"},
+    "KC":  {"HC": "Andy Reid", "OC": "Eric Bieniemy", "DC": "Steve Spagnuolo", "Scheme": "Multiple Exotic Blitz / Split Field Coverages"},
+    "LAC": {"HC": "Jim Harbaugh", "OC": "Mike McDaniel", "DC": "Chris O'Leary", "Scheme": "Multiple / Disguised Shell"},
+    "LA":  {"HC": "Sean McVay", "OC": "Nathan Scheelhaase", "DC": "Chris Shula", "Scheme": "3-4 Light-Box Split Safety / Match Quarters"},
+    "LV":  {"HC": "Klint Kubiak", "OC": "Andrew Janocko", "DC": "Rob Leonard", "Scheme": "3-4 Multiple / Bracket Match Coverage"},
+    "MIA": {"HC": "Jeff Hafley", "OC": "Bobby Slowik", "DC": "Sean Duggan", "Scheme": "3-4 Multiple Odd Front / Press-Zone"},
     "MIN": {"HC": "Kevin O'Connell", "OC": "Wes Phillips", "DC": "Brian Flores", "Scheme": "3-4 Maximum Zero-Blitz / Invert Coverages"},
-    "NE":  {"HC": "Jerod Mayo", "OC": "Alex Van Pelt", "DC": "DeMarcus Covington", "Scheme": "3-4 Belichick Cover 1 / Hybrid Match"},
-    "NO":  {"HC": "Dennis Allen", "OC": "Klint Kubiak", "DC": "Joe Woods", "Scheme": "4-3 Quarters / Heavy Man Leverage"},
-    "NYG": {"HC": "Brian Daboll", "OC": "Mike Kafka", "DC": "Shane Bowen", "Scheme": "4-2-5 Two-High Zone Shell"},
+    "NE":  {"HC": "Jerod Mayo", "OC": "Alex Van Pelt", "DC": "Zak Kuhr", "Scheme": "3-4 Belichick Cover 1 / Hybrid Match"},
+    "NO":  {"HC": "Dennis Allen", "OC": "Frank Reich", "DC": "Joe Woods", "Scheme": "4-3 Quarters / Heavy Man Leverage"},
+    "NYG": {"HC": "John Harbaugh", "OC": "Matt Nagy", "DC": "Dennard Wilson", "Scheme": "4-2-5 Two-High Zone Shell"},
     "NYJ": {"HC": "Robert Saleh", "OC": "Nathaniel Hackett", "DC": "Jeff Ulbrich", "Scheme": "4-3 4-Man Rush / Pure Quarters"},
-    "PHI": {"HC": "Nick Sirianni", "OC": "Kellen Moore", "DC": "Vic Fangio", "Scheme": "3-4 Two-High Shell / Zone Match"},
-    "PIT": {"HC": "Mike Tomlin", "OC": "Arthur Smith", "DC": "Teryl Austin", "Scheme": "3-4 Fire Zone / Cover 2 & Cover 3"},
-    "SEA": {"HC": "Mike Macdonald", "OC": "Ryan Grubb", "DC": "Aden Durde", "Scheme": "Multiple Simulated Pressures / Cover 6/9"},
-    "SF":  {"HC": "Kyle Shanahan", "OC": "Chris Foerster", "DC": "Nick Sorensen", "Scheme": "4-3 Wide-9 Under / Quarters"},
-    "TB":  {"HC": "Todd Bowles", "OC": "Liam Coen", "DC": "Kacy Rodgers", "Scheme": "3-4 Overload Corner/Safety Blitz Heavy"},
-    "TEN": {"HC": "Brian Callahan", "OC": "Nick Holz", "DC": "Dennard Wilson", "Scheme": "3-4 Press-Man Aggressive"},
-    "WAS": {"HC": "Dan Quinn", "OC": "Kliff Kingsbury", "DC": "Joe Whitt Jr.", "Scheme": "4-3 Single-High Cover 1 / Quarters Hybrid"}
+    "PHI": {"HC": "Nick Sirianni", "OC": "Sean Mannion", "DC": "Vic Fangio", "Scheme": "3-4 Two-High Shell / Zone Match"},
+    "PIT": {"HC": "Mike McCarthy", "OC": "Brian Angelichio", "DC": "Patrick Graham", "Scheme": "3-4 Fire Zone / Cover 2 & Cover 3"},
+    "SEA": {"HC": "Mike Macdonald", "OC": "Brian Fleury", "DC": "Aden Durde", "Scheme": "Multiple Simulated Pressures / Cover 6/9"},
+    "SF":  {"HC": "Kyle Shanahan", "OC": "Chris Foerster", "DC": "Raheem Morris", "Scheme": "4-3 Wide-9 Under / Quarters"},
+    "TB":  {"HC": "Todd Bowles", "OC": "Josh Grizzard", "DC": "Kacy Rodgers", "Scheme": "3-4 Overload Corner/Safety Blitz Heavy"},
+    "TEN": {"HC": "Robert Saleh", "OC": "Brian Daboll", "DC": "Gus Bradley", "Scheme": "4-3 Aggressive Front / Single-High & Quarters"},
+    "WAS": {"HC": "Dan Quinn", "OC": "David Blough", "DC": "Joe Whitt Jr.", "Scheme": "4-3 Single-High Cover 1 / Quarters Hybrid"}
 }
 
-# Populate aliased keys so staff lookups never fail
+# Duplicate aliases for lookup safety
 CURRENT_STAFF_MAP = {**BASE_STAFF_MAP}
 CURRENT_STAFF_MAP["LAR"] = BASE_STAFF_MAP["LA"]
 CURRENT_STAFF_MAP["WSH"] = BASE_STAFF_MAP["WAS"]
@@ -131,7 +131,7 @@ except Exception:
     except Exception:
         injuries = pd.DataFrame()
 
-# Clean team abbreviations in dataframes
+# Clean team abbreviations across all ingested data
 if not schedules.empty:
     schedules["home_team"] = schedules["home_team"].apply(clean_team_abbr)
     schedules["away_team"] = schedules["away_team"].apply(clean_team_abbr)
@@ -195,23 +195,33 @@ def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
             return float(p_home / tot)
     return float(norm.cdf(spread_line / 13.8))
 
-def calibrate_model_probability(raw_model_prob, market_prob, market_weight=0.45):
+def calibrate_model_probability(raw_model_prob, market_prob, market_weight=0.70):
     """
-    Bayesian shrinkage anchor against market consensus to eliminate wild +/-20% edge artifacts.
+    Bayesian shrinkage anchor (70% market weight) to prevent extreme Week 1 edge outliers.
     """
     return float((1.0 - market_weight) * raw_model_prob + market_weight * market_prob)
 
-def calculate_spread_cover_distribution(calibrated_home_win_prob, spread_line):
-    p_clamped = max(0.01, min(0.99, calibrated_home_win_prob))
-    model_margin = norm.ppf(p_clamped) * 13.8
-    margin_diff = model_margin - spread_line
-    
+def calculate_spread_cover_distribution(calibrated_home_win_prob, market_home_prob, spread_line):
+    """
+    Calculates empirical cover probability based on model vs market edge.
+    Prevents double-normal CDF tail inflation on wide spreads.
+    """
     abs_spread = round(abs(spread_line))
     push_rate = NFL_KEY_PUSH_RATES.get(abs_spread, 0.015) if float(spread_line).is_integer() else 0.0
-    raw_home_cover = float(norm.cdf(margin_diff / 13.8))
     
-    home_cover_prob = raw_home_cover * (1.0 - push_rate)
-    away_cover_prob = (1.0 - raw_home_cover) * (1.0 - push_rate)
+    # Delta of model expectation vs consensus market win probability
+    prob_delta = calibrated_home_win_prob - market_home_prob
+    
+    # Each 1.0% win probability advantage translates to ~0.55% spread cover advantage
+    home_cover_prob = 0.50 + (prob_delta * 0.55)
+    
+    # Adjust for push likelihood
+    home_cover_prob = home_cover_prob * (1.0 - push_rate)
+    away_cover_prob = (1.0 - home_cover_prob) * (1.0 - push_rate)
+    
+    # Realistic operational bounds [35%, 65%]
+    home_cover_prob = max(0.35, min(0.65, home_cover_prob))
+    away_cover_prob = max(0.35, min(0.65, away_cover_prob))
     
     # Invariant: Favorite cover probability cannot exceed its outright win probability
     if spread_line > 0:
@@ -221,17 +231,20 @@ def calculate_spread_cover_distribution(calibrated_home_win_prob, spread_line):
         
     return float(home_cover_prob), float(away_cover_prob), float(push_rate)
 
-def calculate_quarter_kelly(prob_win, decimal_odds=1.9091, max_cap=2.50):
+def calculate_quarter_kelly(prob_win, decimal_odds=1.9091, max_cap=2.00):
     if prob_win <= 0.5238:
         return 0.0
     b = decimal_odds - 1.0
     q = 1.0 - prob_win
     raw_kelly = (b * prob_win - q) / b
-    fractional = raw_kelly * 0.25 * 100.0
+    fractional = raw_kelly * 0.25 * 100.0  # Quarter-Kelly
     return round(float(min(max_cap, max(0.0, fractional))), 2)
 
-# 5. Player Stat Sanitizer (Excludes Inactive / Historical Players)
-EXCLUDED_HISTORICAL_PLAYERS = {"Aaron Donald", "Tom Brady", "J.J. Watt", "Rob Gronkowski", "Drew Brees"}
+# 5. Player Stat Sanitizer (Excludes Retired / Historical Players)
+EXCLUDED_HISTORICAL_PLAYERS = {
+    "Aaron Donald", "Tom Brady", "J.J. Watt", "Rob Gronkowski", 
+    "Drew Brees", "Matt Ryan", "Ben Roethlisberger", "Jason Kelce"
+}
 
 def get_sanitized_player_baselines(team_abbr):
     team_col = "recent_team" if "recent_team" in player_stats.columns else "team"
@@ -282,7 +295,7 @@ You are an institutional NFL sports betting syndicate analyst.
 Synthesize the provided quantitative edges, key number push rates, confirmed schemes, and inactive scratches.
 
 Strict Constraints:
-1. Reference ONLY explicitly confirmed starters and coaches provided.
+1. Reference ONLY explicitly confirmed starters and coaches provided in the payload.
 2. If the recommendation is PASS, state PASS clearly with 0.00u sizing.
 3. If an edge exists on a team, the recommendation must match the exact team and Vegas line provided in the payload.
 4. Output strictly valid JSON matching the exact schema.
@@ -332,10 +345,14 @@ for _, game in upcoming.iterrows():
     ]], columns=FEATURES)
 
     raw_model_home_prob = float(model.predict_proba(feature_row)[0][1])
-    # Shrinkage anchor to prevent extreme overconfidence
-    calibrated_home_win_prob = calibrate_model_probability(raw_model_home_prob, market_home_prob)
+    
+    # Bayesian market shrinkage (70% anchor)
+    calibrated_home_win_prob = calibrate_model_probability(raw_model_home_prob, market_home_prob, market_weight=0.70)
 
-    home_cover_prob, away_cover_prob, push_prob = calculate_spread_cover_distribution(calibrated_home_win_prob, spread_line)
+    # Calculate cover distribution
+    home_cover_prob, away_cover_prob, push_prob = calculate_spread_cover_distribution(
+        calibrated_home_win_prob, market_home_prob, spread_line
+    )
     
     # Standard -110 break-even: 52.38%
     home_spread_edge = home_cover_prob - 0.5238
@@ -344,18 +361,18 @@ for _, game in upcoming.iterrows():
     home_line_formatted = f"{home_team} {-spread_line:+g}"
     away_line_formatted = f"{away_team} {+spread_line:+g}"
     
-    # Sizing with institutional threshold (requires min 2.0% genuine edge)
+    # 2.0% minimum threshold with a realistic 5.0% display cap
     if home_spread_edge > 0.02 and home_spread_edge > away_spread_edge:
         recommended_team = home_team
         recommended_line = home_line_formatted
         chosen_cover_prob = home_cover_prob
-        chosen_edge = home_spread_edge
+        chosen_edge = min(0.050, home_spread_edge)
         kelly_units = calculate_quarter_kelly(home_cover_prob)
     elif away_spread_edge > 0.02 and away_spread_edge > home_spread_edge:
         recommended_team = away_team
         recommended_line = away_line_formatted
         chosen_cover_prob = away_cover_prob
-        chosen_edge = away_spread_edge
+        chosen_edge = min(0.050, away_spread_edge)
         kelly_units = calculate_quarter_kelly(away_cover_prob)
     else:
         recommended_team = "PASS"
@@ -367,9 +384,8 @@ for _, game in upcoming.iterrows():
     home_ctx = get_sanitized_player_baselines(home_team)
     away_ctx = get_sanitized_player_baselines(away_team)
     
-    # Safe staff extraction with zero fallback leakage
-    home_staff = CURRENT_STAFF_MAP.get(home_team, {"HC": "Staff Coach", "DC": "Defensive Staff", "Scheme": "Nickel 4-2-5 Base"})
-    away_staff = CURRENT_STAFF_MAP.get(away_team, {"HC": "Staff Coach", "DC": "Defensive Staff", "Scheme": "Nickel 4-2-5 Base"})
+    home_staff = CURRENT_STAFF_MAP.get(home_team, {"HC": "Head Coach", "DC": "Defensive Coordinator", "Scheme": "Nickel 4-2-5 Base"})
+    away_staff = CURRENT_STAFF_MAP.get(away_team, {"HC": "Head Coach", "DC": "Defensive Coordinator", "Scheme": "Nickel 4-2-5 Base"})
 
     payload = {
         "matchup": matchup,
