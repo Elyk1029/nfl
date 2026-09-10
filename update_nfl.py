@@ -110,7 +110,7 @@ if not pbp.empty:
 
     pbp_clean["is_late_down"] = pbp_clean["down"].isin([3, 4]).astype(int) if "down" in pbp_clean.columns else 0
     
-    # Isolate true explosive plays: Pass 15+ yards, Rush 10+ yards
+    # Explosive threshold isolation: Pass 15+ yds, Rush 10+ yds
     pbp_clean["is_explosive"] = (
         ((pbp_clean["play_type"] == "pass") & (pbp_clean["yards_gained"] >= 15)) |
         ((pbp_clean["play_type"] == "run") & (pbp_clean["yards_gained"] >= 10))
@@ -145,7 +145,7 @@ if not pbp.empty:
 else:
     team_perf = pd.DataFrame()
 
-# 4. Mathematical Modeling & Spread Cover Distribution
+# 4. Point Spread Margin Distribution Engine
 def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
     if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
         p_home = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
@@ -156,34 +156,21 @@ def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
     return float(norm.cdf(-spread_line / 13.5))
 
 def calculate_spread_cover_distribution(raw_model_home_prob, market_home_prob, spread_line, total_line=44.0):
-    """
-    Point spread margin distribution model with discrete key-number push calibration.
-    Converts model vs market probabilities into an implied projected point spread differential.
-    """
-    # Shrink raw model edge by 65% toward market consensus to prevent early-season overreaction
     calibrated_home_win_prob = 0.35 * raw_model_home_prob + 0.65 * market_home_prob
-    
-    # Margin volatility scales with game total (sigma ~ 13.5 adjusted by total line)
     sigma = 13.5 * math.sqrt(total_line / 44.0)
     
-    # Invert normal win prob into implied margin: mu = -sigma * norm.ppf(1 - win_prob)
     z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
-    model_projected_margin = z_win * sigma  # Positive indicates home favorite
+    model_projected_margin = z_win * sigma
     
-    # Cover probability calculation: Home covers if (Actual Margin + spread_line) > 0
-    # Vegas notation: home_team -3.5 means spread_line = -3.5 (or +3.5 depending on provider).
-    # Here spread_line is the point adjustment added to the home score.
     z_cover = (model_projected_margin + spread_line) / sigma
     continuous_home_cover = float(norm.cdf(z_cover))
     
-    # Key-number push rate allocation
     abs_spread = round(abs(spread_line))
     push_rate = NFL_KEY_PUSH_RATES.get(abs_spread, 0.015) if float(spread_line).is_integer() else 0.0
     
     home_cover_prob = continuous_home_cover * (1.0 - (push_rate * 0.5))
     away_cover_prob = (1.0 - continuous_home_cover) * (1.0 - (push_rate * 0.5))
     
-    # Clamp bounds to institutional sanity thresholds
     home_cover_prob = max(0.30, min(0.70, home_cover_prob))
     away_cover_prob = max(0.30, min(0.70, away_cover_prob))
     
@@ -198,34 +185,53 @@ def calculate_quarter_kelly(prob_win, decimal_odds=1.9091, max_cap=2.00):
     fractional = raw_kelly * 0.25 * 100.0
     return round(float(min(max_cap, max(0.0, fractional))), 2)
 
-# 5. Dynamic Personnel & Starter Identification
+# 5. Schema-Agnostic Starter & Injury Identification
 def get_active_starters(team_abbr):
     scratches = []
     if not injuries.empty and "team" in injuries.columns:
         t_inj = injuries[(injuries["team"] == team_abbr) & (injuries["report_status"].isin(["Out", "Doubtful", "IR"]))]
-        if "full_name" in t_inj.columns:
-            scratches = t_inj["full_name"].dropna().unique().tolist()
+        inj_name_col = next((c for c in ["full_name", "player_name", "player"] if c in t_inj.columns), None)
+        if inj_name_col:
+            scratches = t_inj[inj_name_col].dropna().unique().tolist()
 
     starters = {"QB": "Starting QB", "RB": "Starting RB", "WR": "Starting WR"}
     
-    # Query depth chart if available
-    team_col = "club_code" if "club_code" in depth_charts.columns else "team"
-    if not depth_charts.empty and team_col in depth_charts.columns:
-        t_dc = depth_charts[depth_charts[team_col] == team_abbr]
-        for pos in ["QB", "RB", "WR"]:
-            pos_match = t_dc[(t_dc["position"] == pos) & (t_dc["depth_team"] == "1")]
-            if not pos_match.empty and "full_name" in pos_match.columns:
-                cand = pos_match.iloc[0]["full_name"]
-                if cand not in scratches:
-                    starters[pos] = cand
+    # Dynamically resolve depth chart schema variations
+    if not depth_charts.empty:
+        team_col = next((c for c in ["club_code", "team"] if c in depth_charts.columns), None)
+        pos_col = next((c for c in ["pos_abb", "position", "pos_name", "pos"] if c in depth_charts.columns), None)
+        rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in depth_charts.columns), None)
+        name_col = next((c for c in ["player_name", "full_name", "player"] if c in depth_charts.columns), None)
 
-    # Enrich with player stat averages
-    team_stat_col = "recent_team" if "recent_team" in player_stats.columns else "team"
-    if not player_stats.empty and team_stat_col in player_stats.columns:
+        if team_col and pos_col and rank_col and name_col:
+            t_dc = depth_charts[depth_charts[team_col] == team_abbr]
+            for pos in ["QB", "RB", "WR"]:
+                # Matches depth rank 1 (either as int 1 or string '1')
+                pos_match = t_dc[(t_dc[pos_col] == pos) & (t_dc[rank_col].astype(str).str.strip() == "1")]
+                if not pos_match.empty:
+                    cand = pos_match.iloc[0][name_col]
+                    if cand not in scratches:
+                        starters[pos] = cand
+
+    # Baseline stat enrichment or fallback identification from player_stats
+    team_stat_col = next((c for c in ["recent_team", "team"] if c in player_stats.columns), None)
+    name_stat_col = next((c for c in ["player_name", "player", "full_name"] if c in player_stats.columns), None)
+    pos_stat_col = next((c for c in ["position", "pos"] if c in player_stats.columns), None)
+
+    if not player_stats.empty and team_stat_col and name_stat_col:
         t_stats = player_stats[player_stats[team_stat_col] == team_abbr]
         for pos, metric, unit in [("QB", "passing_yards", "pass yds"), ("RB", "rushing_yards", "rush yds"), ("WR", "receiving_yards", "rec yds")]:
             current_name = starters[pos]
-            sub = t_stats[t_stats["player_name"] == current_name]
+            
+            # Fallback starter if depth charts lacked data
+            if current_name == f"Starting {pos}" and pos_stat_col and metric in t_stats.columns:
+                sub_pos = t_stats[(t_stats[pos_stat_col] == pos) & (~t_stats[name_stat_col].isin(scratches))]
+                if not sub_pos.empty:
+                    top_player = sub_pos.groupby(name_stat_col)[metric].mean().idxmax()
+                    current_name = top_player
+                    starters[pos] = current_name
+
+            sub = t_stats[t_stats[name_stat_col] == current_name]
             if not sub.empty and metric in sub.columns:
                 avg_stat = sub[metric].mean()
                 starters[pos] = f"{current_name} (~{avg_stat:.1f} {unit}/gm)"
@@ -237,7 +243,7 @@ def get_active_starters(team_abbr):
         "scratches": scratches[:5] if scratches else ["None Reported"]
     }
 
-# 6. Asynchronous LLM Execution Engine
+# 6. Async LLM Evaluator
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
 You are an NFL Strategic Research Director and quantitative betting syndicate analyst.
@@ -322,7 +328,7 @@ async def main():
 
     tasks = []
     metadata = []
-    semaphore = asyncio.Semaphore(4)  # Concurrency cap to respect API limits
+    semaphore = asyncio.Semaphore(4)
 
     for _, game in upcoming.iterrows():
         home_team = clean_team_abbr(str(game["home_team"]))
@@ -379,7 +385,6 @@ async def main():
         home_line_formatted = f"{home_team} {spread_line:+g}"
         away_line_formatted = f"{away_team} {-spread_line:+g}"
 
-        # 2.0% clear threshold
         if home_spread_edge > 0.02 and home_spread_edge > away_spread_edge:
             recommended_team = home_team
             recommended_line = home_line_formatted
@@ -441,18 +446,16 @@ async def main():
             "recommended_line": recommended_line
         })
 
-    # Await concurrent LLM analysis
     results = await asyncio.gather(*tasks)
 
     records = []
     for meta, text_response in zip(metadata, results):
-        rec = dict(meta)
+        rec = {k: v for k, v in meta.items() if k != "recommended_line"}
         rec["analysis"] = text_response
-        del rec["recommended_line"]
         records.append(rec)
         print(f"Processed: {meta['matchup']} | Line: {meta['recommended_line']} | Kelly: {meta['kelly_units']}u")
 
-    # 8. Database Upsert & Migration
+    # 8. Neon Database Synchronization
     if records:
         df_results = pd.DataFrame(records)
         with engine.begin() as conn:
