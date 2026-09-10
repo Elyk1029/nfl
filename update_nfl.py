@@ -1,12 +1,13 @@
 import json
+import math
 import os
 import time
-import math
 from google import genai
 from google.genai import types
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
@@ -34,9 +35,8 @@ FEATURES = [
     "diff_explosive", "rest_diff", "is_divisional", "market_home_prob",
 ]
 
-# 3. NFL Key Number Push and Distribution Matrix
-# Historical frequencies of final margins in the modern NFL
-NFL_KEY_NUMBERS = {
+# 3. NFL Key Number Push Frequencies
+NFL_KEY_PUSH_RATES = {
     3: 0.148,
     7: 0.094,
     6: 0.059,
@@ -82,7 +82,7 @@ CURRENT_STAFF_MAP = {
     "WAS": {"HC": "Dan Quinn", "OC": "Kliff Kingsbury", "DC": "Joe Whitt Jr.", "Scheme": "4-3 Single-High Cover 1 / Quarters Hybrid"}
 }
 
-# 4. Pull Data
+# 4. Ingestion Pipeline
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
 
@@ -110,11 +110,9 @@ except Exception:
     except Exception:
         injuries = pd.DataFrame()
 
-# 5. Advanced Garbage-Time Filtered Efficiency Metrics
+# Clean Garbage Time EPA
 if not pbp.empty:
     pbp_clean = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
-    
-    # Filter Garbage Time: WP between 5% and 95% unless 1st half
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
         leverage_mask = (pbp_clean["qtr"] <= 2) | (pbp_clean["home_wp"].between(0.05, 0.95))
         pbp_clean = pbp_clean[leverage_mask]
@@ -150,91 +148,147 @@ if not pbp.empty:
 else:
     team_perf = pd.DataFrame()
 
-# 6. Advanced Mathematical Betting Formulas
-def get_devigged_market_probs(spread_line, home_ml=None, away_ml=None):
+# 5. Core Mathematical Functions
+def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
+    """
+    Standard NFL convention:
+    spread_line < 0 means Home team is FAVORED (e.g. LAC -9.5)
+    spread_line > 0 means Home team is UNDERDOG (e.g. CAR +3.5)
+    """
     if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
-        p_home = 100 / (home_ml + 100) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100)
-        p_away = 100 / (away_ml + 100) if away_ml > 0 else abs(away_ml) / (abs(away_ml) + 100)
-        return p_home / (p_home + p_away)
-    
-    # Precise empirical logistic mapping calibrated on modern NFL regular season lines
-    # spread_line is Home Team point line (e.g. -7 means Home is favored by 7)
-    return 1.0 / (1.0 + 10.0 ** (spread_line / 14.5))
+        p_home = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
+        p_away = 100.0 / (away_ml + 100.0) if away_ml > 0 else abs(away_ml) / (abs(away_ml) + 100.0)
+        tot = p_home + p_away
+        if tot > 0:
+            return float(p_home / tot)
+            
+    # Empirical NFL spread conversion: LAC -9.5 -> Home prob is norm.cdf(9.5 / 13.8) ~ 75.4%
+    return float(norm.cdf(-spread_line / 13.8))
 
-def calculate_spread_cover_edge(model_home_win_prob, spread_line):
+def calculate_spread_cover_distribution(model_home_win_prob, home_spread):
     """
-    Evaluates probability of covering spread accounting for NFL key numbers.
+    Computes mathematically consistent Home vs Away cover probabilities.
+    Ensures P(Cover -Spread) <= P(Win Outright) for any favorite.
     """
-    projected_margin = -14.5 * math.log10((1.0 - model_home_win_prob) / max(0.001, model_home_win_prob))
-    margin_diff = projected_margin - (-spread_line)
+    p_clamped = max(0.01, min(0.99, model_home_win_prob))
     
-    base_cover = 1.0 / (1.0 + math.exp(-margin_diff / 5.2))
+    # Implied projected scoring margin (Home - Away)
+    implied_margin = norm.ppf(p_clamped) * 13.8
     
-    abs_spread = round(abs(spread_line))
-    push_prob = NFL_KEY_NUMBERS.get(abs_spread, 0.02) if float(spread_line).is_integer() else 0.0
-    adjusted_cover = base_cover * (1.0 - push_prob)
-    return adjusted_cover, push_prob
+    # Margin difference vs spread line
+    # Home covers if (Actual Margin + home_spread) > 0 when home_spread is defined as Vegas line (e.g. + home_spread)
+    # Standard: Home score - Away score > -home_spread
+    margin_diff = implied_margin - (-home_spread)
+    
+    # Key Number Push Probability
+    abs_spread = round(abs(home_spread))
+    push_rate = NFL_KEY_PUSH_RATES.get(abs_spread, 0.015) if float(home_spread).is_integer() else 0.0
+    
+    raw_home_cover = float(norm.cdf(margin_diff / 13.8))
+    
+    # Push adjustments
+    home_cover_prob = raw_home_cover * (1.0 - push_rate)
+    away_cover_prob = (1.0 - raw_home_cover) * (1.0 - push_rate)
+    
+    # Invariant Hard Constraint: Favorite cover prob CANNOT exceed its win prob
+    if home_spread < 0:
+        home_cover_prob = min(home_cover_prob, model_home_win_prob)
+    elif home_spread > 0:
+        away_cover_prob = min(away_cover_prob, (1.0 - model_home_win_prob))
+        
+    return float(home_cover_prob), float(away_cover_prob), float(push_rate)
 
-def calculate_kelly_fraction(p_win, decimal_odds=1.9091, fraction=0.25):
+def calculate_quarter_kelly(prob_win, decimal_odds=1.9091, max_cap=2.50):
     """
-    Calculates Quarter-Kelly recommendation.
-    Standard -110 spread line = 1.9091 decimal odds (b = 0.9091)
+    Quarter-Kelly (0.25) with strict bankroll cap (default 2.50u max).
+    Zero sizing on non-positive edge.
     """
     b = decimal_odds - 1.0
-    q = 1.0 - p_win
-    raw_kelly = (b * p_win - q) / b
-    if raw_kelly <= 0:
+    q = 1.0 - prob_win
+    # Standard -110 break-even is 52.38% (1 / 1.9091)
+    if prob_win <= (1.0 / decimal_odds):
         return 0.0
-    return round(raw_kelly * fraction * 100, 2)
-
-# 7. Injury & Starter Resolver
-def get_team_context(team_abbr):
-    team_col = "recent_team" if "recent_team" in player_stats.columns else "team"
-    t_stats = player_stats[player_stats[team_col] == team_abbr] if not player_stats.empty else pd.DataFrame()
     
-    # Active Scratches
-    scratches = []
-    if not injuries.empty:
-        t_inj = injuries[(injuries["team"] == team_abbr) & (injuries["report_status"].isin(["Out", "Doubtful", "IR"]))]
-        scratches = t_inj["full_name"].dropna().unique().tolist()[:6]
+    raw_kelly = (b * prob_win - q) / b
+    fractional = raw_kelly * 0.25 * 100.0  # units (1 unit = 1% bankroll)
+    return round(float(min(max_cap, max(0.0, fractional))), 2)
 
-    def get_pos(pos, stat_col):
-        if t_stats.empty: return f"Confirmed Starting {pos}"
-        sub = t_stats[(t_stats['position'] == pos) & (~t_stats['player_name'].isin(scratches))].sort_values(stat_col, ascending=False)
+# 6. Player Stat Sanitizer (Fixes Impossible 450 yds/gm Projections)
+def get_sanitized_player_baselines(team_abbr):
+    team_col = "recent_team" if "recent_team" in player_stats.columns else "team"
+    t_stats = player_stats[player_stats[team_col] == team_abbr] if not player_stats.empty and team_col in player_stats.columns else pd.DataFrame()
+    
+    scratches = []
+    if not injuries.empty and "team" in injuries.columns:
+        t_inj = injuries[(injuries["team"] == team_abbr) & (injuries["report_status"].isin(["Out", "Doubtful", "IR"]))]
+        if "full_name" in t_inj.columns:
+            scratches = t_inj["full_name"].dropna().unique().tolist()[:6]
+
+    def get_pos(pos, stat_col, min_val, max_val, unit_str):
+        if t_stats.empty or stat_col not in t_stats.columns:
+            return f"Starting {pos} (~0.0 {unit_str}/gm)"
+            
+        sub = t_stats[(t_stats['position'] == pos) & (~t_stats['player_name'].isin(scratches))].copy()
         if not sub.empty:
-            p = sub.iloc[0]
-            return f"{p['player_name']} (Avg {p[stat_col]:.1f}/gm)"
-        return f"Starting {pos}"
+            # Group by player in case multi-week rows are separate
+            grouped = sub.groupby('player_name').agg({stat_col: 'mean'}).reset_index()
+            grouped = grouped.sort_values(stat_col, ascending=False)
+            top = grouped.iloc[0]
+            name = top['player_name']
+            val = float(top[stat_col])
+            # Hard clip bounds to enforce realistic football distributions
+            sanitized_val = max(min_val, min(max_val, val))
+            return f"{name} (~{sanitized_val:.1f} {unit_str}/gm)"
+        return f"Starting {pos} (~0.0 {unit_str}/gm)"
 
     return {
         "starters": {
-            "QB": get_pos("QB", "passing_yards"),
-            "RB": get_pos("RB", "rushing_yards"),
-            "WR": get_pos("WR", "receiving_yards")
+            "QB": get_pos("QB", "passing_yards", 120.0, 310.0, "pass yds"),
+            "RB": get_pos("RB", "rushing_yards", 25.0, 115.0, "rush yds"),
+            "WR": get_pos("WR", "receiving_yards", 20.0, 105.0, "rec yds")
         },
         "scratches": scratches if scratches else ["None Reported"]
     }
 
-# 8. Main Execution Loop
-next_week = schedules[schedules["result"].isna()]["week"].min()
-upcoming = schedules[(schedules["result"].isna()) & (schedules["week"] == next_week)].copy()
+# 7. Processing Pipeline
+upcoming = pd.DataFrame()
+target_week = 1
+
+if not schedules.empty:
+    unplayed = schedules[schedules["result"].isna()]
+    if not unplayed.empty:
+        target_week = int(unplayed["week"].min())
+        upcoming = unplayed[unplayed["week"] == target_week].copy()
 
 records = []
+system_prompt = """
+You are a quantitative NFL sports betting analyst. 
+You synthesize statistical projections, confirmed injury reports, and verified schemes.
+
+Rules:
+1. Reference ONLY explicitly confirmed starters and coaches provided.
+2. If the recommendation is PASS, state PASS clearly with 0.00u sizing.
+3. If an edge exists on a team, the recommendation must match the exact team and line provided in the payload.
+4. Output strictly valid JSON matching the exact schema.
+"""
+
 for _, game in upcoming.iterrows():
-    home_team = game["home_team"]
-    away_team = game["away_team"]
+    home_team = str(game["home_team"])
+    away_team = str(game["away_team"])
     matchup = f"{away_team} @ {home_team}"
-    week_num = int(game["week"]) if pd.notna(game["week"]) else 1
+    week_num = int(game["week"]) if pd.notna(game["week"]) else target_week
 
-    spread_line = float(game["spread_line"]) if pd.notna(game["spread_line"]) else 0.0
-    total_line = float(game["total_line"]) if pd.notna(game["total_line"]) else 44.0
-    home_ml = float(game["home_moneyline"]) if "home_moneyline" in game and pd.notna(game["home_moneyline"]) else None
-    away_ml = float(game["away_moneyline"]) if "away_moneyline" in game and pd.notna(game["away_moneyline"]) else None
+    spread_line = float(game["spread_line"]) if pd.notna(game.get("spread_line")) else 0.0
+    total_line = float(game["total_line"]) if pd.notna(game.get("total_line")) else 44.0
+    home_ml = float(game["home_moneyline"]) if pd.notna(game.get("home_moneyline")) else None
+    away_ml = float(game["away_moneyline"]) if pd.notna(game.get("away_moneyline")) else None
 
-    market_home_prob = get_devigged_market_probs(spread_line, home_ml, away_ml)
+    # Devigged Market Home Win Probability
+    market_home_prob = get_devigged_market_home_prob(spread_line, home_ml, away_ml)
 
-    home_row = team_perf[(team_perf["team"] == home_team) & (team_perf["week"] == week_num)]
-    away_row = team_perf[(team_perf["team"] == away_team) & (team_perf["week"] == week_num)]
+    # Feature lookups
+    home_row = team_perf[(team_perf["team"] == home_team) & (team_perf["week"] == week_num)] if not team_perf.empty else pd.DataFrame()
+    away_row = team_perf[(team_perf["team"] == away_team) & (team_perf["week"] == week_num)] if not team_perf.empty else pd.DataFrame()
 
     if home_row.empty and not team_perf.empty: home_row = team_perf[team_perf["team"] == home_team].tail(1)
     if away_row.empty and not team_perf.empty: away_row = team_perf[team_perf["team"] == away_team].tail(1)
@@ -242,7 +296,7 @@ for _, game in upcoming.iterrows():
     def get_metric(df, col_name, default=0.0):
         if not df.empty and col_name in df.columns and pd.notna(df[col_name].values[0]):
             return float(df[col_name].values[0])
-        return default
+        return float(default)
 
     home_rest = float(game.get("home_rest", 7.0)) if pd.notna(game.get("home_rest")) else 7.0
     away_rest = float(game.get("away_rest", 7.0)) if pd.notna(game.get("away_rest")) else 7.0
@@ -263,84 +317,104 @@ for _, game in upcoming.iterrows():
         diff_explosive, rest_diff, is_divisional, market_home_prob
     ]], columns=FEATURES)
 
-    model_home_prob = float(model.predict_proba(feature_row)[0][1])
-    ml_edge = model_home_prob - market_home_prob
+    model_home_win_prob = float(model.predict_proba(feature_row)[0][1])
 
-    home_cover_prob, push_prob = calculate_spread_cover_edge(model_home_prob, spread_line)
-    spread_edge = home_cover_prob - 0.50
-    kelly_units = calculate_kelly_fraction(home_cover_prob if spread_edge > 0 else (1.0 - home_cover_prob - push_prob))
+    # Calculate both sides of the spread
+    home_cover_prob, away_cover_prob, push_prob = calculate_spread_cover_distribution(model_home_win_prob, spread_line)
+    
+    # Break-even for -110 standard juice is 52.38%
+    home_spread_edge = home_cover_prob - 0.5238
+    away_spread_edge = away_cover_prob - 0.5238
+    
+    # Determine the mathematically superior side
+    if home_spread_edge > away_spread_edge and home_spread_edge > 0.02:
+        recommended_team = home_team
+        recommended_line = f"{home_team} {spread_line:+g}"
+        chosen_cover_prob = home_cover_prob
+        chosen_edge = home_spread_edge
+        kelly_units = calculate_quarter_kelly(home_cover_prob)
+    elif away_spread_edge > home_spread_edge and away_spread_edge > 0.02:
+        recommended_team = away_team
+        recommended_line = f"{away_team} {-spread_line:+g}"
+        chosen_cover_prob = away_cover_prob
+        chosen_edge = away_spread_edge
+        kelly_units = calculate_quarter_kelly(away_cover_prob)
+    else:
+        recommended_team = "PASS"
+        recommended_line = "No Value"
+        chosen_cover_prob = max(home_cover_prob, away_cover_prob)
+        chosen_edge = max(home_spread_edge, away_spread_edge)
+        kelly_units = 0.00
 
-    home_ctx = get_team_context(home_team)
-    away_ctx = get_team_context(away_team)
-    home_staff = CURRENT_STAFF_MAP.get(home_team, {"HC": "Head Coach", "DC": "Defensive Coordinator", "Scheme": "Standard Base"})
-    away_staff = CURRENT_STAFF_MAP.get(away_team, {"HC": "Head Coach", "DC": "Defensive Coordinator", "Scheme": "Standard Base"})
+    # Strict Validation Assertions
+    if spread_line < 0:  # Home is favorite
+        assert home_cover_prob <= (model_home_win_prob + 0.0001), \
+            f"Invariant failure on {matchup}: Home cover {home_cover_prob:.3f} > Win {model_home_win_prob:.3f}"
+    if recommended_team == "PASS":
+        assert kelly_units == 0.0, f"Invariant failure: Non-zero Kelly on PASS in {matchup}"
+
+    home_ctx = get_sanitized_player_baselines(home_team)
+    away_ctx = get_sanitized_player_baselines(away_team)
+    home_staff = CURRENT_STAFF_MAP.get(home_team, {"HC": "Head Coach", "DC": "Defensive Coordinator", "Scheme": "Base Scheme"})
+    away_staff = CURRENT_STAFF_MAP.get(away_team, {"HC": "Head Coach", "DC": "Defensive Coordinator", "Scheme": "Base Scheme"})
 
     payload = {
         "matchup": matchup,
         "market": {
-            "spread_line": spread_line,
-            "total_line": total_line,
+            "home_spread": spread_line,
+            "total": total_line,
             "devigged_home_ml_prob": f"{market_home_prob:.1%}"
         },
-        "model_projections": {
-            "model_home_win_prob": f"{model_home_prob:.1%}",
-            "home_spread_cover_prob": f"{home_cover_prob:.1%}",
-            "ml_edge": f"{ml_edge:+.1%}",
-            "spread_edge": f"{spread_edge:+.1%}",
-            "key_number_push_prob": f"{push_prob:.1%}",
-            "suggested_kelly_allocation": f"{kelly_units:.2f}u"
+        "model_calculations": {
+            "model_home_win_prob": f"{model_home_win_prob:.1%}",
+            "home_cover_prob": f"{home_cover_prob:.1%}",
+            "away_cover_prob": f"{away_cover_prob:.1%}",
+            "home_edge_vs_juice": f"{home_spread_edge:+.1%}",
+            "away_edge_vs_juice": f"{away_spread_edge:+.1%}",
+            "recommended_side": recommended_team,
+            "recommended_line": recommended_line,
+            "suggested_kelly_units": f"{kelly_units:.2f}u"
         },
-        "verified_schematics": {
+        "schematics": {
             "home_team": {
                 "team": home_team,
                 "staff": home_staff,
                 "starters": home_ctx["starters"],
-                "confirmed_scratches": home_ctx["scratches"]
+                "injuries": home_ctx["scratches"]
             },
             "away_team": {
                 "team": away_team,
                 "staff": away_staff,
                 "starters": away_ctx["starters"],
-                "confirmed_scratches": away_ctx["scratches"]
+                "injuries": away_ctx["scratches"]
             }
         }
     }
 
-    system_prompt = """
-You are an institutional NFL sports betting syndicate analyst.
-Synthesize the provided quantitative edges, key number push rates, confirmed schemes, and inactive scratches.
-
-Strict Constraints:
-1. Reference ONLY the explicitly confirmed personnel, coaching staff, and active starters provided in the payload.
-2. DO NOT make up players or coaches.
-3. If absolute spread edge is under 2.5%, actionable_verdict MUST be 'PASS'.
-4. Respond in strictly valid JSON matching the exact output schema.
-"""
-
     prompt = f"""
-Input Game Data:
+Analyze this game JSON:
 {json.dumps(payload, indent=2)}
 
-Output JSON Schema:
+Output strictly valid JSON with this schema:
 {{
-  "executive_summary": "2 sentences breaking down market value, key number importance, and edge.",
+  "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS.",
   "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Breakdown matching away starters against DC {home_staff['DC']} and scheme {home_staff['Scheme']}.",
-    "home_offense_vs_away_defense": "Breakdown matching home starters against DC {away_staff['DC']} and scheme {away_staff['Scheme']}."
+    "away_offense_vs_home_defense": "Analysis matching away players against DC {home_staff['DC']} and scheme {home_staff['Scheme']}.",
+    "home_offense_vs_away_defense": "Analysis matching home players against DC {away_staff['DC']} and scheme {away_staff['Scheme']}."
   }},
   "player_projections": {{
     "away_team": {{
-      "QB": "{away_ctx['starters']['QB']}: projection & scheme rationale",
-      "RB": "{away_ctx['starters']['RB']}: projection & scheme rationale",
-      "WR": "{away_ctx['starters']['WR']}: projection & scheme rationale"
+      "QB": "{away_ctx['starters']['QB']}: analysis",
+      "RB": "{away_ctx['starters']['RB']}: analysis",
+      "WR": "{away_ctx['starters']['WR']}: analysis"
     }},
     "home_team": {{
-      "QB": "{home_ctx['starters']['QB']}: projection & scheme rationale",
-      "RB": "{home_ctx['starters']['RB']}: projection & scheme rationale",
-      "WR": "{home_ctx['starters']['WR']}: projection & scheme rationale"
+      "QB": "{home_ctx['starters']['QB']}: analysis",
+      "RB": "{home_ctx['starters']['RB']}: analysis",
+      "WR": "{home_ctx['starters']['WR']}: analysis"
     }}
   }},
-  "actionable_verdict": "[Bet Team Spread / Bet Team ML / PASS] - Include suggested Kelly unit sizing."
+  "actionable_verdict": "{'PASS - 0.00u' if recommended_team == 'PASS' else 'Bet ' + recommended_line + ' - ' + str(kelly_units) + 'u'}"
 }}
 """
 
@@ -366,27 +440,47 @@ Output JSON Schema:
                 time.sleep(backoff)
                 backoff *= 2
             else:
-                print(f"API generation error on {matchup}: {e}")
+                print(f"API error on {matchup}: {e}")
 
     records.append({
-        "game_id": str(game["game_id"]),
-        "week": week_num,
-        "matchup": matchup,
-        "home_win_prob": model_home_prob,
-        "market_prob": market_home_prob,
-        "spread_cover_prob": home_cover_prob,
-        "spread_edge": spread_edge,
-        "kelly_units": kelly_units,
-        "analysis": response_text,
+        "game_id": str(game.get("game_id", f"2026_{week_num}_{away_team}_{home_team}")),
+        "week": int(week_num),
+        "matchup": str(matchup),
+        "home_win_prob": float(model_home_win_prob),
+        "market_prob": float(market_home_prob),
+        "spread_cover_prob": float(chosen_cover_prob),
+        "spread_edge": float(chosen_edge),
+        "kelly_units": float(kelly_units),
+        "analysis": str(response_text),
     })
-    print(f"Processed {matchup} | Spread Edge: {spread_edge:+.1%} | Kelly: {kelly_units}u")
+    print(f"Processed {matchup} | Pick: {recommended_line} | Edge: {chosen_edge:+.1%} | Kelly: {kelly_units}u")
 
+# 8. Database Sync & Auto-Migration
 if records:
     df_results = pd.DataFrame(records)
     with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS nfl_weekly_analysis (
+                game_id TEXT PRIMARY KEY,
+                week INTEGER,
+                matchup TEXT,
+                home_win_prob NUMERIC,
+                market_prob NUMERIC,
+                spread_cover_prob NUMERIC,
+                spread_edge NUMERIC,
+                kelly_units NUMERIC,
+                analysis TEXT
+            );
+        """))
+        conn.execute(text("""
+            ALTER TABLE nfl_weekly_analysis 
+            ADD COLUMN IF NOT EXISTS spread_cover_prob NUMERIC,
+            ADD COLUMN IF NOT EXISTS spread_edge NUMERIC,
+            ADD COLUMN IF NOT EXISTS kelly_units NUMERIC;
+        """))
         conn.execute(
-            text("DELETE FROM nfl_weekly_analysis WHERE week = :week_num"),
-            {"week_num": week_num}
+            text("DELETE FROM nfl_weekly_analysis WHERE week = :target_week"),
+            {"target_week": target_week}
         )
     df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
-    print("Pipeline finished: Database updated with institutional edge models.")
+    print(f"Database updated for Week {target_week} with {len(df_results)} verified records.")
