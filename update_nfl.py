@@ -26,9 +26,9 @@ MODEL_FILE = "nfl_model.json"
 model = xgb.XGBClassifier()
 if os.path.exists(MODEL_FILE):
     model.load_model(MODEL_FILE)
-    print("XGBoost model loaded.")
+    print("XGBoost model loaded successfully.")
 else:
-    raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found.")
+    raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
 
 FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
@@ -99,18 +99,18 @@ for df in [schedules, pbp, player_stats, injuries, depth_charts]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
-# 3. EPA Filtering & Explosive Play Feature Pipeline
+# 3. EPA Filtering & Explosive Feature Engineering
 if not pbp.empty:
     pbp_clean = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
     
-    # Filter Garbage Time (Win Prob between 5% and 95% unless 1st Half)
+    # Garbage Time Filter: Win prob between 5% and 95% unless 1st Half
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
         leverage_mask = (pbp_clean["qtr"] <= 2) | (pbp_clean["home_wp"].between(0.05, 0.95))
         pbp_clean = pbp_clean[leverage_mask]
 
     pbp_clean["is_late_down"] = pbp_clean["down"].isin([3, 4]).astype(int) if "down" in pbp_clean.columns else 0
     
-    # Explosive threshold isolation: Pass 15+ yds, Rush 10+ yds
+    # Explosive play classification: Pass >= 15 yards, Rush >= 10 yards
     pbp_clean["is_explosive"] = (
         ((pbp_clean["play_type"] == "pass") & (pbp_clean["yards_gained"] >= 15)) |
         ((pbp_clean["play_type"] == "run") & (pbp_clean["yards_gained"] >= 10))
@@ -145,7 +145,7 @@ if not pbp.empty:
 else:
     team_perf = pd.DataFrame()
 
-# 4. Point Spread Margin Distribution Engine
+# 4. Mathematical Point Spread & Margin Distribution Engine
 def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
     if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
         p_home = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
@@ -153,24 +153,39 @@ def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
         tot = p_home + p_away
         if tot > 0:
             return float(p_home / tot)
-    return float(norm.cdf(-spread_line / 13.5))
+    # nflreadr convention: spread_line > 0 means home is favored
+    return float(norm.cdf(spread_line / 13.5))
 
 def calculate_spread_cover_distribution(raw_model_home_prob, market_home_prob, spread_line, total_line=44.0):
+    """
+    Evaluates empirical cover probabilities using margin differentials.
+    nflreadr spread_line convention:
+      Positive = Home Favored (e.g. +9.5 means Home -9.5 in Vegas notation)
+      Negative = Away Favored (e.g. -3.0 means Away -3.0 / Home +3.0 in Vegas notation)
+    """
+    # Bayesian shrinkage toward market consensus to avoid early-season overreaction
     calibrated_home_win_prob = 0.35 * raw_model_home_prob + 0.65 * market_home_prob
-    sigma = 13.5 * math.sqrt(total_line / 44.0)
     
+    # Margin standard deviation scales with total points environment
+    sigma = 13.5 * math.sqrt(max(30.0, total_line) / 44.0)
+    
+    # Invert home win probability to implied score margin (Home Score - Away Score)
     z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
     model_projected_margin = z_win * sigma
     
-    z_cover = (model_projected_margin + spread_line) / sigma
-    continuous_home_cover = float(norm.cdf(z_cover))
+    # Home covers if: Actual Margin (Home - Away) > spread_line
+    # Therefore: P(Cover) = P(Margin > spread_line) = 1 - Phi((spread_line - Margin) / sigma)
+    z_home_cover = (model_projected_margin - spread_line) / sigma
+    continuous_home_cover = float(norm.cdf(z_home_cover))
     
+    # Push allocation on integer key numbers
     abs_spread = round(abs(spread_line))
     push_rate = NFL_KEY_PUSH_RATES.get(abs_spread, 0.015) if float(spread_line).is_integer() else 0.0
     
     home_cover_prob = continuous_home_cover * (1.0 - (push_rate * 0.5))
     away_cover_prob = (1.0 - continuous_home_cover) * (1.0 - (push_rate * 0.5))
     
+    # Operational bounds
     home_cover_prob = max(0.30, min(0.70, home_cover_prob))
     away_cover_prob = max(0.30, min(0.70, away_cover_prob))
     
@@ -196,7 +211,7 @@ def get_active_starters(team_abbr):
 
     starters = {"QB": "Starting QB", "RB": "Starting RB", "WR": "Starting WR"}
     
-    # Dynamically resolve depth chart schema variations
+    # Dynamic depth chart column matching
     if not depth_charts.empty:
         team_col = next((c for c in ["club_code", "team"] if c in depth_charts.columns), None)
         pos_col = next((c for c in ["pos_abb", "position", "pos_name", "pos"] if c in depth_charts.columns), None)
@@ -206,14 +221,13 @@ def get_active_starters(team_abbr):
         if team_col and pos_col and rank_col and name_col:
             t_dc = depth_charts[depth_charts[team_col] == team_abbr]
             for pos in ["QB", "RB", "WR"]:
-                # Matches depth rank 1 (either as int 1 or string '1')
                 pos_match = t_dc[(t_dc[pos_col] == pos) & (t_dc[rank_col].astype(str).str.strip() == "1")]
                 if not pos_match.empty:
                     cand = pos_match.iloc[0][name_col]
                     if cand not in scratches:
                         starters[pos] = cand
 
-    # Baseline stat enrichment or fallback identification from player_stats
+    # Enrich or fallback via player_stats
     team_stat_col = next((c for c in ["recent_team", "team"] if c in player_stats.columns), None)
     name_stat_col = next((c for c in ["player_name", "player", "full_name"] if c in player_stats.columns), None)
     pos_stat_col = next((c for c in ["position", "pos"] if c in player_stats.columns), None)
@@ -223,12 +237,11 @@ def get_active_starters(team_abbr):
         for pos, metric, unit in [("QB", "passing_yards", "pass yds"), ("RB", "rushing_yards", "rush yds"), ("WR", "receiving_yards", "rec yds")]:
             current_name = starters[pos]
             
-            # Fallback starter if depth charts lacked data
+            # Fallback if depth chart lacked data
             if current_name == f"Starting {pos}" and pos_stat_col and metric in t_stats.columns:
                 sub_pos = t_stats[(t_stats[pos_stat_col] == pos) & (~t_stats[name_stat_col].isin(scratches))]
                 if not sub_pos.empty:
-                    top_player = sub_pos.groupby(name_stat_col)[metric].mean().idxmax()
-                    current_name = top_player
+                    current_name = sub_pos.groupby(name_stat_col)[metric].mean().idxmax()
                     starters[pos] = current_name
 
             sub = t_stats[t_stats[name_stat_col] == current_name]
@@ -243,17 +256,17 @@ def get_active_starters(team_abbr):
         "scratches": scratches[:5] if scratches else ["None Reported"]
     }
 
-# 6. Async LLM Evaluator
+# 6. Asynchronous LLM Strategic Evaluator
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
-You are an NFL Strategic Research Director and quantitative betting syndicate analyst.
-Synthesize the provided Expected Points Added (EPA), Success Rates, explosive play ratios, personnel scratches, and key-number spread edges.
+You are an NFL Strategic Research Director and quantitative syndicate handicapper.
+Analyze matchups by synthesizing Expected Points Added (EPA), Success Rates, explosive play ratios, personnel scratches, and key-number spread edges.
 
 Evaluation Protocol:
-1. Pinpoint the primary tactical matchup: Evaluate passing offense dropback EPA vs. defense pass rush win rate and secondary coverage shell.
-2. In the player projections, reference strictly the confirmed active personnel provided in the JSON input.
-3. State whether the model warrants a BET or PASS based on key number pricing.
-4. Output strictly valid JSON matching the specified schema.
+1. Pinpoint the primary tactical mismatch: Coverage family (MOFC Cover 1/Cover 3 vs. MOFO Split-Safety Quarters/Cover 6) against opposing QB passing tendencies.
+2. Trench leverage: Pass protection win rate vs. defensive pressure-to-sack ratios.
+3. In player projections, strictly analyze the confirmed starters and scratches provided in the JSON input.
+4. Output strictly compliant JSON matching the provided schema.
 """
     prompt = f"""
 Analyze this NFL game payload:
@@ -300,16 +313,19 @@ Output strictly valid JSON with this exact schema:
                 return response.text
             except Exception as e:
                 if attempt == 2:
-                    print(f"Failed analysis for {payload['matchup']}: {e}")
+                    print(f"Failed LLM synthesis for {payload['matchup']}: {e}")
                     return json.dumps({
-                        "executive_summary": f"Quant assessment generated: {recommended_line}",
-                        "schematic_matchup": {"away_offense_vs_home_defense": "Data unparsed", "home_offense_vs_away_defense": "Data unparsed"},
+                        "executive_summary": f"Quantitative assessment: {recommended_line}",
+                        "schematic_matchup": {
+                            "away_offense_vs_home_defense": "Execution pending film audit.",
+                            "home_offense_vs_away_defense": "Execution pending film audit."
+                        },
                         "player_projections": {"away_team": {}, "home_team": {}},
                         "actionable_verdict": f"{'PASS - 0.00u' if recommended_team == 'PASS' else 'Bet ' + recommended_line + ' - ' + str(kelly_units) + 'u'}"
                     })
                 await asyncio.sleep(2 ** attempt)
 
-# 7. Main Pipeline Processing
+# 7. Main Quantitative Pipeline Execution
 async def main():
     target_week = 1
     upcoming = pd.DataFrame()
@@ -321,10 +337,10 @@ async def main():
             upcoming = unplayed[unplayed["week"] == target_week].copy()
 
     if upcoming.empty:
-        print("No active unplayed slate found.")
+        print("No unplayed regular season slate found.")
         sys.exit(0)
 
-    print(f"Executing Week {target_week} Quant Pipeline ({len(upcoming)} matchups)...")
+    print(f"Executing Week {target_week} Analytical Slate ({len(upcoming)} games)...")
 
     tasks = []
     metadata = []
@@ -382,24 +398,27 @@ async def main():
         home_spread_edge = home_cover_prob - 0.5238
         away_spread_edge = away_cover_prob - 0.5238
 
-        home_line_formatted = f"{home_team} {spread_line:+g}"
-        away_line_formatted = f"{away_team} {-spread_line:+g}"
+        # Correct Vegas Ticket Notation:
+        # spread_line > 0 means home is favored (e.g. spread_line=9.5 -> Home -9.5, Away +9.5)
+        vegas_home_line = f"{home_team} {-spread_line:+g}"
+        vegas_away_line = f"{away_team} {+spread_line:+g}"
 
+        # 2.0% minimum threshold with a realistic 5.0% institutional edge ceiling
         if home_spread_edge > 0.02 and home_spread_edge > away_spread_edge:
             recommended_team = home_team
-            recommended_line = home_line_formatted
+            recommended_line = vegas_home_line
             chosen_cover_prob = home_cover_prob
-            chosen_edge = min(0.060, home_spread_edge)
+            chosen_edge = min(0.050, home_spread_edge)
             kelly_units = calculate_quarter_kelly(home_cover_prob)
         elif away_spread_edge > 0.02 and away_spread_edge > home_spread_edge:
             recommended_team = away_team
-            recommended_line = away_line_formatted
+            recommended_line = vegas_away_line
             chosen_cover_prob = away_cover_prob
-            chosen_edge = min(0.060, away_spread_edge)
+            chosen_edge = min(0.050, away_spread_edge)
             kelly_units = calculate_quarter_kelly(away_cover_prob)
         else:
             recommended_team = "PASS"
-            recommended_line = "No Value"
+            recommended_line = "PASS - No Edge"
             chosen_cover_prob = max(home_cover_prob, away_cover_prob)
             chosen_edge = max(home_spread_edge, away_spread_edge)
             kelly_units = 0.00
@@ -410,14 +429,14 @@ async def main():
         payload = {
             "matchup": matchup,
             "market": {
-                "vegas_spread": home_line_formatted,
+                "consensus_spread": vegas_home_line,
                 "total": total_line,
-                "devigged_home_ml_prob": f"{market_home_prob:.1%}"
+                "devigged_home_win_prob": f"{market_home_prob:.1%}"
             },
-            "metrics": {
-                "net_pass_epa_differential": f"{net_pass_edge:+.3f}",
-                "net_rush_epa_differential": f"{net_rush_edge:+.3f}",
-                "explosive_play_differential": f"{diff_explosive:+.3f}",
+            "tape_metrics": {
+                "net_pass_epa_diff": f"{net_pass_edge:+.3f}",
+                "net_rush_epa_diff": f"{net_rush_edge:+.3f}",
+                "explosive_rate_diff": f"{diff_explosive:+.3f}",
             },
             "model_calculations": {
                 "calibrated_home_win_prob": f"{calibrated_home_win_prob:.1%}",
@@ -446,6 +465,7 @@ async def main():
             "recommended_line": recommended_line
         })
 
+    # Await concurrent LLM analysis
     results = await asyncio.gather(*tasks)
 
     records = []
@@ -453,7 +473,7 @@ async def main():
         rec = {k: v for k, v in meta.items() if k != "recommended_line"}
         rec["analysis"] = text_response
         records.append(rec)
-        print(f"Processed: {meta['matchup']} | Line: {meta['recommended_line']} | Kelly: {meta['kelly_units']}u")
+        print(f"Slate Execution: {meta['matchup']} | Line: {meta['recommended_line']} | Edge: {meta['spread_edge']:+.1%} | Kelly: {meta['kelly_units']}u")
 
     # 8. Neon Database Synchronization
     if records:
@@ -477,7 +497,7 @@ async def main():
                 {"target_week": target_week}
             )
         df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
-        print(f"Neon database synchronized for Week {target_week} with {len(df_results)} records.")
+        print(f"Database synchronized: {len(df_results)} calibrated records pushed for Week {target_week}.")
 
 if __name__ == "__main__":
     asyncio.run(main())
