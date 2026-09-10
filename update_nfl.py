@@ -92,7 +92,7 @@ for df in [schedules, pbp, player_stats, injuries, depth_charts]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
-# 3. Clean EPA & Explosive Rates
+# 3. Clean EPA & Explosive Feature Engineering
 if not pbp.empty:
     pbp_clean = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
@@ -134,7 +134,7 @@ if not pbp.empty:
 else:
     team_perf = pd.DataFrame()
 
-# 4. Point Spread Engine & Dynamic Market Calibration
+# 4. Point Spread Engine & Risk Allocation
 def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
     if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
         p_home = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
@@ -145,17 +145,14 @@ def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
     return float(norm.cdf(spread_line / 13.5))
 
 def calculate_spread_cover_distribution(raw_model_home_prob, market_home_prob, spread_line, total_line=44.0):
-    # Dynamic Market Weight: Higher market certainty applied to wide spreads
     spread_magnitude = abs(spread_line)
-    dynamic_market_weight = min(0.88, max(0.65, 0.65 + (spread_magnitude * 0.025)))
+    dynamic_market_weight = min(0.90, max(0.60, 0.60 + (spread_magnitude * 0.03)))
     calibrated_home_win_prob = ((1.0 - dynamic_market_weight) * raw_model_home_prob) + (dynamic_market_weight * market_home_prob)
     
-    # Margin volatility anchored to total
     sigma = 13.5 * math.sqrt(max(30.0, total_line) / 44.0)
     z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
     model_projected_margin = z_win * sigma
     
-    # Home covers if Margin > spread_line
     z_home_cover = (model_projected_margin - spread_line) / sigma
     continuous_home_cover = float(norm.cdf(z_home_cover))
     
@@ -170,16 +167,16 @@ def calculate_spread_cover_distribution(raw_model_home_prob, market_home_prob, s
     
     return float(calibrated_home_win_prob), float(home_cover_prob), float(away_cover_prob), float(push_rate)
 
-def calculate_quarter_kelly(prob_win, decimal_odds=1.9091, max_cap=2.00):
+def calculate_eighth_kelly(prob_win, decimal_odds=1.9091, max_cap=2.00):
     if prob_win <= 0.5238:
         return 0.0
     b = decimal_odds - 1.0
     q = 1.0 - prob_win
     raw_kelly = (b * prob_win - q) / b
-    fractional = raw_kelly * 0.25 * 100.0
+    fractional = raw_kelly * 0.125 * 100.0
     return round(float(min(max_cap, max(0.0, fractional))), 2)
 
-# 5. Advanced Skill-Player Stat Aggregation
+# 5. Roster & Production Volume Isolation
 def get_comprehensive_player_baselines(team_abbr):
     scratches = []
     if not injuries.empty and "team" in injuries.columns:
@@ -188,9 +185,8 @@ def get_comprehensive_player_baselines(team_abbr):
         if inj_name_col:
             scratches = t_inj[inj_name_col].dropna().unique().tolist()
 
-    starters = {"QB": "Starting QB", "RB": "Starting RB", "WR": "Starting WR"}
+    starters = {"QB": "Starting QB", "RB": "Starting RB", "WR": "Starting WR", "TE": "Starting TE"}
     
-    # Depth chart primary selection
     if not depth_charts.empty:
         team_col = next((c for c in ["club_code", "team"] if c in depth_charts.columns), None)
         pos_col = next((c for c in ["pos_abb", "position", "pos_name", "pos"] if c in depth_charts.columns), None)
@@ -199,80 +195,62 @@ def get_comprehensive_player_baselines(team_abbr):
 
         if team_col and pos_col and rank_col and name_col:
             t_dc = depth_charts[depth_charts[team_col] == team_abbr]
-            for pos in ["QB", "RB", "WR"]:
+            for pos in ["QB", "RB", "WR", "TE"]:
                 pos_match = t_dc[(t_dc[pos_col] == pos) & (t_dc[rank_col].astype(str).str.strip() == "1")]
                 if not pos_match.empty:
                     cand = pos_match.iloc[0][name_col]
                     if cand not in scratches:
                         starters[pos] = cand
 
-    team_stat_col = next((c for c in ["recent_team", "team"] if c in player_stats.columns), None)
     name_stat_col = next((c for c in ["player_name", "player", "full_name"] if c in player_stats.columns), None)
-    pos_stat_col = next((c for c in ["position", "pos"] if c in player_stats.columns), None)
 
     player_profiles = {}
-    if not player_stats.empty and team_stat_col and name_stat_col:
-        t_stats = player_stats[player_stats[team_stat_col] == team_abbr]
-        
-        # QB Baselines
-        qb_name = starters["QB"]
-        if qb_name == "Starting QB" and pos_stat_col:
-            qbs = t_stats[(t_stats[pos_stat_col] == "QB") & (~t_stats[name_stat_col].isin(scratches))]
-            if not qbs.empty:
-                qb_name = qbs.groupby(name_stat_col)["attempts"].mean().idxmax()
-        qb_df = t_stats[t_stats[name_stat_col] == qb_name]
-        player_profiles["QB"] = {
-            "name": qb_name,
-            "pass_yds_pg": round(float(qb_df["passing_yards"].mean()), 1) if "passing_yards" in qb_df else 225.0,
-            "pass_att_pg": round(float(qb_df["attempts"].mean()), 1) if "attempts" in qb_df else 32.0,
-            "pass_td_pg": round(float(qb_df["passing_tds"].mean()), 1) if "passing_tds" in qb_df else 1.5,
-            "rush_yds_pg": round(float(qb_df["rushing_yards"].mean()), 1) if "rushing_yards" in qb_df else 12.0
-        }
+    if not player_stats.empty and name_stat_col:
+        # Cross-team stat extraction to handle free-agency roster movement
+        def pull_stats(player_name, default_dict):
+            p_df = player_stats[player_stats[name_stat_col] == player_name]
+            if not p_df.empty:
+                res = {}
+                for k, col in default_dict.items():
+                    res[k] = round(float(p_df[col].mean()), 1) if col in p_df else 0.0
+                res["name"] = player_name
+                return res
+            default_dict["name"] = player_name
+            return default_dict
 
-        # RB Baselines
-        rb_name = starters["RB"]
-        if rb_name == "Starting RB" and pos_stat_col:
-            rbs = t_stats[(t_stats[pos_stat_col] == "RB") & (~t_stats[name_stat_col].isin(scratches))]
-            if not rbs.empty:
-                rb_name = rbs.groupby(name_stat_col)["carries"].mean().idxmax()
-        rb_df = t_stats[t_stats[name_stat_col] == rb_name]
-        player_profiles["RB"] = {
-            "name": rb_name,
-            "rush_yds_pg": round(float(rb_df["rushing_yards"].mean()), 1) if "rushing_yards" in rb_df else 65.0,
-            "rush_att_pg": round(float(rb_df["carries"].mean()), 1) if "carries" in rb_df else 14.5,
-            "receptions_pg": round(float(rb_df["receptions"].mean()), 1) if "receptions" in rb_df else 2.5,
-            "rec_yds_pg": round(float(rb_df["receiving_yards"].mean()), 1) if "receiving_yards" in rb_df else 15.0
-        }
-
-        # WR Baselines
-        wr_name = starters["WR"]
-        if wr_name == "Starting WR" and pos_stat_col:
-            wrs = t_stats[(t_stats[pos_stat_col] == "WR") & (~t_stats[name_stat_col].isin(scratches))]
-            if not wrs.empty:
-                wr_name = wrs.groupby(name_stat_col)["targets"].mean().idxmax()
-        wr_df = t_stats[t_stats[name_stat_col] == wr_name]
-        player_profiles["WR"] = {
-            "name": wr_name,
-            "rec_yds_pg": round(float(wr_df["receiving_yards"].mean()), 1) if "receiving_yards" in wr_df else 68.0,
-            "targets_pg": round(float(wr_df["targets"].mean()), 1) if "targets" in wr_df else 7.5,
-            "receptions_pg": round(float(wr_df["receptions"].mean()), 1) if "receptions" in wr_df else 4.8
-        }
+        player_profiles["QB"] = pull_stats(starters["QB"], {
+            "pass_yds_pg": "passing_yards", "pass_att_pg": "attempts", 
+            "pass_td_pg": "passing_tds", "rush_yds_pg": "rushing_yards"
+        })
+        player_profiles["RB"] = pull_stats(starters["RB"], {
+            "rush_yds_pg": "rushing_yards", "rush_att_pg": "carries", 
+            "receptions_pg": "receptions", "rec_yds_pg": "receiving_yards"
+        })
+        player_profiles["WR"] = pull_stats(starters["WR"], {
+            "rec_yds_pg": "receiving_yards", "targets_pg": "targets", 
+            "receptions_pg": "receptions"
+        })
+        player_profiles["TE"] = pull_stats(starters["TE"], {
+            "rec_yds_pg": "receiving_yards", "targets_pg": "targets", 
+            "receptions_pg": "receptions"
+        })
 
     return {
         "profiles": player_profiles,
         "scratches": scratches[:5] if scratches else ["None Reported"]
     }
 
-# 6. Async LLM Execution
+# 6. Structurally Constrained LLM Evaluator
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
-You are an NFL Strategic Research Director and quantitative prop analyst.
-Analyze both team spread edges and discrete player stat projections (passing, rushing, receiving, catching receptions).
+You are an NFL Strategic Research Director and quantitative prop handicapper.
+Analyze matchups by synthesizing Expected Points Added (EPA), Success Rates, explosive play ratios, personnel scratches, and key-number spread edges.
 
-Strict Protocols:
-1. Formulate discrete player prop projections informed by the baseline stats, defensive EPA allowed, and projected game script.
-2. In the player projections, output numeric predictions alongside a brief schematic justification.
-3. Output strictly valid JSON matching the exact schema.
+Strict Mathematical & Volume Constraints:
+1. Reconcile Target Trees: Projected team passing yards must realistically equal the sum of receiving yards across pass catchers (WR + TE + RB + Other). 
+2. Ground Output in Vegas Totals: If total < 43.0, compress passing volume to reflect game environment.
+3. Roster Discipline: Never hallucinate retired players (e.g. Aaron Donald) or coaches no longer with the team. Reference solely confirmed players.
+4. Output strictly valid JSON matching the schema.
 """
     prompt = f"""
 Analyze this NFL matchup payload:
@@ -282,8 +260,8 @@ Output strictly valid JSON with this exact schema:
 {{
   "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS based on market key numbers.",
   "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Film-grounded breakdown of coverage shells, blitz packages, and run-fit dynamics.",
-    "home_offense_vs_away_defense": "Film-grounded breakdown of coverage shells, blitz packages, and run-fit dynamics."
+    "away_offense_vs_home_defense": "Breakdown of passing concepts vs. coverage shells and pass-protection win rates.",
+    "home_offense_vs_away_defense": "Breakdown of passing concepts vs. coverage shells and pass-protection win rates."
   }},
   "player_projections": {{
     "away_team": {{
@@ -292,20 +270,26 @@ Output strictly valid JSON with this exact schema:
         "projected_pass_yards": 0.0,
         "projected_pass_tds": 0.0,
         "projected_rush_yards": 0.0,
-        "analysis": "Brief schematic rationale."
+        "analysis": "Brief rationale."
       }},
       "RB": {{
         "player": "{payload['rosters']['away_team']['profiles'].get('RB', {}).get('name', 'Starting RB')}",
         "projected_rush_yards": 0.0,
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief schematic rationale."
+        "analysis": "Brief rationale."
       }},
       "WR": {{
         "player": "{payload['rosters']['away_team']['profiles'].get('WR', {}).get('name', 'Starting WR')}",
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief schematic rationale."
+        "analysis": "Brief rationale."
+      }},
+      "TE": {{
+        "player": "{payload['rosters']['away_team']['profiles'].get('TE', {}).get('name', 'Starting TE')}",
+        "projected_receptions": 0.0,
+        "projected_rec_yards": 0.0,
+        "analysis": "Brief rationale."
       }}
     }},
     "home_team": {{
@@ -314,20 +298,26 @@ Output strictly valid JSON with this exact schema:
         "projected_pass_yards": 0.0,
         "projected_pass_tds": 0.0,
         "projected_rush_yards": 0.0,
-        "analysis": "Brief schematic rationale."
+        "analysis": "Brief rationale."
       }},
       "RB": {{
         "player": "{payload['rosters']['home_team']['profiles'].get('RB', {}).get('name', 'Starting RB')}",
         "projected_rush_yards": 0.0,
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief schematic rationale."
+        "analysis": "Brief rationale."
       }},
       "WR": {{
         "player": "{payload['rosters']['home_team']['profiles'].get('WR', {}).get('name', 'Starting WR')}",
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief schematic rationale."
+        "analysis": "Brief rationale."
+      }},
+      "TE": {{
+        "player": "{payload['rosters']['home_team']['profiles'].get('TE', {}).get('name', 'Starting TE')}",
+        "projected_receptions": 0.0,
+        "projected_rec_yards": 0.0,
+        "analysis": "Brief rationale."
       }}
     }}
   }},
@@ -353,7 +343,7 @@ Output strictly valid JSON with this exact schema:
                 return response.text
             except Exception as e:
                 if attempt == 2:
-                    print(f"Failed analysis on {payload['matchup']}: {e}")
+                    print(f"Failed LLM synthesis for {payload['matchup']}: {e}")
                     return json.dumps({
                         "executive_summary": f"Quant execution line: {recommended_line}",
                         "schematic_matchup": {"away_offense_vs_home_defense": "N/A", "home_offense_vs_away_defense": "N/A"},
@@ -362,7 +352,7 @@ Output strictly valid JSON with this exact schema:
                     })
                 await asyncio.sleep(2 ** attempt)
 
-# 7. Main Pipeline
+# 7. Main Pipeline Processing
 async def main():
     target_week = 1
     upcoming = pd.DataFrame()
@@ -377,7 +367,7 @@ async def main():
         print("No active unplayed regular season slate found.")
         sys.exit(0)
 
-    print(f"Executing Week {target_week} Pipeline ({len(upcoming)} matchups)...")
+    print(f"Executing Week {target_week} Analytical Slate ({len(upcoming)} matchups)...")
 
     tasks = []
     metadata = []
@@ -438,19 +428,19 @@ async def main():
         vegas_home_line = f"{home_team} {-spread_line:+g}"
         vegas_away_line = f"{away_team} {+spread_line:+g}"
 
-        # Require a strict 2.0% edge threshold and dynamic edge ceiling
-        if home_spread_edge > 0.02 and home_spread_edge > away_spread_edge:
+        # Sizing via Eighth-Kelly
+        if home_spread_edge > 0.020 and home_spread_edge > away_spread_edge:
             recommended_team = home_team
             recommended_line = vegas_home_line
             chosen_cover_prob = home_cover_prob
             chosen_edge = min(0.050, home_spread_edge)
-            kelly_units = calculate_quarter_kelly(home_cover_prob)
-        elif away_spread_edge > 0.02 and away_spread_edge > home_spread_edge:
+            kelly_units = calculate_eighth_kelly(home_cover_prob)
+        elif away_spread_edge > 0.020 and away_spread_edge > home_spread_edge:
             recommended_team = away_team
             recommended_line = vegas_away_line
             chosen_cover_prob = away_cover_prob
             chosen_edge = min(0.050, away_spread_edge)
-            kelly_units = calculate_quarter_kelly(away_cover_prob)
+            kelly_units = calculate_eighth_kelly(away_cover_prob)
         else:
             recommended_team = "PASS"
             recommended_line = "PASS - No Edge"
@@ -507,8 +497,9 @@ async def main():
         rec = {k: v for k, v in meta.items() if k != "recommended_line"}
         rec["analysis"] = text_response
         records.append(rec)
-        print(f"Calculated: {meta['matchup']} | Line: {meta['recommended_line']} | Kelly: {meta['kelly_units']}u")
+        print(f"Slate Execution: {meta['matchup']} | Line: {meta['recommended_line']} | Edge: {meta['spread_edge']:+.1%} | Kelly: {meta['kelly_units']}u")
 
+    # 8. Database Synchronization
     if records:
         df_results = pd.DataFrame(records)
         with engine.begin() as conn:
@@ -530,7 +521,7 @@ async def main():
                 {"target_week": target_week}
             )
         df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
-        print(f"Neon database synchronized for Week {target_week} with {len(df_results)} calibrated records.")
+        print(f"Neon database synchronized for Week {target_week} with {len(df_results)} records.")
 
 if __name__ == "__main__":
     asyncio.run(main())
