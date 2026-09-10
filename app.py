@@ -104,5 +104,3 @@ for _, row in df.iterrows():
             with st.expander("Read Matchup Analysis (Legacy Format)"):
                 st.markdown(row['analysis'])
         st.write("---")
-            st.markdown(row['analysis'])
-        st.write("")
