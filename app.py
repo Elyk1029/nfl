@@ -50,7 +50,7 @@ def load_predictions():
 df = load_predictions()
 
 st.title("🏈 Institutional NFL Quantitative Engine")
-st.caption("Discrete Key-Number Modeling | Garbage-Time Filtered EPA | Eighth-Kelly Unit Allocations")
+st.caption("Bivariate Skellam Score Modeling | Early-Down EPA Isolation | Eighth-Kelly Unit Allocations")
 
 if df.empty:
     st.info("No prediction data currently available.")
@@ -86,7 +86,7 @@ for _, row in df.iterrows():
         cols[0].subheader(row['matchup'])
         cols[1].metric("Calibrated Home Win", f"{home_win_pct:.1f}%")
         cols[2].metric("Devigged Consensus", f"{market_win_pct:.1f}%")
-        cols[3].metric("Cover Probability", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
+        cols[3].metric("Skellam Cover Prob", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
         cols[4].metric("Eighth-Kelly", f"{kelly:.2f}u")
 
         try:
