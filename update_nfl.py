@@ -12,7 +12,7 @@ from scipy.stats import norm
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
-# 1. Verification & Database Connection
+# 1. Environment Verification & Client Initialization
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
 
@@ -26,9 +26,9 @@ MODEL_FILE = "nfl_model.json"
 model = xgb.XGBClassifier()
 if os.path.exists(MODEL_FILE):
     model.load_model(MODEL_FILE)
-    print("XGBoost classifier loaded.")
+    print("XGBoost classifier loaded successfully.")
 else:
-    raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found.")
+    raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
 
 FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
@@ -213,97 +213,78 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
                             roster_picks[label] = cand
 
     name_stat_col = next((c for c in ["player_name", "player", "full_name"] if c in player_stats.columns), None)
-    profiles = {}
-
-    # Benchmark Multiplier adjusted to Implied Total
+    profiles = []
     pace_factor = max(0.75, min(1.25, implied_team_total / 22.0))
 
     if not player_stats.empty and name_stat_col:
         def get_metrics(player_name, role):
             p_df = player_stats[player_stats[name_stat_col] == player_name]
-            p_dict = {"name": player_name, "role": role}
+            p_dict = {"player": player_name, "role": role, "team": team_abbr}
             
             if "QB" in role:
                 pass_yds = round(float(p_df["passing_yards"].mean()), 1) if not p_df.empty and "passing_yards" in p_df else 235.5
                 rush_yds = round(float(p_df["rushing_yards"].mean()), 1) if not p_df.empty and "rushing_yards" in p_df else 14.5
                 p_dict.update({
-                    "market_pass_yds": round(pass_yds * pace_factor, 1),
-                    "market_pass_tds": 1.5,
-                    "market_rush_yds": round(rush_yds, 1)
+                    "prop_type": "Pass Yards",
+                    "market_line": round(pass_yds * pace_factor, 1)
                 })
             elif "RB" in role:
                 rush_yds = round(float(p_df["rushing_yards"].mean()), 1) if not p_df.empty and "rushing_yards" in p_df else (62.5 if "1" in role else 28.5)
-                rec = round(float(p_df["receptions"].mean()), 1) if not p_df.empty and "receptions" in p_df else (2.5 if "1" in role else 1.5)
-                rec_yds = round(float(p_df["receiving_yards"].mean()), 1) if not p_df.empty and "receiving_yards" in p_df else (17.5 if "1" in role else 9.5)
                 p_dict.update({
-                    "market_rush_yds": round(rush_yds * pace_factor, 1),
-                    "market_receptions": round(rec, 1),
-                    "market_rec_yds": round(rec_yds * pace_factor, 1)
+                    "prop_type": "Rush Yards",
+                    "market_line": round(rush_yds * pace_factor, 1)
                 })
             elif "WR" in role or "TE" in role:
-                rec_def = 5.5 if "WR1" in role else (3.5 if "WR2" in role else 2.5)
-                yds_def = 68.5 if "WR1" in role else (44.5 if "WR2" in role else 28.5)
-                rec = round(float(p_df["receptions"].mean()), 1) if not p_df.empty and "receptions" in p_df else rec_def
+                yds_def = 68.5 if "WR1" in role else (44.5 if "WR2" in role else (28.5 if "WR3" in role else 38.5))
                 rec_yds = round(float(p_df["receiving_yards"].mean()), 1) if not p_df.empty and "receiving_yards" in p_df else yds_def
                 p_dict.update({
-                    "market_receptions": round(rec, 1),
-                    "market_rec_yds": round(rec_yds * pace_factor, 1)
+                    "prop_type": "Rec Yards",
+                    "market_line": round(rec_yds * pace_factor, 1)
                 })
             return p_dict
 
         for role_key, p_name in roster_picks.items():
-            profiles[role_key] = get_metrics(p_name, role_key)
+            profiles.append(get_metrics(p_name, role_key))
 
     return {
         "profiles": profiles,
         "scratches": scratches[:5] if scratches else ["None Reported"]
     }
 
-# 6. Strategic Scouting Voice LLM Evaluator
+# 6. Strategic Scouting Voice LLM Evaluator with Anti-Anchoring Chain-of-Thought Prompt
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
 You are an NFL Strategic Research Director and quantitative prop analyst.
-Analyze both team spread edges and discrete player prop projections across ALL skill players (QB, RB1, RB2, WR1, WR2, WR3, TE1).
+Analyze both team spread edges and discrete player prop projections across ALL skill roles (QB1, RB1, RB2, WR1, WR2, WR3, TE1).
 
 Evaluation Directives:
-1. Reconcile Target Trees: The sum of projected receiving yards across WRs, TEs, and RBs must equal 85-92% of the projected QB passing yards.
-2. Formulate discrete estimates for passing yards, rushing yards, receiving yards, and receptions.
-3. Compare your estimate directly against the market benchmark provided and issue a definitive OVER, UNDER, or PASS pick.
+1. Anti-Anchoring Mandate: Do NOT default to market benchmarks or copy numbers. Your projection must reflect your own independent read of usage share, game script, and matchup, even when it diverges from market baselines.
+2. Chain-of-Thought First: You must formulate the `tactical_rationale` explaining your film/data read BEFORE determining the final `projected_value`.
+3. Target Tree Sanity: After projecting each player independently, consider as a post-hoc check that total receiving yards should correlate logically with team passing volume.
 4. Output strictly valid JSON matching the exact schema without markdown formatting.
 """
     prompt = f"""
-Evaluate this NFL advance scouting dossier with sportsbook prop lines:
+Evaluate this NFL advance scouting dossier:
 {json.dumps(payload, indent=2)}
 
-Output strictly valid JSON matching this schema:
+Output strictly valid JSON matching this exact array schema (note that tactical_rationale must come BEFORE projected_value):
 {{
   "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS.",
   "schematic_matchup": {{
     "away_offense_vs_home_defense": "Film analysis of protection rates, blitz schemes, and coverage families (MOFC vs MOFO).",
     "home_offense_vs_away_defense": "Film analysis of protection rates, blitz schemes, and coverage families (MOFC vs MOFO)."
   }},
-  "player_projections": {{
-    "away_team": [
-      {{
-        "player": "Name", "role": "QB1",
-        "market_pass_yds": 0.0, "projected_pass_yds": 0.0, "pass_edge": "OVER/UNDER/PASS",
-        "market_rush_yds": 0.0, "projected_rush_yds": 0.0, "rush_edge": "OVER/UNDER/PASS",
-        "market_rec_yds": 0.0, "projected_rec_yds": 0.0, "rec_yds_edge": "PASS",
-        "market_receptions": 0.0, "projected_receptions": 0.0, "rec_edge": "PASS",
-        "tactical_rationale": "Film rationale."
-      }}
-    ],
-    "home_team": [
-      {{
-        "player": "Name", "role": "QB1",
-        "market_pass_yds": 0.0, "projected_pass_yds": 0.0, "pass_edge": "OVER/UNDER/PASS",
-        "market_rush_yds": 0.0, "projected_rush_yds": 0.0, "rush_edge": "OVER/UNDER/PASS",
-        "market_rec_yds": 0.0, "projected_rec_yds": 0.0, "rec_yds_edge": "PASS",
-        "market_receptions": 0.0, "projected_receptions": 0.0, "rec_edge": "PASS",
-        "tactical_rationale": "Film rationale."
-      }}
-    ]
-  }},
+  "player_projections": [
+    {{
+      "team": "Team Abbr",
+      "role": "QB1 / RB1 / RB2 / WR1 / WR2 / WR3 / TE1",
+      "player": "Player Name",
+      "prop_category": "Pass Yards / Rush Yards / Rec Yards",
+      "tactical_rationale": "Must write chain-of-thought film/data reasoning here first.",
+      "projected_value": 0.0,
+      "edge": "OVER / UNDER / PASS"
+    }}
+  ],
   "actionable_verdict": "{'PASS - 0.00u' if recommended_team == 'PASS' else 'Bet ' + recommended_line + ' - ' + str(kelly_units) + 'u'}"
 }}
 """
@@ -318,7 +299,7 @@ Output strictly valid JSON matching this schema:
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=system_prompt,
-                            temperature=0.1,
+                            temperature=0.2, # Slight temperature lift to encourage independent movement
                             response_mime_type="application/json"
                         )
                     )
@@ -329,7 +310,7 @@ Output strictly valid JSON matching this schema:
                     return json.dumps({
                         "executive_summary": f"Quant assessment: {recommended_line}",
                         "schematic_matchup": {"away_offense_vs_home_defense": "N/A", "home_offense_vs_away_defense": "N/A"},
-                        "player_projections": {"away_team": [], "home_team": []},
+                        "player_projections": [],
                         "actionable_verdict": f"{'PASS - 0.00u' if recommended_team == 'PASS' else 'Bet ' + recommended_line + ' - ' + str(kelly_units) + 'u'}"
                     })
                 await asyncio.sleep(2 ** attempt)
@@ -469,12 +450,15 @@ async def main():
             chosen_edge = max(home_spread_edge, away_spread_edge)
             kelly_units = 0.00
 
-        # Calculate implied team totals for prop scaling
         implied_home_total = (total_line / 2.0) + (spread_line / 2.0)
         implied_away_total = (total_line / 2.0) - (spread_line / 2.0)
 
         home_ctx = get_full_skill_player_baselines(home_team, implied_home_total)
         away_ctx = get_full_skill_player_baselines(away_team, implied_away_total)
+
+        # Build lookup dictionaries for post-hoc market baseline merging
+        home_market_map = {f"{p['role']}_{p['prop_type']}": p['market_line'] for p in home_ctx["profiles"]}
+        away_market_map = {f"{p['role']}_{p['prop_type']}": p['market_line'] for p in away_ctx["profiles"]}
 
         pre_processed.append({
             "game_id": str(game.get("game_id", f"2026_{week_num}_{away_team}_{home_team}")),
@@ -488,6 +472,7 @@ async def main():
             "recommended_team": rec_team,
             "recommended_line": rec_line,
             "total_line": total_line,
+            "market_maps": {"home": home_market_map, "away": away_market_map},
             "tape_metrics": {
                 "net_pass_epa_diff": f"{net_pass_edge:+.3f}",
                 "net_rush_epa_diff": f"{net_rush_edge:+.3f}",
@@ -506,6 +491,10 @@ async def main():
     semaphore = asyncio.Semaphore(4)
 
     for item in governed_slate:
+        # Pass stripped payload to Gemini (WITHOUT market lines directly adjacent to projections)
+        clean_profiles_home = [{"role": p["role"], "player": p["player"], "prop_type": p["prop_type"]} for p in item["rosters"]["home_team"]["profiles"]]
+        clean_profiles_away = [{"role": p["role"], "player": p["player"], "prop_type": p["prop_type"]} for p in item["rosters"]["away_team"]["profiles"]]
+
         payload = {
             "matchup": item["matchup"],
             "market": {
@@ -522,7 +511,10 @@ async def main():
                 "recommended_line": item["recommended_line"],
                 "suggested_kelly_units": f"{item['kelly_units']:.2f}u"
             },
-            "rosters": item["rosters"]
+            "rosters": {
+                "home_team": {"team": item["rosters"]["home_team"]["team"], "profiles": clean_profiles_home, "injuries": item["rosters"]["home_team"]["injuries"]},
+                "away_team": {"team": item["rosters"]["away_team"]["team"], "profiles": clean_profiles_away, "injuries": item["rosters"]["away_team"]["injuries"]}
+            }
         }
         tasks.append(generate_matchup_analysis(
             semaphore, payload, item["recommended_team"], item["recommended_line"], 
@@ -533,6 +525,27 @@ async def main():
 
     records = []
     for item, text_response in zip(governed_slate, results):
+        # Post-hoc merge market lines back into player projections so Streamlit can compare them
+        try:
+            parsed_analysis = json.loads(text_response)
+            if "player_projections" in parsed_analysis and isinstance(parsed_analysis["player_projections"], list):
+                for p in parsed_analysis["player_projections"]:
+                    team_key = "home" if p.get("team","").upper() == item["rosters"]["home_team"]["team"].upper() else "away"
+                    m_map = item["market_maps"][team_key]
+                    map_key = f"{p.get('role')}_{p.get('prop_category')}"
+                    # Matchup prop category strings
+                    if p.get('prop_category') == "Pass Yards":
+                        map_key = f"{p.get('role')}_Pass Yards"
+                    elif p.get('prop_category') == "Rush Yards":
+                        map_key = f"{p.get('role')}_Rush Yards"
+                    elif p.get('prop_category') == "Rec Yards":
+                        map_key = f"{p.get('role')}_Rec Yards"
+                    
+                    p["market_line"] = m_map.get(map_key, 50.0)
+                text_response = json.dumps(parsed_analysis)
+        except Exception as e:
+            print(f"Error merging post-hoc market lines for {item['matchup']}: {e}")
+
         records.append({
             "game_id": item["game_id"],
             "week": item["week"],
