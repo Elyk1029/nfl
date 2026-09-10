@@ -8,11 +8,11 @@ from google.genai import types
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy.stats import norm, skellam
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
-# 1. Environment Verification
+# 1. Environment & Database Verification
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
 
@@ -35,6 +35,7 @@ FEATURES = [
     "diff_explosive", "rest_diff", "is_divisional", "market_home_prob",
 ]
 
+# Discrete historical NFL key-number push frequencies
 NFL_KEY_PUSH_RATES = {
     3: 0.148, 7: 0.094, 6: 0.059, 10: 0.057, 4: 0.052, 14: 0.046, 1: 0.038, 2: 0.036
 }
@@ -92,13 +93,16 @@ for df in [schedules, pbp, player_stats, injuries, depth_charts]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
-# 3. Clean EPA & Explosive Feature Engineering
+# 3. High-Leverage EPA & Early-Down Success Feature Engineering
 if not pbp.empty:
     pbp_clean = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
+    
+    # Strip garbage time: WP must sit between 15% and 85% in second half
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
-        leverage_mask = (pbp_clean["qtr"] <= 2) | (pbp_clean["home_wp"].between(0.05, 0.95))
+        leverage_mask = (pbp_clean["qtr"] <= 2) | (pbp_clean["home_wp"].between(0.15, 0.85))
         pbp_clean = pbp_clean[leverage_mask]
 
+    pbp_clean["is_early_down"] = pbp_clean["down"].isin([1, 2]).astype(int) if "down" in pbp_clean.columns else 1
     pbp_clean["is_late_down"] = pbp_clean["down"].isin([3, 4]).astype(int) if "down" in pbp_clean.columns else 0
     pbp_clean["is_explosive"] = (
         ((pbp_clean["play_type"] == "pass") & (pbp_clean["yards_gained"] >= 15)) |
@@ -108,7 +112,7 @@ if not pbp.empty:
     off_stats = pbp_clean.groupby(["week", "posteam"]).agg(
         off_dropback_epa=("epa", lambda x: x[pbp_clean.loc[x.index, "play_type"] == "pass"].mean()),
         off_rush_epa=("epa", lambda x: x[pbp_clean.loc[x.index, "play_type"] == "run"].mean()),
-        off_success=("success", "mean"),
+        off_early_down_success=("success", lambda x: x[pbp_clean.loc[x.index, "is_early_down"] == 1].mean()),
         off_late_down_epa=("epa", lambda x: x[pbp_clean.loc[x.index, "is_late_down"] == 1].mean()),
         off_explosive=("is_explosive", "mean"),
     ).reset_index().rename(columns={"posteam": "team"})
@@ -116,7 +120,7 @@ if not pbp.empty:
     def_stats = pbp_clean.groupby(["week", "defteam"]).agg(
         def_dropback_epa=("epa", lambda x: x[pbp_clean.loc[x.index, "play_type"] == "pass"].mean()),
         def_rush_epa=("epa", lambda x: x[pbp_clean.loc[x.index, "play_type"] == "run"].mean()),
-        def_success=("success", "mean"),
+        def_early_down_success=("success", lambda x: x[pbp_clean.loc[x.index, "is_early_down"] == 1].mean()),
         def_late_down_epa=("epa", lambda x: x[pbp_clean.loc[x.index, "is_late_down"] == 1].mean()),
     ).reset_index().rename(columns={"defteam": "team"})
 
@@ -124,8 +128,8 @@ if not pbp.empty:
     team_perf.sort_values(["team", "week"], inplace=True)
 
     metric_cols = [
-        "off_dropback_epa", "off_rush_epa", "off_success", "off_late_down_epa", "off_explosive",
-        "def_dropback_epa", "def_rush_epa", "def_success", "def_late_down_epa",
+        "off_dropback_epa", "off_rush_epa", "off_early_down_success", "off_late_down_epa", "off_explosive",
+        "def_dropback_epa", "def_rush_epa", "def_early_down_success", "def_late_down_epa",
     ]
     for col in metric_cols:
         team_perf[f"roll_{col}"] = team_perf.groupby("team")[col].transform(
@@ -134,7 +138,7 @@ if not pbp.empty:
 else:
     team_perf = pd.DataFrame()
 
-# 4. Point Spread Engine & Eighth-Kelly Risk Sizing
+# 4. Discrete Skellam Point Spread Engine & Eighth-Kelly Risk Sizing
 def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
     if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
         p_home = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
@@ -144,28 +148,47 @@ def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
             return float(p_home / tot)
     return float(norm.cdf(spread_line / 13.5))
 
-def calculate_spread_cover_distribution(raw_model_home_prob, market_home_prob, spread_line, total_line=44.0):
+def calculate_skellam_spread_distribution(raw_model_home_prob, market_home_prob, spread_line, total_line=44.0):
+    """
+    Bivariate Poisson / Skellam score margin engine. 
+    Models Home Score - Away Score as independent Poisson distributions to calibrate discrete key-number mass.
+    """
+    # Dynamic Bayesian shrinkage anchored to market liquidity
     spread_magnitude = abs(spread_line)
-    # Dynamic shrinkage to avoid collapsing favorites on short spreads
     dynamic_market_weight = min(0.92, max(0.68, 0.68 + (spread_magnitude * 0.025)))
     calibrated_home_win_prob = ((1.0 - dynamic_market_weight) * raw_model_home_prob) + (dynamic_market_weight * market_home_prob)
     
+    # Implied Projected Margin from calibrated win probability
     sigma = 13.5 * math.sqrt(max(30.0, total_line) / 44.0)
     z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
-    model_projected_margin = z_win * sigma
+    model_margin = z_win * sigma
+
+    # Derive offensive lambda parameters
+    lambda_home = max(6.0, (total_line + model_margin) / 2.0)
+    lambda_away = max(6.0, (total_line - model_margin) / 2.0)
     
-    z_home_cover = (model_projected_margin - spread_line) / sigma
-    continuous_home_cover = float(norm.cdf(z_home_cover))
-    
-    abs_spread = round(abs(spread_line))
-    push_rate = NFL_KEY_PUSH_RATES.get(abs_spread, 0.015) if float(spread_line).is_integer() else 0.0
-    
-    home_cover_prob = continuous_home_cover * (1.0 - (push_rate * 0.5))
-    away_cover_prob = (1.0 - continuous_home_cover) * (1.0 - (push_rate * 0.5))
-    
+    # Continuous to discrete threshold: Home covers if Actual Margin > spread_line
+    # In Skellam: P(Home - Away > spread_line) = 1 - cdf(spread_line)
+    if float(spread_line).is_integer():
+        k = int(spread_line)
+        # Push probability at exact integer key
+        push_rate = float(skellam.pmf(k, lambda_home, lambda_away))
+        raw_home_cover = float(1.0 - skellam.cdf(k, lambda_home, lambda_away))
+        raw_away_cover = float(skellam.cdf(k - 1, lambda_home, lambda_away))
+        
+        # Split key push density into devigged binary outcomes
+        home_cover_prob = raw_home_cover + (push_rate * 0.5)
+        away_cover_prob = raw_away_cover + (push_rate * 0.5)
+    else:
+        k = math.floor(spread_line)
+        push_rate = 0.0
+        home_cover_prob = float(1.0 - skellam.cdf(k, lambda_home, lambda_away))
+        away_cover_prob = float(skellam.cdf(k, lambda_home, lambda_away))
+
+    # Operational sanity clamping
     home_cover_prob = max(0.30, min(0.70, home_cover_prob))
     away_cover_prob = max(0.30, min(0.70, away_cover_prob))
-    
+
     return float(calibrated_home_win_prob), float(home_cover_prob), float(away_cover_prob), float(push_rate)
 
 def calculate_eighth_kelly(prob_win, decimal_odds=1.9091, max_cap=2.00):
@@ -177,7 +200,7 @@ def calculate_eighth_kelly(prob_win, decimal_odds=1.9091, max_cap=2.00):
     fractional = raw_kelly * 0.125 * 100.0
     return round(float(min(max_cap, max(0.0, fractional))), 2)
 
-# 5. Advanced Skill-Player Stat Aggregation
+# 5. Roster & Personnel Isolation
 def get_comprehensive_player_baselines(team_abbr):
     scratches = []
     if not injuries.empty and "team" in injuries.columns:
@@ -240,7 +263,7 @@ def get_comprehensive_player_baselines(team_abbr):
         "scratches": scratches[:5] if scratches else ["None Reported"]
     }
 
-# 6. Strategic Scouting Voice LLM Evaluator
+# 6. Strategic Scouting Voice Evaluator
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
 You are an NFL Strategic Research Director and advance scouting analyst.
@@ -249,7 +272,7 @@ Analyze games strictly through scheme execution, film breakdowns, Expected Point
 Mandatory Directives:
 1. Speak as an NFL coach and research coordinator. NEVER reference the prompt, JSON keys, or payload (do not say "as per payload", "in the data", or "according to instructions").
 2. Active Roster Grounding: Only evaluate confirmed active players provided in the roster object. Do NOT claim any player is retired, missing, or departed unless explicitly present in the injuries list.
-3. Reconcile Target Trees: Total individual receiving yards projected across pass catchers must realistically sum to the projected QB passing yards.
+3. Target Tree Mathematical Reconciliation: Total receiving yards projected across WR, TE, and RB MUST sum to approximately 85-90% of projected QB passing yards (allowing for secondary depth).
 4. Output strictly valid JSON matching the exact schema.
 """
     prompt = f"""
@@ -260,8 +283,8 @@ Output strictly valid JSON with this exact schema:
 {{
   "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS based on market key numbers.",
   "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Film breakdown analyzing pass protection win rates, run schemes, and coverage shell clashes.",
-    "home_offense_vs_away_defense": "Film breakdown analyzing pass protection win rates, run schemes, and coverage shell clashes."
+    "away_offense_vs_home_defense": "Film breakdown analyzing pass protection win rates, run schemes, and coverage shell clashes (MOFC vs MOFO).",
+    "home_offense_vs_away_defense": "Film breakdown analyzing pass protection win rates, run schemes, and coverage shell clashes (MOFC vs MOFO)."
   }},
   "player_projections": {{
     "away_team": {{
@@ -343,7 +366,6 @@ Output strictly valid JSON with this exact schema:
                 return response.text
             except Exception as e:
                 if attempt == 2:
-                    print(f"Failed LLM synthesis for {payload['matchup']}: {e}")
                     return json.dumps({
                         "executive_summary": f"Quant assessment: {recommended_line}",
                         "schematic_matchup": {"away_offense_vs_home_defense": "N/A", "home_offense_vs_away_defense": "N/A"},
@@ -352,7 +374,7 @@ Output strictly valid JSON with this exact schema:
                     })
                 await asyncio.sleep(2 ** attempt)
 
-# 7. Main Pipeline Processing
+# 7. Main Pipeline Execution
 async def main():
     target_week = 1
     upcoming = pd.DataFrame()
@@ -408,7 +430,7 @@ async def main():
                         (get_metric(away_row, "roll_off_rush_epa") - get_metric(home_row, "roll_def_rush_epa"))
         net_late_down_edge = (get_metric(home_row, "roll_off_late_down_epa") - get_metric(away_row, "roll_def_late_down_epa")) - \
                              (get_metric(away_row, "roll_off_late_down_epa") - get_metric(home_row, "roll_def_late_down_epa"))
-        diff_success = get_metric(home_row, "roll_off_success", 0.44) - get_metric(away_row, "roll_off_success", 0.44)
+        diff_success = get_metric(home_row, "roll_off_early_down_success", 0.44) - get_metric(away_row, "roll_off_early_down_success", 0.44)
         diff_explosive = get_metric(home_row, "roll_off_explosive", 0.12) - get_metric(away_row, "roll_off_explosive", 0.12)
 
         feature_row = pd.DataFrame([[
@@ -418,7 +440,8 @@ async def main():
 
         raw_model_home_prob = float(model.predict_proba(feature_row)[0][1])
 
-        calibrated_home_win_prob, home_cover_prob, away_cover_prob, push_prob = calculate_spread_cover_distribution(
+        # Skellam Discrete Point Spread Engine
+        calibrated_home_win_prob, home_cover_prob, away_cover_prob, push_prob = calculate_skellam_spread_distribution(
             raw_model_home_prob, market_home_prob, spread_line, total_line
         )
 
@@ -428,7 +451,7 @@ async def main():
         vegas_home_line = f"{home_team} {-spread_line:+g}"
         vegas_away_line = f"{away_team} {+spread_line:+g}"
 
-        # Asymmetric threshold: Require +3.0% on road underdogs to mitigate key hook clustering
+        # Asymmetric hurdle: Require +3.0% edge on road underdogs to filter key hook clustering
         is_away_dog = (spread_line > 0)
         edge_hurdle = 0.030 if is_away_dog else 0.020
 
@@ -465,6 +488,7 @@ async def main():
                 "net_pass_epa_diff": f"{net_pass_edge:+.3f}",
                 "net_rush_epa_diff": f"{net_rush_edge:+.3f}",
                 "explosive_rate_diff": f"{diff_explosive:+.3f}",
+                "early_down_success_diff": f"{diff_success:+.3f}"
             },
             "model_calculations": {
                 "calibrated_home_win_prob": f"{calibrated_home_win_prob:.1%}",
@@ -500,9 +524,9 @@ async def main():
         rec = {k: v for k, v in meta.items() if k != "recommended_line"}
         rec["analysis"] = text_response
         records.append(rec)
-        print(f"Execution: {meta['matchup']} | Line: {meta['recommended_line']} | Edge: {meta['spread_edge']:+.1%} | Kelly: {meta['kelly_units']}u")
+        print(f"Executed: {meta['matchup']} | Line: {meta['recommended_line']} | Edge: {meta['spread_edge']:+.1%} | Stake: {meta['kelly_units']}u")
 
-    # 8. Database Synchronization
+    # 8. Database Upsert
     if records:
         df_results = pd.DataFrame(records)
         with engine.begin() as conn:
@@ -524,7 +548,7 @@ async def main():
                 {"target_week": target_week}
             )
         df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
-        print(f"Neon database synchronized for Week {target_week} with {len(df_results)} records.")
+        print(f"Database synchronized: {len(df_results)} records successfully committed for Week {target_week}.")
 
 if __name__ == "__main__":
     asyncio.run(main())
