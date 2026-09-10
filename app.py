@@ -50,13 +50,13 @@ def load_predictions():
 df = load_predictions()
 
 st.title("🏈 Institutional NFL Quantitative Engine")
-st.caption("Bivariate Skellam Score Modeling | Early-Down EPA Isolation | Eighth-Kelly Unit Allocations")
+st.caption("Full Depth-Chart Prop Ingestion | Dynamic Market Shrinkage | Eighth-Kelly Staking")
 
 if df.empty:
     st.info("No prediction data currently available.")
     st.stop()
 
-# Header Metrics
+# Header Summary Metrics
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Games Modeled", len(df))
 max_edge_row = df.loc[df['spread_edge'].abs().idxmax()]
@@ -86,7 +86,7 @@ for _, row in df.iterrows():
         cols[0].subheader(row['matchup'])
         cols[1].metric("Calibrated Home Win", f"{home_win_pct:.1f}%")
         cols[2].metric("Devigged Consensus", f"{market_win_pct:.1f}%")
-        cols[3].metric("Skellam Cover Prob", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
+        cols[3].metric("Cover Probability", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
         cols[4].metric("Eighth-Kelly", f"{kelly:.2f}u")
 
         try:
@@ -101,10 +101,10 @@ for _, row in df.iterrows():
             else:
                 st.success(f"**Execution:** {verdict}")
 
-            with st.expander("Tactical Matchup Breakdown & Prop Projections"):
+            with st.expander("Tactical Matchup Breakdown & Full-Roster Prop Market"):
                 st.write(f"**Tactical Brief:** {analysis_data.get('executive_summary', '')}")
                 
-                tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Target Tree & Props"])
+                tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Full-Roster Props vs Market Lines"])
                 with tab_scheme:
                     st.markdown("**Away Offense vs. Home Front & Shell**")
                     st.write(analysis_data['schematic_matchup'].get('away_offense_vs_home_defense', 'N/A'))
@@ -113,52 +113,87 @@ for _, row in df.iterrows():
                 
                 with tab_props:
                     projections = analysis_data.get('player_projections', {})
-                    c_away, c_home = st.columns(2)
                     teams = row['matchup'].split('@')
                     
-                    def render_prop_matrix(team_key, team_name, col):
-                        with col:
-                            st.markdown(f"#### {team_name.strip()} Output Projections")
-                            tp = projections.get(team_key, {})
+                    def render_player_market_table(team_key, team_name):
+                        st.markdown(f"#### {team_name.strip()} Market Comparison Matrix")
+                        player_list = projections.get(team_key, [])
+                        
+                        if isinstance(player_list, list) and player_list:
+                            rows = []
+                            for p in player_list:
+                                role = p.get("role", "SKILL")
+                                name = p.get("player", "Unknown")
+                                
+                                # QB Market Row
+                                if "QB" in role:
+                                    m_pass = p.get("market_pass_yds", 0.0)
+                                    ai_pass = p.get("projected_pass_yds", 0.0)
+                                    p_edge = p.get("pass_edge", "PASS")
+                                    m_rush = p.get("market_rush_yds", 0.0)
+                                    ai_rush = p.get("projected_rush_yds", 0.0)
+                                    r_edge = p.get("rush_edge", "PASS")
+                                    
+                                    rows.append({
+                                        "Role": role, "Player": name, "Category": "Pass Yards",
+                                        "Sportsbook Line": f"{m_pass:.1f}", "AI Estimate": f"{ai_pass:.1f}",
+                                        "Market Edge": f"{ai_pass - m_pass:+.1f}", "Action": p_edge
+                                    })
+                                    rows.append({
+                                        "Role": role, "Player": name, "Category": "Rush Yards",
+                                        "Sportsbook Line": f"{m_rush:.1f}", "AI Estimate": f"{ai_rush:.1f}",
+                                        "Market Edge": f"{ai_rush - m_rush:+.1f}", "Action": r_edge
+                                    })
+                                
+                                # RB Market Row
+                                elif "RB" in role:
+                                    m_rush = p.get("market_rush_yds", 0.0)
+                                    ai_rush = p.get("projected_rush_yards", 0.0)
+                                    r_edge = p.get("rush_edge", "PASS")
+                                    m_rec = p.get("market_receptions", 0.0)
+                                    ai_rec = p.get("projected_receptions", 0.0)
+                                    rec_edge = p.get("rec_edge", "PASS")
+                                    
+                                    rows.append({
+                                        "Role": role, "Player": name, "Category": "Rush Yards",
+                                        "Sportsbook Line": f"{m_rush:.1f}", "AI Estimate": f"{ai_rush:.1f}",
+                                        "Market Edge": f"{ai_rush - m_rush:+.1f}", "Action": r_edge
+                                    })
+                                    rows.append({
+                                        "Role": role, "Player": name, "Category": "Receptions",
+                                        "Sportsbook Line": f"{m_rec:.1f}", "AI Estimate": f"{ai_rec:.1f}",
+                                        "Market Edge": f"{ai_rec - m_rec:+.1f}", "Action": rec_edge
+                                    })
+                                
+                                # WR / TE Market Row
+                                elif "WR" in role or "TE" in role:
+                                    m_yds = p.get("market_rec_yds", 0.0)
+                                    ai_yds = p.get("projected_rec_yards", 0.0)
+                                    y_edge = p.get("rec_yds_edge", "PASS")
+                                    m_rec = p.get("market_receptions", 0.0)
+                                    ai_rec = p.get("projected_receptions", 0.0)
+                                    rec_edge = p.get("rec_edge", "PASS")
+                                    
+                                    rows.append({
+                                        "Role": role, "Player": name, "Category": "Rec Yards",
+                                        "Sportsbook Line": f"{m_yds:.1f}", "AI Estimate": f"{ai_yds:.1f}",
+                                        "Market Edge": f"{ai_yds - m_yds:+.1f}", "Action": y_edge
+                                    })
+                                    rows.append({
+                                        "Role": role, "Player": name, "Category": "Receptions",
+                                        "Sportsbook Line": f"{m_rec:.1f}", "AI Estimate": f"{ai_rec:.1f}",
+                                        "Market Edge": f"{ai_rec - m_rec:+.1f}", "Action": rec_edge
+                                    })
                             
-                            qb = tp.get("QB", {})
-                            rb = tp.get("RB", {})
-                            wr = tp.get("WR", {})
-                            te = tp.get("TE", {})
-                            
-                            table_rows = [
-                                {
-                                    "Role": "QB", "Player": qb.get("player", "N/A"), 
-                                    "Pass Yds": f"{qb.get('projected_pass_yards', 0.0):.1f}",
-                                    "Pass TD": f"{qb.get('projected_pass_tds', 0.0):.1f}",
-                                    "Rush Yds": f"{qb.get('projected_rush_yards', 0.0):.1f}",
-                                    "Rec": "-", "Rec Yds": "-"
-                                },
-                                {
-                                    "Role": "RB", "Player": rb.get("player", "N/A"),
-                                    "Pass Yds": "-", "Pass TD": "-",
-                                    "Rush Yds": f"{rb.get('projected_rush_yards', 0.0):.1f}",
-                                    "Rec": f"{rb.get('projected_receptions', 0.0):.1f}",
-                                    "Rec Yds": f"{rb.get('projected_rec_yards', 0.0):.1f}"
-                                },
-                                {
-                                    "Role": "WR1", "Player": wr.get("player", "N/A"),
-                                    "Pass Yds": "-", "Pass TD": "-", "Rush Yds": "-",
-                                    "Rec": f"{wr.get('projected_receptions', 0.0):.1f}",
-                                    "Rec Yds": f"{wr.get('projected_rec_yards', 0.0):.1f}"
-                                },
-                                {
-                                    "Role": "TE1", "Player": te.get("player", "N/A"),
-                                    "Pass Yds": "-", "Pass TD": "-", "Rush Yds": "-",
-                                    "Rec": f"{te.get('projected_receptions', 0.0):.1f}",
-                                    "Rec Yds": f"{te.get('projected_rec_yards', 0.0):.1f}"
-                                }
-                            ]
-                            st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
-                            st.caption(f"**QB Film Note:** _{qb.get('analysis', '')}_")
+                            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                        else:
+                            st.caption("No structured player prop data available for this squad.")
 
-                    render_prop_matrix("away_team", teams[0], c_away)
-                    render_prop_matrix("home_team", teams[1], c_home)
+                    c_away, c_home = st.columns(2)
+                    with c_away:
+                        render_player_market_table("away_team", teams[0])
+                    with c_home:
+                        render_player_market_table("home_team", teams[1])
         else:
             with st.expander("Analysis Logs"):
                 st.write(row['analysis'])
