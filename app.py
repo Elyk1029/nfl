@@ -50,7 +50,7 @@ def load_predictions():
 df = load_predictions()
 
 st.title("🏈 Institutional NFL Quantitative Engine")
-st.caption("Discrete Key-Number Modeling | Garbage-Time Filtered EPA | Quarter-Kelly Unit Allocations")
+st.caption("Discrete Key-Number Modeling | Garbage-Time Filtered EPA | Eighth-Kelly Unit Allocations")
 
 if df.empty:
     st.info("No prediction data currently available.")
@@ -87,7 +87,7 @@ for _, row in df.iterrows():
         cols[1].metric("Calibrated Home Win", f"{home_win_pct:.1f}%")
         cols[2].metric("Devigged Consensus", f"{market_win_pct:.1f}%")
         cols[3].metric("Cover Probability", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
-        cols[4].metric("Quarter-Kelly", f"{kelly:.2f}u")
+        cols[4].metric("Eighth-Kelly", f"{kelly:.2f}u")
 
         try:
             analysis_data = json.loads(row['analysis'])
@@ -104,7 +104,7 @@ for _, row in df.iterrows():
             with st.expander("Tactical Matchup Breakdown & Prop Projections"):
                 st.write(f"**Tactical Brief:** {analysis_data.get('executive_summary', '')}")
                 
-                tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Player Prop Projections"])
+                tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Target Tree & Props"])
                 with tab_scheme:
                     st.markdown("**Away Offense vs. Home Front & Shell**")
                     st.write(analysis_data['schematic_matchup'].get('away_offense_vs_home_defense', 'N/A'))
@@ -116,40 +116,51 @@ for _, row in df.iterrows():
                     c_away, c_home = st.columns(2)
                     teams = row['matchup'].split('@')
                     
-                    def render_team_props(team_key, team_name, col):
+                    def render_prop_matrix(team_key, team_name, col):
                         with col:
-                            st.markdown(f"### {team_name.strip()} Projections")
-                            team_p = projections.get(team_key, {})
+                            st.markdown(f"#### {team_name.strip()} Output Projections")
+                            tp = projections.get(team_key, {})
                             
-                            qb = team_p.get("QB", {})
-                            st.markdown(f"**QB: {qb.get('player', 'Starting QB')}**")
-                            qb_cols = st.columns(3)
-                            qb_cols[0].metric("Pass Yds", f"{qb.get('projected_pass_yards', 0.0):.1f}")
-                            qb_cols[1].metric("Pass TDs", f"{qb.get('projected_pass_tds', 0.0):.1f}")
-                            qb_cols[2].metric("Rush Yds", f"{qb.get('projected_rush_yards', 0.0):.1f}")
-                            st.caption(f"_{qb.get('analysis', '')}_")
+                            qb = tp.get("QB", {})
+                            rb = tp.get("RB", {})
+                            wr = tp.get("WR", {})
+                            te = tp.get("TE", {})
+                            
+                            table_rows = [
+                                {
+                                    "Role": "QB", "Player": qb.get("player", "N/A"), 
+                                    "Pass Yds": f"{qb.get('projected_pass_yards', 0.0):.1f}",
+                                    "Pass TD": f"{qb.get('projected_pass_tds', 0.0):.1f}",
+                                    "Rush Yds": f"{qb.get('projected_rush_yards', 0.0):.1f}",
+                                    "Rec": "-", "Rec Yds": "-"
+                                },
+                                {
+                                    "Role": "RB", "Player": rb.get("player", "N/A"),
+                                    "Pass Yds": "-", "Pass TD": "-",
+                                    "Rush Yds": f"{rb.get('projected_rush_yards', 0.0):.1f}",
+                                    "Rec": f"{rb.get('projected_receptions', 0.0):.1f}",
+                                    "Rec Yds": f"{rb.get('projected_rec_yards', 0.0):.1f}"
+                                },
+                                {
+                                    "Role": "WR1", "Player": wr.get("player", "N/A"),
+                                    "Pass Yds": "-", "Pass TD": "-", "Rush Yds": "-",
+                                    "Rec": f"{wr.get('projected_receptions', 0.0):.1f}",
+                                    "Rec Yds": f"{wr.get('projected_rec_yards', 0.0):.1f}"
+                                },
+                                {
+                                    "Role": "TE1", "Player": te.get("player", "N/A"),
+                                    "Pass Yds": "-", "Pass TD": "-", "Rush Yds": "-",
+                                    "Rec": f"{te.get('projected_receptions', 0.0):.1f}",
+                                    "Rec Yds": f"{te.get('projected_rec_yards', 0.0):.1f}"
+                                }
+                            ]
+                            st.dataframe(pd.DataFrame(table_rows), hide_index=True, use_container_width=True)
+                            st.caption(f"**QB Film Note:** _{qb.get('analysis', '')}_")
 
-                            rb = team_p.get("RB", {})
-                            st.markdown(f"**RB: {rb.get('player', 'Starting RB')}**")
-                            rb_cols = st.columns(3)
-                            rb_cols[0].metric("Rush Yds", f"{rb.get('projected_rush_yards', 0.0):.1f}")
-                            rb_cols[1].metric("Receptions", f"{rb.get('projected_receptions', 0.0):.1f}")
-                            rb_cols[2].metric("Rec Yds", f"{rb.get('projected_rec_yards', 0.0):.1f}")
-                            st.caption(f"_{rb.get('analysis', '')}_")
-
-                            wr = team_p.get("WR", {})
-                            st.markdown(f"**WR: {wr.get('player', 'Starting WR')}**")
-                            wr_cols = st.columns(2)
-                            wr_cols[0].metric("Receptions", f"{wr.get('projected_receptions', 0.0):.1f}")
-                            wr_cols[1].metric("Rec Yds", f"{wr.get('projected_rec_yards', 0.0):.1f}")
-                            st.caption(f"_{wr.get('analysis', '')}_")
-
-                    render_team_props("away_team", teams[0], c_away)
-                    render_team_props("home_team", teams[1], c_home)
+                    render_prop_matrix("away_team", teams[0], c_away)
+                    render_prop_matrix("home_team", teams[1], c_home)
         else:
             with st.expander("Analysis Logs"):
                 st.write(row['analysis'])
-
-        st.divider()
 
         st.divider()
