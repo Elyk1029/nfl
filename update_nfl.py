@@ -101,8 +101,11 @@ else:
 # Aggregate rolling baselines for top skill positions
 top_qbs = top_rbs = top_wrs = pd.DataFrame()
 if not player_stats.empty:
+    # Dynamic column resolver to handle nflverse data dictionary updates
+    team_col = "recent_team" if "recent_team" in player_stats.columns else "team"
+    
     recent_stats = player_stats[player_stats['week'] >= player_stats['week'].max() - 4]
-    player_baselines = recent_stats.groupby(['recent_team', 'player_id', 'player_name', 'position']).agg(
+    player_baselines = recent_stats.groupby([team_col, 'player_id', 'player_name', 'position']).agg(
         avg_pass_yards=('passing_yards', 'mean'),
         avg_pass_tds=('passing_tds', 'mean'),
         avg_rush_yards=('rushing_yards', 'mean'),
@@ -110,9 +113,9 @@ if not player_stats.empty:
         avg_targets=('targets', 'mean')
     ).reset_index()
     
-    top_qbs = player_baselines[player_baselines['position'] == 'QB'].sort_values('avg_pass_yards', ascending=False).groupby('recent_team').head(1)
-    top_rbs = player_baselines[player_baselines['position'] == 'RB'].sort_values('avg_rush_yards', ascending=False).groupby('recent_team').head(1)
-    top_wrs = player_baselines[player_baselines['position'] == 'WR'].sort_values('avg_targets', ascending=False).groupby('recent_team').head(1)
+    top_qbs = player_baselines[player_baselines['position'] == 'QB'].sort_values('avg_pass_yards', ascending=False).groupby(team_col).head(1)
+    top_rbs = player_baselines[player_baselines['position'] == 'RB'].sort_values('avg_rush_yards', ascending=False).groupby(team_col).head(1)
+    top_wrs = player_baselines[player_baselines['position'] == 'WR'].sort_values('avg_targets', ascending=False).groupby(team_col).head(1)
 
 # 4. Filter Upcoming Unplayed Matchups (Pulls the entire next slate)
 next_week = schedules[schedules["result"].isna()]["week"].min()
@@ -147,7 +150,9 @@ You must output a JSON object with the following exact keys:
 """
 
 def get_top_player_string(team_abbr, df, pos, stat_col, stat_name):
-    player_row = df[df['recent_team'] == team_abbr]
+    if df.empty: return "Unknown"
+    tc = "recent_team" if "recent_team" in df.columns else "team"
+    player_row = df[df[tc] == team_abbr]
     if not player_row.empty:
         name = player_row.iloc[0]['player_name']
         val = player_row.iloc[0][stat_col]
