@@ -12,7 +12,7 @@ from scipy.stats import norm
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
-# 1. Environment & Database Verification
+# 1. Environment Verification
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
 
@@ -53,7 +53,7 @@ def clean_team_abbr(team_str):
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
 
-print("Ingesting schedules, rosters, and historical stats...")
+print("Ingesting schedules, rosters, and live depth charts...")
 try:
     schedules = nfl.load_schedules(seasons=[CURRENT_SEASON]).to_pandas()
 except Exception:
@@ -134,7 +134,7 @@ if not pbp.empty:
 else:
     team_perf = pd.DataFrame()
 
-# 4. Point Spread Engine & Risk Allocation
+# 4. Point Spread Engine & Eighth-Kelly Risk Sizing
 def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
     if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
         p_home = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
@@ -146,7 +146,8 @@ def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
 
 def calculate_spread_cover_distribution(raw_model_home_prob, market_home_prob, spread_line, total_line=44.0):
     spread_magnitude = abs(spread_line)
-    dynamic_market_weight = min(0.90, max(0.60, 0.60 + (spread_magnitude * 0.03)))
+    # Dynamic shrinkage to avoid collapsing favorites on short spreads
+    dynamic_market_weight = min(0.92, max(0.68, 0.68 + (spread_magnitude * 0.025)))
     calibrated_home_win_prob = ((1.0 - dynamic_market_weight) * raw_model_home_prob) + (dynamic_market_weight * market_home_prob)
     
     sigma = 13.5 * math.sqrt(max(30.0, total_line) / 44.0)
@@ -176,7 +177,7 @@ def calculate_eighth_kelly(prob_win, decimal_odds=1.9091, max_cap=2.00):
     fractional = raw_kelly * 0.125 * 100.0
     return round(float(min(max_cap, max(0.0, fractional))), 2)
 
-# 5. Roster & Production Volume Isolation
+# 5. Advanced Skill-Player Stat Aggregation
 def get_comprehensive_player_baselines(team_abbr):
     scratches = []
     if not injuries.empty and "team" in injuries.columns:
@@ -206,7 +207,6 @@ def get_comprehensive_player_baselines(team_abbr):
 
     player_profiles = {}
     if not player_stats.empty and name_stat_col:
-        # Cross-team stat extraction to handle free-agency roster movement
         def pull_stats(player_name, default_dict):
             p_df = player_stats[player_stats[name_stat_col] == player_name]
             if not p_df.empty:
@@ -240,28 +240,28 @@ def get_comprehensive_player_baselines(team_abbr):
         "scratches": scratches[:5] if scratches else ["None Reported"]
     }
 
-# 6. Structurally Constrained LLM Evaluator
+# 6. Strategic Scouting Voice LLM Evaluator
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
-You are an NFL Strategic Research Director and quantitative prop handicapper.
-Analyze matchups by synthesizing Expected Points Added (EPA), Success Rates, explosive play ratios, personnel scratches, and key-number spread edges.
+You are an NFL Strategic Research Director and advance scouting analyst.
+Analyze games strictly through scheme execution, film breakdowns, Expected Points Added (EPA), and key-number spread edges.
 
-Strict Mathematical & Volume Constraints:
-1. Reconcile Target Trees: Projected team passing yards must realistically equal the sum of receiving yards across pass catchers (WR + TE + RB + Other). 
-2. Ground Output in Vegas Totals: If total < 43.0, compress passing volume to reflect game environment.
-3. Roster Discipline: Never hallucinate retired players (e.g. Aaron Donald) or coaches no longer with the team. Reference solely confirmed players.
-4. Output strictly valid JSON matching the schema.
+Mandatory Directives:
+1. Speak as an NFL coach and research coordinator. NEVER reference the prompt, JSON keys, or payload (do not say "as per payload", "in the data", or "according to instructions").
+2. Active Roster Grounding: Only evaluate confirmed active players provided in the roster object. Do NOT claim any player is retired, missing, or departed unless explicitly present in the injuries list.
+3. Reconcile Target Trees: Total individual receiving yards projected across pass catchers must realistically sum to the projected QB passing yards.
+4. Output strictly valid JSON matching the exact schema.
 """
     prompt = f"""
-Analyze this NFL matchup payload:
+Evaluate this NFL advance scouting dossier:
 {json.dumps(payload, indent=2)}
 
 Output strictly valid JSON with this exact schema:
 {{
   "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS based on market key numbers.",
   "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Breakdown of passing concepts vs. coverage shells and pass-protection win rates.",
-    "home_offense_vs_away_defense": "Breakdown of passing concepts vs. coverage shells and pass-protection win rates."
+    "away_offense_vs_home_defense": "Film breakdown analyzing pass protection win rates, run schemes, and coverage shell clashes.",
+    "home_offense_vs_away_defense": "Film breakdown analyzing pass protection win rates, run schemes, and coverage shell clashes."
   }},
   "player_projections": {{
     "away_team": {{
@@ -270,26 +270,26 @@ Output strictly valid JSON with this exact schema:
         "projected_pass_yards": 0.0,
         "projected_pass_tds": 0.0,
         "projected_rush_yards": 0.0,
-        "analysis": "Brief rationale."
+        "analysis": "Film note."
       }},
       "RB": {{
         "player": "{payload['rosters']['away_team']['profiles'].get('RB', {}).get('name', 'Starting RB')}",
         "projected_rush_yards": 0.0,
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief rationale."
+        "analysis": "Film note."
       }},
       "WR": {{
         "player": "{payload['rosters']['away_team']['profiles'].get('WR', {}).get('name', 'Starting WR')}",
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief rationale."
+        "analysis": "Film note."
       }},
       "TE": {{
         "player": "{payload['rosters']['away_team']['profiles'].get('TE', {}).get('name', 'Starting TE')}",
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief rationale."
+        "analysis": "Film note."
       }}
     }},
     "home_team": {{
@@ -298,26 +298,26 @@ Output strictly valid JSON with this exact schema:
         "projected_pass_yards": 0.0,
         "projected_pass_tds": 0.0,
         "projected_rush_yards": 0.0,
-        "analysis": "Brief rationale."
+        "analysis": "Film note."
       }},
       "RB": {{
         "player": "{payload['rosters']['home_team']['profiles'].get('RB', {}).get('name', 'Starting RB')}",
         "projected_rush_yards": 0.0,
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief rationale."
+        "analysis": "Film note."
       }},
       "WR": {{
         "player": "{payload['rosters']['home_team']['profiles'].get('WR', {}).get('name', 'Starting WR')}",
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief rationale."
+        "analysis": "Film note."
       }},
       "TE": {{
         "player": "{payload['rosters']['home_team']['profiles'].get('TE', {}).get('name', 'Starting TE')}",
         "projected_receptions": 0.0,
         "projected_rec_yards": 0.0,
-        "analysis": "Brief rationale."
+        "analysis": "Film note."
       }}
     }}
   }},
@@ -345,7 +345,7 @@ Output strictly valid JSON with this exact schema:
                 if attempt == 2:
                     print(f"Failed LLM synthesis for {payload['matchup']}: {e}")
                     return json.dumps({
-                        "executive_summary": f"Quant execution line: {recommended_line}",
+                        "executive_summary": f"Quant assessment: {recommended_line}",
                         "schematic_matchup": {"away_offense_vs_home_defense": "N/A", "home_offense_vs_away_defense": "N/A"},
                         "player_projections": {"away_team": {}, "home_team": {}},
                         "actionable_verdict": f"{'PASS - 0.00u' if recommended_team == 'PASS' else 'Bet ' + recommended_line + ' - ' + str(kelly_units) + 'u'}"
@@ -428,14 +428,17 @@ async def main():
         vegas_home_line = f"{home_team} {-spread_line:+g}"
         vegas_away_line = f"{away_team} {+spread_line:+g}"
 
-        # Sizing via Eighth-Kelly
+        # Asymmetric threshold: Require +3.0% on road underdogs to mitigate key hook clustering
+        is_away_dog = (spread_line > 0)
+        edge_hurdle = 0.030 if is_away_dog else 0.020
+
         if home_spread_edge > 0.020 and home_spread_edge > away_spread_edge:
             recommended_team = home_team
             recommended_line = vegas_home_line
             chosen_cover_prob = home_cover_prob
             chosen_edge = min(0.050, home_spread_edge)
             kelly_units = calculate_eighth_kelly(home_cover_prob)
-        elif away_spread_edge > 0.020 and away_spread_edge > home_spread_edge:
+        elif away_spread_edge > edge_hurdle and away_spread_edge > home_spread_edge:
             recommended_team = away_team
             recommended_line = vegas_away_line
             chosen_cover_prob = away_cover_prob
@@ -497,7 +500,7 @@ async def main():
         rec = {k: v for k, v in meta.items() if k != "recommended_line"}
         rec["analysis"] = text_response
         records.append(rec)
-        print(f"Slate Execution: {meta['matchup']} | Line: {meta['recommended_line']} | Edge: {meta['spread_edge']:+.1%} | Kelly: {meta['kelly_units']}u")
+        print(f"Execution: {meta['matchup']} | Line: {meta['recommended_line']} | Edge: {meta['spread_edge']:+.1%} | Kelly: {meta['kelly_units']}u")
 
     # 8. Database Synchronization
     if records:
