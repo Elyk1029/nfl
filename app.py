@@ -89,7 +89,6 @@ for _, row in df.iterrows():
         cols[3].metric("Cover Probability", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
         cols[4].metric("Quarter-Kelly", f"{kelly:.2f}u")
 
-        # JSON Structural Parsing
         try:
             analysis_data = json.loads(row['analysis'])
         except Exception:
@@ -102,30 +101,55 @@ for _, row in df.iterrows():
             else:
                 st.success(f"**Execution:** {verdict}")
 
-            with st.expander("Tactical Matchup Breakdown & Film Projections"):
+            with st.expander("Tactical Matchup Breakdown & Prop Projections"):
                 st.write(f"**Tactical Brief:** {analysis_data.get('executive_summary', '')}")
                 
-                tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Personnel & Projections"])
+                tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Player Prop Projections"])
                 with tab_scheme:
-                    st.markdown("**Away Passing/Run Game vs. Home Front & Shell**")
+                    st.markdown("**Away Offense vs. Home Front & Shell**")
                     st.write(analysis_data['schematic_matchup'].get('away_offense_vs_home_defense', 'N/A'))
-                    st.markdown("**Home Passing/Run Game vs. Away Front & Shell**")
+                    st.markdown("**Home Offense vs. Away Front & Shell**")
                     st.write(analysis_data['schematic_matchup'].get('home_offense_vs_away_defense', 'N/A'))
+                
                 with tab_props:
+                    projections = analysis_data.get('player_projections', {})
                     c_away, c_home = st.columns(2)
                     teams = row['matchup'].split('@')
-                    with c_away:
-                        st.markdown(f"**{teams[0].strip()} Lineup Baselines**")
-                        away_props = analysis_data.get('player_projections', {}).get('away_team', {})
-                        for pos in ["QB", "RB", "WR"]:
-                            st.write(f"• **{pos}:** {away_props.get(pos, 'N/A')}")
-                    with c_home:
-                        st.markdown(f"**{teams[1].strip()} Lineup Baselines**")
-                        home_props = analysis_data.get('player_projections', {}).get('home_team', {})
-                        for pos in ["QB", "RB", "WR"]:
-                            st.write(f"• **{pos}:** {home_props.get(pos, 'N/A')}")
+                    
+                    def render_team_props(team_key, team_name, col):
+                        with col:
+                            st.markdown(f"### {team_name.strip()} Projections")
+                            team_p = projections.get(team_key, {})
+                            
+                            qb = team_p.get("QB", {})
+                            st.markdown(f"**QB: {qb.get('player', 'Starting QB')}**")
+                            qb_cols = st.columns(3)
+                            qb_cols[0].metric("Pass Yds", f"{qb.get('projected_pass_yards', 0.0):.1f}")
+                            qb_cols[1].metric("Pass TDs", f"{qb.get('projected_pass_tds', 0.0):.1f}")
+                            qb_cols[2].metric("Rush Yds", f"{qb.get('projected_rush_yards', 0.0):.1f}")
+                            st.caption(f"_{qb.get('analysis', '')}_")
+
+                            rb = team_p.get("RB", {})
+                            st.markdown(f"**RB: {rb.get('player', 'Starting RB')}**")
+                            rb_cols = st.columns(3)
+                            rb_cols[0].metric("Rush Yds", f"{rb.get('projected_rush_yards', 0.0):.1f}")
+                            rb_cols[1].metric("Receptions", f"{rb.get('projected_receptions', 0.0):.1f}")
+                            rb_cols[2].metric("Rec Yds", f"{rb.get('projected_rec_yards', 0.0):.1f}")
+                            st.caption(f"_{rb.get('analysis', '')}_")
+
+                            wr = team_p.get("WR", {})
+                            st.markdown(f"**WR: {wr.get('player', 'Starting WR')}**")
+                            wr_cols = st.columns(2)
+                            wr_cols[0].metric("Receptions", f"{wr.get('projected_receptions', 0.0):.1f}")
+                            wr_cols[1].metric("Rec Yds", f"{wr.get('projected_rec_yards', 0.0):.1f}")
+                            st.caption(f"_{wr.get('analysis', '')}_")
+
+                    render_team_props("away_team", teams[0], c_away)
+                    render_team_props("home_team", teams[1], c_home)
         else:
             with st.expander("Analysis Logs"):
                 st.write(row['analysis'])
+
+        st.divider()
 
         st.divider()
