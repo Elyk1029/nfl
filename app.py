@@ -15,9 +15,19 @@ if not db_url:
     st.error("DATABASE_URL environment variable is not configured.")
     st.stop()
 
+@st.cache_resource
+def get_db_engine():
+    return create_engine(
+        db_url,
+        pool_size=5,
+        max_overflow=10,
+        pool_pre_ping=True,
+        pool_recycle=300
+    )
+
 @st.cache_data(ttl=300)
 def load_predictions():
-    engine = create_engine(db_url)
+    engine = get_db_engine()
     query = """
         SELECT DISTINCT ON (game_id)
             game_id,
@@ -33,13 +43,14 @@ def load_predictions():
         FROM nfl_weekly_analysis
         ORDER BY game_id, week DESC;
     """
-    df = pd.read_sql(query, engine)
+    with engine.connect() as conn:
+        df = pd.read_sql(query, conn)
     return df
 
 df = load_predictions()
 
 st.title("🏈 Institutional NFL Quantitative Engine")
-st.caption("Discrete Key-Number Modeling | EPA Garbage-Time Filtering | Quarter-Kelly Unit Allocations")
+st.caption("Discrete Key-Number Modeling | Garbage-Time Filtered EPA | Quarter-Kelly Unit Allocations")
 
 if df.empty:
     st.info("No prediction data currently available.")
@@ -49,17 +60,17 @@ if df.empty:
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Games Modeled", len(df))
 max_edge_row = df.loc[df['spread_edge'].abs().idxmax()]
-c2.metric("Top Spread Edge", f"{max_edge_row['matchup']}", f"{max_edge_row['spread_edge']*100:+.1f}%")
-c3.metric("Top Recommended Size", f"{df['kelly_units'].max():.2f}u")
-c4.metric("Week", f"Week {int(df['week'].max())}")
+c2.metric("Top Model Edge", f"{max_edge_row['matchup']}", f"{max_edge_row['spread_edge']*100:+.1f}%")
+c3.metric("Peak Recommended Stake", f"{df['kelly_units'].max():.2f}u")
+c4.metric("Active Slate", f"Week {int(df['week'].max())}")
 
 st.divider()
 
-# Interactive Filter Controls
-st.sidebar.header("Risk Configuration")
-min_spread_edge = st.sidebar.slider("Minimum Spread Edge %", 0.0, 10.0, 1.5, 0.5)
+# Sidebar Risk Controls
+st.sidebar.header("Execution Filters")
+min_spread_edge = st.sidebar.slider("Minimum Edge Cutoff %", 0.0, 10.0, 1.5, 0.25)
 
-# Render Games
+# Render Matchup Cards
 for _, row in df.iterrows():
     spread_edge_pct = (row.get('spread_edge') or 0.0) * 100
     if abs(spread_edge_pct) < min_spread_edge:
@@ -73,12 +84,12 @@ for _, row in df.iterrows():
     with st.container():
         cols = st.columns([2.5, 1.5, 1.5, 1.5, 1.5])
         cols[0].subheader(row['matchup'])
-        cols[1].metric("Model Home Win", f"{home_win_pct:.1f}%")
-        cols[2].metric("Market Devigged", f"{market_win_pct:.1f}%")
-        cols[3].metric("Spread Cover", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}%")
-        cols[4].metric("Kelly Size", f"{kelly:.2f}u")
+        cols[1].metric("Calibrated Home Win", f"{home_win_pct:.1f}%")
+        cols[2].metric("Devigged Consensus", f"{market_win_pct:.1f}%")
+        cols[3].metric("Cover Probability", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
+        cols[4].metric("Quarter-Kelly", f"{kelly:.2f}u")
 
-        # JSON Analysis Parsing
+        # JSON Structural Parsing
         try:
             analysis_data = json.loads(row['analysis'])
         except Exception:
@@ -87,35 +98,34 @@ for _, row in df.iterrows():
         if "schematic_matchup" in analysis_data:
             verdict = analysis_data.get('actionable_verdict', 'PASS')
             if "PASS" in verdict.upper():
-                st.info(f"**Recommendation:** {verdict}")
+                st.info(f"**Execution:** {verdict}")
             else:
-                st.success(f"**Recommendation:** {verdict}")
+                st.success(f"**Execution:** {verdict}")
 
-            with st.expander("Schematic Clash, Personnel & Projections"):
-                st.write(f"**Executive Summary:** {analysis_data.get('executive_summary', '')}")
+            with st.expander("Tactical Matchup Breakdown & Film Projections"):
+                st.write(f"**Tactical Brief:** {analysis_data.get('executive_summary', '')}")
                 
-                tab_scheme, tab_props = st.tabs(["🧠 Schematic Analysis", "🎯 Player Projections"])
+                tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Personnel & Projections"])
                 with tab_scheme:
-                    st.markdown("#### Away Offense vs. Home Defense")
-                    st.write(analysis_data['schematic_matchup'].get('away_offense_vs_home_defense', ''))
-                    st.markdown("#### Home Offense vs. Away Defense")
-                    st.write(analysis_data['schematic_matchup'].get('home_offense_vs_away_defense', ''))
+                    st.markdown("**Away Passing/Run Game vs. Home Front & Shell**")
+                    st.write(analysis_data['schematic_matchup'].get('away_offense_vs_home_defense', 'N/A'))
+                    st.markdown("**Home Passing/Run Game vs. Away Front & Shell**")
+                    st.write(analysis_data['schematic_matchup'].get('home_offense_vs_away_defense', 'N/A'))
                 with tab_props:
                     c_away, c_home = st.columns(2)
+                    teams = row['matchup'].split('@')
                     with c_away:
-                        st.markdown(f"**{row['matchup'].split('@')[0].strip()} Skill Projections**")
-                        away_props = analysis_data['player_projections'].get('away_team', {})
-                        st.write(f"• **QB:** {away_props.get('QB', 'N/A')}")
-                        st.write(f"• **RB:** {away_props.get('RB', 'N/A')}")
-                        st.write(f"• **WR:** {away_props.get('WR', 'N/A')}")
+                        st.markdown(f"**{teams[0].strip()} Lineup Baselines**")
+                        away_props = analysis_data.get('player_projections', {}).get('away_team', {})
+                        for pos in ["QB", "RB", "WR"]:
+                            st.write(f"• **{pos}:** {away_props.get(pos, 'N/A')}")
                     with c_home:
-                        st.markdown(f"**{row['matchup'].split('@')[1].strip()} Skill Projections**")
-                        home_props = analysis_data['player_projections'].get('home_team', {})
-                        st.write(f"• **QB:** {home_props.get('QB', 'N/A')}")
-                        st.write(f"• **RB:** {home_props.get('RB', 'N/A')}")
-                        st.write(f"• **WR:** {home_props.get('WR', 'N/A')}")
+                        st.markdown(f"**{teams[1].strip()} Lineup Baselines**")
+                        home_props = analysis_data.get('player_projections', {}).get('home_team', {})
+                        for pos in ["QB", "RB", "WR"]:
+                            st.write(f"• **{pos}:** {home_props.get(pos, 'N/A')}")
         else:
-            with st.expander("Legacy Text Summary"):
+            with st.expander("Analysis Logs"):
                 st.write(row['analysis'])
 
-        st.write("---")
+        st.divider()
