@@ -155,12 +155,8 @@ else:
   )
 
 # 4. Filter Upcoming Unplayed Matchups
-upcoming = (
-    schedules[schedules["result"].isna()]
-    .sort_values(["season", "week"])
-    .head(3)
-    .copy()
-)
+next_week = schedules[schedules["result"].isna()]["week"].min()
+upcoming = schedules[(schedules["result"].isna()) & (schedules["week"] == next_week)].copy()
 
 system_prompt = (
     "You are a quantitative sports handicapper. You are evaluating an upcoming"
