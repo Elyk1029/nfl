@@ -8,11 +8,11 @@ from google.genai import types
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
-from scipy.stats import norm, skellam
+from scipy.stats import norm
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
-# 1. Environment & Database Verification
+# 1. Verification & Database Connection
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
 
@@ -26,16 +26,16 @@ MODEL_FILE = "nfl_model.json"
 model = xgb.XGBClassifier()
 if os.path.exists(MODEL_FILE):
     model.load_model(MODEL_FILE)
-    print("XGBoost model loaded successfully.")
+    print("XGBoost classifier loaded.")
 else:
-    raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
+    raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found.")
 
 FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
     "diff_explosive", "rest_diff", "is_divisional", "market_home_prob",
 ]
 
-# Discrete historical NFL key-number push frequencies
+# Discrete empirical key-number push densities
 NFL_KEY_PUSH_RATES = {
     3: 0.148, 7: 0.094, 6: 0.059, 10: 0.057, 4: 0.052, 14: 0.046, 1: 0.038, 2: 0.036
 }
@@ -93,11 +93,11 @@ for df in [schedules, pbp, player_stats, injuries, depth_charts]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
-# 3. High-Leverage EPA & Early-Down Success Feature Engineering
+# 3. High-Leverage EPA & Early-Down Success Rate (EDSR)
 if not pbp.empty:
     pbp_clean = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
     
-    # Strip garbage time: WP must sit between 15% and 85% in second half
+    # Strict Garbage-Time Truncation: Win Prob must sit between 15% and 85% in second half
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
         leverage_mask = (pbp_clean["qtr"] <= 2) | (pbp_clean["home_wp"].between(0.15, 0.85))
         pbp_clean = pbp_clean[leverage_mask]
@@ -138,7 +138,7 @@ if not pbp.empty:
 else:
     team_perf = pd.DataFrame()
 
-# 4. Discrete Skellam Point Spread Engine & Eighth-Kelly Risk Sizing
+# 4. Corrected Continuous Margin & Key-Number Distribution Engine
 def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
     if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
         p_home = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
@@ -148,47 +148,36 @@ def get_devigged_market_home_prob(spread_line, home_ml=None, away_ml=None):
             return float(p_home / tot)
     return float(norm.cdf(spread_line / 13.5))
 
-def calculate_skellam_spread_distribution(raw_model_home_prob, market_home_prob, spread_line, total_line=44.0):
+def calculate_spread_cover_distribution(raw_model_home_prob, market_home_prob, spread_line, total_line=44.0):
     """
-    Bivariate Poisson / Skellam score margin engine. 
-    Models Home Score - Away Score as independent Poisson distributions to calibrate discrete key-number mass.
+    Calibrates spread margin using empirical NFL standard deviation (sigma ~ 13.5).
+    nflreadr convention: spread_line > 0 means Home team is favored.
     """
-    # Dynamic Bayesian shrinkage anchored to market liquidity
+    # Spread-scaled Bayesian shrinkage: Dampens raw XGBoost mean regression
     spread_magnitude = abs(spread_line)
-    dynamic_market_weight = min(0.92, max(0.68, 0.68 + (spread_magnitude * 0.025)))
+    dynamic_market_weight = min(0.92, max(0.70, 0.70 + (spread_magnitude * 0.025)))
     calibrated_home_win_prob = ((1.0 - dynamic_market_weight) * raw_model_home_prob) + (dynamic_market_weight * market_home_prob)
     
-    # Implied Projected Margin from calibrated win probability
+    # Scale sigma proportionally to total
     sigma = 13.5 * math.sqrt(max(30.0, total_line) / 44.0)
     z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
-    model_margin = z_win * sigma
+    model_projected_margin = z_win * sigma
 
-    # Derive offensive lambda parameters
-    lambda_home = max(6.0, (total_line + model_margin) / 2.0)
-    lambda_away = max(6.0, (total_line - model_margin) / 2.0)
+    # Continuous cover evaluation: Home covers if Actual Margin (Home - Away) > spread_line
+    z_home_cover = (model_projected_margin - spread_line) / sigma
+    continuous_home_cover = float(norm.cdf(z_home_cover))
     
-    # Continuous to discrete threshold: Home covers if Actual Margin > spread_line
-    # In Skellam: P(Home - Away > spread_line) = 1 - cdf(spread_line)
-    if float(spread_line).is_integer():
-        k = int(spread_line)
-        # Push probability at exact integer key
-        push_rate = float(skellam.pmf(k, lambda_home, lambda_away))
-        raw_home_cover = float(1.0 - skellam.cdf(k, lambda_home, lambda_away))
-        raw_away_cover = float(skellam.cdf(k - 1, lambda_home, lambda_away))
-        
-        # Split key push density into devigged binary outcomes
-        home_cover_prob = raw_home_cover + (push_rate * 0.5)
-        away_cover_prob = raw_away_cover + (push_rate * 0.5)
-    else:
-        k = math.floor(spread_line)
-        push_rate = 0.0
-        home_cover_prob = float(1.0 - skellam.cdf(k, lambda_home, lambda_away))
-        away_cover_prob = float(skellam.cdf(k, lambda_home, lambda_away))
-
-    # Operational sanity clamping
+    # Key-number push mass adjustment
+    abs_spread = round(abs(spread_line))
+    push_rate = NFL_KEY_PUSH_RATES.get(abs_spread, 0.015) if float(spread_line).is_integer() else 0.0
+    
+    home_cover_prob = continuous_home_cover * (1.0 - (push_rate * 0.5))
+    away_cover_prob = (1.0 - continuous_home_cover) * (1.0 - (push_rate * 0.5))
+    
+    # Institutional bounds
     home_cover_prob = max(0.30, min(0.70, home_cover_prob))
     away_cover_prob = max(0.30, min(0.70, away_cover_prob))
-
+    
     return float(calibrated_home_win_prob), float(home_cover_prob), float(away_cover_prob), float(push_rate)
 
 def calculate_eighth_kelly(prob_win, decimal_odds=1.9091, max_cap=2.00):
@@ -270,9 +259,9 @@ You are an NFL Strategic Research Director and advance scouting analyst.
 Analyze games strictly through scheme execution, film breakdowns, Expected Points Added (EPA), and key-number spread edges.
 
 Mandatory Directives:
-1. Speak as an NFL coach and research coordinator. NEVER reference the prompt, JSON keys, or payload (do not say "as per payload", "in the data", or "according to instructions").
-2. Active Roster Grounding: Only evaluate confirmed active players provided in the roster object. Do NOT claim any player is retired, missing, or departed unless explicitly present in the injuries list.
-3. Target Tree Mathematical Reconciliation: Total receiving yards projected across WR, TE, and RB MUST sum to approximately 85-90% of projected QB passing yards (allowing for secondary depth).
+1. Speak as an NFL research coordinator. NEVER reference the prompt, JSON keys, or payload (never write "as per payload", "in the data", or "according to instructions").
+2. Active Roster Grounding: Only evaluate confirmed active players provided in the roster object. Do NOT claim any player is retired or departed unless explicitly present in the injuries list.
+3. Target Tree Mathematical Reconciliation: Total receiving yards projected across WR, TE, and RB MUST sum to approximately 85-90% of projected QB passing yards.
 4. Output strictly valid JSON matching the exact schema.
 """
     prompt = f"""
@@ -374,7 +363,49 @@ Output strictly valid JSON with this exact schema:
                     })
                 await asyncio.sleep(2 ** attempt)
 
-# 7. Main Pipeline Execution
+# 7. Portfolio Governance Engine
+def apply_portfolio_risk_governance(slate_data, max_slate_bets=4, max_dog_units=4.0):
+    """
+    Syndicate Risk Governance:
+    1. Caps total slate action to top 4 highest-conviction edges.
+    2. Enforces a 4.0u maximum card ceiling on underdogs to eliminate correlation ruin.
+    """
+    slate_data.sort(key=lambda x: x["spread_edge"], reverse=True)
+    governed = []
+    dog_units_staked = 0.0
+    action_count = 0
+
+    for item in slate_data:
+        is_dog = (item["recommended_line"].find("+") != -1)
+        stake = item["kelly_units"]
+        edge = item["spread_edge"]
+
+        # Actionable criteria
+        if edge >= 0.020 and action_count < max_slate_bets and stake > 0:
+            if is_dog:
+                if dog_units_staked >= max_dog_units:
+                    item["kelly_units"] = 0.00
+                    item["recommended_team"] = "PASS"
+                    item["recommended_line"] = "PASS - Portfolio Cap Exceeded"
+                elif (dog_units_staked + stake) > max_dog_units:
+                    item["kelly_units"] = round(max_dog_units - dog_units_staked, 2)
+                    dog_units_staked += item["kelly_units"]
+                    action_count += 1
+                else:
+                    dog_units_staked += stake
+                    action_count += 1
+            else:
+                action_count += 1
+        else:
+            item["kelly_units"] = 0.00
+            item["recommended_team"] = "PASS"
+            item["recommended_line"] = "PASS - No Edge"
+
+        governed.append(item)
+
+    return governed
+
+# 8. Main Pipeline Processing
 async def main():
     target_week = 1
     upcoming = pd.DataFrame()
@@ -389,11 +420,9 @@ async def main():
         print("No active unplayed regular season slate found.")
         sys.exit(0)
 
-    print(f"Executing Week {target_week} Analytical Slate ({len(upcoming)} matchups)...")
+    print(f"Executing Week {target_week} Quant Pipeline ({len(upcoming)} matchups)...")
 
-    tasks = []
-    metadata = []
-    semaphore = asyncio.Semaphore(4)
+    pre_processed = []
 
     for _, game in upcoming.iterrows():
         home_team = clean_team_abbr(str(game["home_team"]))
@@ -440,8 +469,7 @@ async def main():
 
         raw_model_home_prob = float(model.predict_proba(feature_row)[0][1])
 
-        # Skellam Discrete Point Spread Engine
-        calibrated_home_win_prob, home_cover_prob, away_cover_prob, push_prob = calculate_skellam_spread_distribution(
+        calibrated_home_win_prob, home_cover_prob, away_cover_prob, push_prob = calculate_spread_cover_distribution(
             raw_model_home_prob, market_home_prob, spread_line, total_line
         )
 
@@ -451,82 +479,107 @@ async def main():
         vegas_home_line = f"{home_team} {-spread_line:+g}"
         vegas_away_line = f"{away_team} {+spread_line:+g}"
 
-        # Asymmetric hurdle: Require +3.0% edge on road underdogs to filter key hook clustering
+        # Asymmetric hurdle: Require +4.5% on underdogs to eliminate market key traps
+        is_home_dog = (spread_line < 0)
         is_away_dog = (spread_line > 0)
-        edge_hurdle = 0.030 if is_away_dog else 0.020
+        
+        home_hurdle = 0.045 if is_home_dog else 0.020
+        away_hurdle = 0.045 if is_away_dog else 0.020
 
-        if home_spread_edge > 0.020 and home_spread_edge > away_spread_edge:
-            recommended_team = home_team
-            recommended_line = vegas_home_line
-            chosen_cover_prob = home_cover_prob
+        if home_spread_edge > home_hurdle and home_spread_edge > away_spread_edge:
+            rec_team = home_team
+            rec_line = vegas_home_line
+            chosen_cover = home_cover_prob
             chosen_edge = min(0.050, home_spread_edge)
             kelly_units = calculate_eighth_kelly(home_cover_prob)
-        elif away_spread_edge > edge_hurdle and away_spread_edge > home_spread_edge:
-            recommended_team = away_team
-            recommended_line = vegas_away_line
-            chosen_cover_prob = away_cover_prob
+        elif away_spread_edge > away_hurdle and away_spread_edge > home_spread_edge:
+            rec_team = away_team
+            rec_line = vegas_away_line
+            chosen_cover = away_cover_prob
             chosen_edge = min(0.050, away_spread_edge)
             kelly_units = calculate_eighth_kelly(away_cover_prob)
         else:
-            recommended_team = "PASS"
-            recommended_line = "PASS - No Edge"
-            chosen_cover_prob = max(home_cover_prob, away_cover_prob)
+            rec_team = "PASS"
+            rec_line = "PASS - No Edge"
+            chosen_cover = max(home_cover_prob, away_cover_prob)
             chosen_edge = max(home_spread_edge, away_spread_edge)
             kelly_units = 0.00
 
         home_ctx = get_comprehensive_player_baselines(home_team)
         away_ctx = get_comprehensive_player_baselines(away_team)
 
-        payload = {
-            "matchup": matchup,
-            "market": {
-                "consensus_spread": vegas_home_line,
-                "total": total_line,
-                "devigged_home_win_prob": f"{market_home_prob:.1%}"
-            },
+        pre_processed.append({
+            "game_id": str(game.get("game_id", f"2026_{week_num}_{away_team}_{home_team}")),
+            "week": int(week_num),
+            "matchup": str(matchup),
+            "home_win_prob": float(calibrated_home_win_prob),
+            "market_prob": float(market_home_prob),
+            "spread_cover_prob": float(chosen_cover),
+            "spread_edge": float(chosen_edge),
+            "kelly_units": float(kelly_units),
+            "recommended_team": rec_team,
+            "recommended_line": rec_line,
+            "total_line": total_line,
             "tape_metrics": {
                 "net_pass_epa_diff": f"{net_pass_edge:+.3f}",
                 "net_rush_epa_diff": f"{net_rush_edge:+.3f}",
                 "explosive_rate_diff": f"{diff_explosive:+.3f}",
                 "early_down_success_diff": f"{diff_success:+.3f}"
             },
-            "model_calculations": {
-                "calibrated_home_win_prob": f"{calibrated_home_win_prob:.1%}",
-                "home_cover_prob": f"{home_cover_prob:.1%}",
-                "away_cover_prob": f"{away_cover_prob:.1%}",
-                "recommended_side": recommended_team,
-                "recommended_line": recommended_line,
-                "suggested_kelly_units": f"{kelly_units:.2f}u"
-            },
             "rosters": {
                 "home_team": {"team": home_team, "profiles": home_ctx["profiles"], "injuries": home_ctx["scratches"]},
                 "away_team": {"team": away_team, "profiles": away_ctx["profiles"], "injuries": away_ctx["scratches"]}
             }
-        }
-
-        tasks.append(generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units))
-        metadata.append({
-            "game_id": str(game.get("game_id", f"2026_{week_num}_{away_team}_{home_team}")),
-            "week": int(week_num),
-            "matchup": str(matchup),
-            "home_win_prob": float(calibrated_home_win_prob),
-            "market_prob": float(market_home_prob),
-            "spread_cover_prob": float(chosen_cover_prob),
-            "spread_edge": float(chosen_edge),
-            "kelly_units": float(kelly_units),
-            "recommended_line": recommended_line
         })
+
+    # Apply Portfolio Risk Governance (Max 4 bets, Max 4.0u dog exposure)
+    governed_slate = apply_portfolio_risk_governance(pre_processed, max_slate_bets=4, max_dog_units=4.0)
+
+    tasks = []
+    semaphore = asyncio.Semaphore(4)
+
+    for item in governed_slate:
+        payload = {
+            "matchup": item["matchup"],
+            "market": {
+                "consensus_spread": item["recommended_line"],
+                "total": item["total_line"],
+                "devigged_home_win_prob": f"{item['market_prob']:.1%}"
+            },
+            "tape_metrics": item["tape_metrics"],
+            "model_calculations": {
+                "calibrated_home_win_prob": f"{item['home_win_prob']:.1%}",
+                "cover_prob": f"{item['spread_cover_prob']:.1%}",
+                "edge": f"{item['spread_edge']:+.1%}",
+                "recommended_side": item["recommended_team"],
+                "recommended_line": item["recommended_line"],
+                "suggested_kelly_units": f"{item['kelly_units']:.2f}u"
+            },
+            "rosters": item["rosters"]
+        }
+        tasks.append(generate_matchup_analysis(
+            semaphore, payload, item["recommended_team"], item["recommended_line"], 
+            item["spread_edge"], item["kelly_units"]
+        ))
 
     results = await asyncio.gather(*tasks)
 
     records = []
-    for meta, text_response in zip(metadata, results):
-        rec = {k: v for k, v in meta.items() if k != "recommended_line"}
-        rec["analysis"] = text_response
-        records.append(rec)
-        print(f"Executed: {meta['matchup']} | Line: {meta['recommended_line']} | Edge: {meta['spread_edge']:+.1%} | Stake: {meta['kelly_units']}u")
+    for item, text_response in zip(governed_slate, results):
+        records.append({
+            "game_id": item["game_id"],
+            "week": item["week"],
+            "matchup": item["matchup"],
+            "home_win_prob": item["home_win_prob"],
+            "market_prob": item["market_prob"],
+            "spread_cover_prob": item["spread_cover_prob"],
+            "spread_edge": item["spread_edge"],
+            "kelly_units": item["kelly_units"],
+            "analysis": text_response
+        })
+        print(f"Executed: {item['matchup']} | Play: {item['recommended_line']} | Edge: {item['spread_edge']:+.1%} | Stake: {item['kelly_units']}u")
 
-    # 8. Database Upsert
+    # 9. Database Upsert
     if records:
         df_results = pd.DataFrame(records)
         with engine.begin() as conn:
