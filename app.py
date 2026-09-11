@@ -1,11 +1,9 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
-Complete Production File:
-- Hardened with Dual-Resolution Credential Handling (.secrets.toml / os.environ).
-- 2026 Schematic & Play-Caller Directory embedded into GURU_SYSTEM_INSTRUCTION.
-- Discrete Predicted Scores (Away, Home, Combined Total).
-- Normalized Spread Evaluation Engine (Fixing ATS Inversion & Push Calculation).
-- Blind Historical Simulation Tab with Epistemic Out-of-Sample Score Masking.
+Complete Production UI:
+- Reconciles actionable verdict banner with Eighth-Kelly staking allocation.
+- Corrects ATS grading inversion via normalized home_spread_line math.
+- Embeds complete 2026 Play-Caller & Schematic Directory in Guru Workbench.
 """
 import os
 import json
@@ -19,9 +17,6 @@ from google.genai import types
 from scipy.stats import norm
 import nflreadpy as nfl
 
-# ---------------------------------------------------------
-# Page Configuration & UI Theme Styling
-# ---------------------------------------------------------
 st.set_page_config(
     page_title="NFL Quantitative Terminal | 2026 Season",
     page_icon="🏈",
@@ -31,13 +26,11 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* Metric Card Polish */
     div[data-testid="stMetric"] {
         background-color: #161b22;
         border: 1px solid #30363d;
         padding: 12px 16px;
         border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.25);
     }
     div[data-testid="stMetricLabel"] p {
         font-size: 0.82rem !important;
@@ -49,8 +42,6 @@ st.markdown("""
         font-weight: 700 !important;
         color: #f0f6fc !important;
     }
-    
-    /* Action & Status Badges */
     .badge-bet {
         background-color: #238636;
         color: #ffffff;
@@ -84,9 +75,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------------------------------------
-# Credential Resolution (.streamlit/secrets.toml -> os.environ)
-# ---------------------------------------------------------
 def resolve_credential(key_name: str) -> str:
     try:
         if key_name in st.secrets and str(st.secrets[key_name]).strip():
@@ -100,11 +88,7 @@ db_url = resolve_credential("DATABASE_URL")
 api_key = resolve_credential("GEMINI_API_KEY")
 
 if not db_url or not api_key:
-    missing = []
-    if not db_url: missing.append("DATABASE_URL (Neon PostgreSQL)")
-    if not api_key: missing.append("GEMINI_API_KEY (Google GenAI)")
-    st.error(f"⚠️ Missing System Credentials: {', '.join(missing)}")
-    st.info("Configure credentials in `.streamlit/secrets.toml` or environment variables.")
+    st.error("DATABASE_URL and GEMINI_API_KEY must be configured in secrets or environment.")
     st.stop()
 
 @st.cache_resource
@@ -118,31 +102,13 @@ def get_genai_client(key: str):
 engine = get_db_engine(db_url)
 ai_client = get_genai_client(api_key)
 
-# ---------------------------------------------------------
-# 11/10 System Instruction: Complete 2026 Tactical Directory
-# ---------------------------------------------------------
 GURU_SYSTEM_INSTRUCTION = """
 # ROLE & IDENTITY
-You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (Next Gen Stats), and advanced sabermetric modeling. You possess complete domain authority over offensive and defensive playbooks, scheme-on-scheme mechanics, Bayesian calibration, and automated AI evaluation.
-
-Your dual mandate:
-1. Deliver razor-sharp, objective, and analytically grounded NFL football breakdowns anchored strictly in the current 2026 NFL campaign.
-2. Serve as an expert AI evaluator: Continuously audit user-submitted AI prompts, analytical frameworks, statistical models, and projection logic to eliminate statistical noise, correct proxy errors, and enforce production-grade quantitative rigor.
+You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
 
 ---
 
-## 1. DETERMINISTIC MODE ROUTING & ACTIVATION
-
-Evaluate the input payload and route execution into exactly one operational path:
-
-* **Trigger MODE 1 (Tactical & Tape Breakdown)** if the query asks about game matchups, scheme clashes, player evaluation, roster trends, or football tape analysis without requesting an evaluation of an external prompt/system.
-* **Trigger MODE 2 (AI & Analytical System Evaluation)** if the query contains code, prompts, statistical formulas, betting theses, model outputs, or explicitly asks for an audit, critique, or optimization.
-* **Fallback Rule:** If an input contains elements of both (e.g., "Audit my prompt that analyzes Detroit's run game"), execute **MODE 2** as the primary response, utilizing **MODE 1** analysis as the worked test case.
-
----
-
-## 2. 2026 PLAY-CALLER & TACTICAL CONTINUITY DIRECTORY
-Never analyze teams by helmet logos or legacy play-callers. All schematic breakdowns must reflect confirmed 2026 play-calling leadership:
+## 1. 2026 PLAY-CALLER & TACTICAL CONTINUITY DIRECTORY
 * Cardinals: HC Mike LaFleur | OC Nathaniel Hackett | DC Nick Rallis (Wide Zone, 12/21 play-action boot)
 * Falcons: HC Kevin Stefanski | OC Tommy Rees | DC Jeff Ulbrich (Under-center wide zone, Duo power)
 * Ravens: HC Jesse Minter | OC Declan Doyle | DC Anthony Weaver (Simulated pressure creeper defense; Doyle heavy option/gap GT counter)
@@ -164,61 +130,29 @@ Never analyze teams by helmet logos or legacy play-callers. All schematic breakd
 
 ---
 
-## 3. SCHEMATIC TAXONOMY & PHYSICAL INVARIANTS
-* Trench & Pocket Physics: Time-to-Pressure (TTP) vs. Time-to-Throw (TTT) determines pocket degradation. If TTP < TTT, evaluate pocket mobility archetype. Immobile pocket passers collapse under duress (P2S > 20%, steep YPA drop); play-extending dual threats convert pressure into scramble EPA or extended second-reaction attempts.
-* Run-Fit Geometry: Gap/Duo/Power creates vertical displacement via double-teams, exploiting light nickel boxes (6-man fronts) and split safeties; neutralized by Odd 3-4 fronts with 0/1-technique two-gapping interior tackles. Wide Zone creates horizontal stretch, exploiting aggressive interior penetrators; neutralized by Wide-9 alignments and disciplined C-gap setters.
-* Coverage Shell Conditioning: Defenses adjust coverage shells based on offensive personnel groupings. Never cite seasonal coverage rates in a vacuum. Evaluate defensive response specifically against the offense's primary personnel package (e.g., 11 vs. 12/21 personnel).
-  * MOFC (Cover 1 / Cover 3 Match): Single-high safety; leaves perimeter 1-on-1s on the boundary; vulnerable to intermediate Dagger concepts, crossing routes, and deep seam shots.
-  * MOFO (Cover 2 / Quarters / Cover 6): Split safeties; caps vertical boundary routes; vulnerable to underneath checkdowns, intermediate hole shots, and gap runs vs. light boxes.
+## 2. TRANSLATIONAL INVARIANTS
+* Trench Physics: Explain as countdown race between pass protection and QB release timing.
+* Run Schemes: Explain Duo/Power as "vertical bulldozing" and Zone schemes as "sideline-to-sideline stretch".
+* Coverage Shells: Explain MOFC as "Single-High Safety (extra run defender)" and MOFO as "Two-Deep Safeties (umbrella against deep shots)".
 
 ---
 
-## 4. MATHEMATICAL DISCIPLINE & DATA HYGIENE
-* Garbage-Time & Leverage Filtration: Filter all EPA, CPOE, and Success Rate metrics to neutral game states: Win Probability between 10% and 90%, excluding final-two-minute desperation drives and fourth-quarter blowouts (margin >= 16 points).
-* Log-Normal Median Transformation for Player Props: Sportsbooks price prop lines near the distribution median (50th percentile). Convert projected mean yardage (mu) to estimated median (m) using position-specific log-variance:
-  m = mu * exp(-(sigma^2) / 2)
-  sigma_QB_Pass = 0.32, sigma_RB_Rush = 0.48, sigma_Skill_Rec = 0.58
-* Discrete Scoring Margins & Push Accounting: NFL scoring distributions are discrete point masses concentrated on key numbers (3, 7, 6, 10, 4, 14). Never assume continuous normal distributions when calculating cover probabilities. Calculate Eighth-Kelly sizing with push probability (p_push):
-  f* = (b * p - q) / b, where q = 1.0 - p - p_push
-* Epistemic Calibration & Anti-Hallucination: If the input does not provide verified Next Gen Stats (NGS) tracking data, pressure numbers, or EPA splits, express metrics in directional percentiles, schematic tiers, or observable film tendencies. Never fabricate decimal-precision statistics.
-
----
-
-## 5. OPERATIONAL EXECUTION PROTOCOLS
-### [MODE 1: NFL TACTICAL & STATISTICAL BREAKDOWN]
-1. The Executive Verdict: Lead with the core strategic conclusion or game edge in the first 1-2 sentences.
-2. Trench & Scheme Cross-Examination: Map offensive run/pass concepts directly against defensive fronts and coverage rules. Pair every film observation with a corresponding efficiency concept.
-3. Data Scaffolding: Use concise markdown tables for comparisons and bold standalone headers for tactical concepts.
-
-### [MODE 2: AI & ANALYTICAL SYSTEM EVALUATION]
-1. Proxy & Feature Audit: Identify flawed proxies, unconditioned seasonal EPA, collinear double-shrinkage, leakage, or unrepeatable noise.
-2. Signal vs. Noise Assessment: Evaluate whether the system isolates true predictive stability vs. game-script artifacts.
-3. Zero-Placeholder Production Refactoring: Provide complete, fully executable code, prompt templates, or mathematical formulas. Never emit pseudocode or leave placeholders.
-4. Three High-Conviction Upgrades: List exactly 3 high-impact architectural, contextual, or data-hygiene modifications.
+## 3. MATHEMATICAL DISCIPLINE
+* Filter metrics to neutral leverage (WP 10%-90%).
+* Log-normal median conversion for player props: m = mu * exp(-sigma^2 / 2).
+* Eighth-Kelly staking sizing with push probability accounting: f* = (b * p - q) / b.
 """
 
-# ---------------------------------------------------------
-# Mathematical Invariants: Normalized Spread Evaluation
-# ---------------------------------------------------------
 def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float, 
                                actual_home_score: int, actual_away_score: int, 
                                home_spread_line: float) -> dict:
-    """
-    Standardizes spread cover grading across arbitrary sportsbook notations.
-    home_spread_line is strictly the points added to the home team's final score:
-    - If Home is -6.5 favorite -> home_spread_line = -6.5
-    - If Home is +3.0 underdog -> home_spread_line = +3.0
-    """
     actual_margin = float(actual_home_score - actual_away_score)
     pred_margin = float(pred_home_score - pred_away_score)
 
-    # Home covers if (Margin + Spread) > 0
     actual_home_covered = (actual_margin + home_spread_line) > 0.0
     pred_home_covered = (pred_margin + home_spread_line) > 0.0
 
     is_actual_push = (actual_margin + home_spread_line) == 0.0
-    is_pred_push = (pred_margin + home_spread_line) == 0.0
-
     if is_actual_push:
         cover_status = "⏸️ Push"
     elif actual_home_covered == pred_home_covered:
@@ -226,7 +160,6 @@ def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float,
     else:
         cover_status = "❌ Wrong Side"
 
-    # Straight-Up Winner Evaluation
     actual_home_won = actual_margin > 0.0
     pred_home_won = pred_margin > 0.0
     su_status = "✅ Hit" if (actual_home_won == pred_home_won) else "❌ Miss"
@@ -241,9 +174,6 @@ def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float,
         "margin_error": round(margin_error, 1)
     }
 
-# ---------------------------------------------------------
-# Database Ingestion Layer
-# ---------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_predictions():
     query = """
@@ -264,38 +194,23 @@ except Exception as e:
     st.error(f"Database Query Failed: {e}")
     st.stop()
 
-# ---------------------------------------------------------
-# Sidebar Controls
-# ---------------------------------------------------------
 with st.sidebar:
     st.title("🏈 Risk Engine")
-    st.caption("Quantitative Capital Allocation")
-    
     show_only_bets = st.checkbox("Show Actionable Bets Only", value=False)
     min_edge_filter = st.slider("Minimum Edge Cutoff %", 0.0, 5.0, 1.5, 0.25)
     max_stake_cap = st.slider("Max Intra-Game Exposure (Units)", 0.5, 3.0, 2.0, 0.25)
-
     st.divider()
-    st.subheader("Guru Operational Mode")
-    guru_mode = st.radio(
-        "Direct Processing Path:",
-        ["Mode 1: Tactical & Tape Breakdown", "Mode 2: AI & Analytical System Evaluation"],
-        index=0
-    )
-
+    guru_mode = st.radio("Guru Mode:", ["Mode 1: Tactical Breakdown", "Mode 2: System Evaluation"], index=0)
     st.divider()
     if st.button("Purge Terminal Cache", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-# ---------------------------------------------------------
-# Dashboard KPI Strip
-# ---------------------------------------------------------
 st.title("🏈 Institutional NFL Quantitative Terminal")
-st.caption("Bivariate Discrete Score Modeling | Opponent-Adjusted EPA | Out-of-Sample Calibration")
+st.caption("Discrete Empirical Score Modeling | Opponent-Adjusted EPA | Out-of-Sample Calibration")
 
 if df.empty:
-    st.info("No active slate predictions currently loaded in Neon PostgreSQL.")
+    st.info("No active slate predictions currently loaded.")
     st.stop()
 
 c1, c2, c3, c4 = st.columns(4)
@@ -307,9 +222,6 @@ c4.metric("Active Slate", f"Week {int(df['week'].max())}")
 
 st.divider()
 
-# ---------------------------------------------------------
-# Master Tabs Layout
-# ---------------------------------------------------------
 tab_slate, tab_steam, tab_guru, tab_sim = st.tabs([
     "📊 Weekly Board & Predicted Scores",
     "⚡ Market Steam & Consensus Deltas",
@@ -317,9 +229,6 @@ tab_slate, tab_steam, tab_guru, tab_sim = st.tabs([
     "🧪 Blind Historical Simulation"
 ])
 
-# =========================================================
-# TAB 1: WEEKLY BOARD & DISCRETE SCORES
-# =========================================================
 with tab_slate:
     displayed = 0
     for _, row in df.iterrows():
@@ -340,18 +249,25 @@ with tab_slate:
         try:
             analysis_data = json.loads(row['analysis'])
         except Exception:
-            analysis_data = {"executive_summary": row['analysis'], "player_projections": []}
+            analysis_data = {}
 
         teams = row['matchup'].split('@')
         away_team = teams[0].strip()
         home_team = teams[1].strip()
 
         p_home = int(row.get('predicted_home_score') or 24)
-        p_away = int(row.get('predicted_away_score') or 20)
+        p_away = int(row.get('predicted_away_score') or 21)
         p_total = int(row.get('predicted_total_score') or (p_home + p_away))
 
-        verdict_str = analysis_data.get('actionable_verdict', 'PASS - 0.00u')
-        is_bet = "BET" in verdict_str.upper()
+        # Reconcile Actionable Verdict Banner with Database Allocation
+        if stake > 0.0 and edge_pct > 0.0:
+            verdict_str = analysis_data.get('actionable_verdict', f"BET - {stake:.2f}u")
+            if "PASS" in verdict_str.upper():
+                verdict_str = f"BET - {stake:.2f}u"
+            is_bet = True
+        else:
+            verdict_str = "PASS - 0.00u"
+            is_bet = False
 
         with st.container():
             col_match, col_sc, col_act = st.columns([2.5, 2.5, 1.5])
@@ -363,7 +279,7 @@ with tab_slate:
                     f"""
                     <div style="padding-top: 5px;">
                         <span class="score-badge">{away_team} {p_away} - {p_home} {home_team}</span>
-                        <span style="font-size: 0.90rem; color: #8b949e; margin-left: 10px;">(Projected Total: {p_total})</span>
+                        <span style="font-size: 0.90rem; color: #8b949e; margin-left: 10px;">(Total: {p_total})</span>
                     </div>
                     """, 
                     unsafe_allow_html=True
@@ -380,64 +296,26 @@ with tab_slate:
             m3.metric("Projected Margin", f"{home_team} {p_home - p_away:+d}")
             m4.metric("Eighth-Kelly Stake", f"{stake:.2f}u")
 
-            with st.expander("Tactical Matchup Dossier & DraftKings Comparative Matrices", expanded=is_bet):
+            with st.expander("Tactical Matchup Dossier & Tape Clash", expanded=is_bet):
                 st.markdown(f"**Tactical Brief:** {analysis_data.get('executive_summary', 'Analysis pending.')}")
-                
-                sub_scheme, sub_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 DraftKings Lines vs. AI Median Estimates"])
-                with sub_scheme:
-                    scheme = analysis_data.get('schematic_matchup', {})
-                    sc1, sc2 = st.columns(2)
-                    sc1.info(f"**{away_team} Offense vs. {home_team} Defense:**\n\n" + scheme.get('away_offense_vs_home_defense', 'N/A'))
-                    sc2.info(f"**{home_team} Offense vs. {away_team} Defense:**\n\n" + scheme.get('home_offense_vs_away_defense', 'N/A'))
-
-                with sub_props:
-                    projections = analysis_data.get('player_projections', [])
-                    def render_prop_matrix(t_name, col_box):
-                        with col_box:
-                            st.markdown(f"##### {t_name} Output vs. Market Lines")
-                            t_props = [p for p in projections if p.get("team", "").strip().upper() == t_name.strip().upper()]
-                            if t_props:
-                                rows = []
-                                for p in t_props:
-                                    m_val = float(p.get('market_line', 0.0))
-                                    p_val = float(p.get('projected_value', 0.0))
-                                    rows.append({
-                                        "Player": f"{p.get('player', 'Unknown')} ({p.get('role', 'SKILL')})",
-                                        "Stat": p.get('prop_category', 'Yards'),
-                                        "Vegas Line": f"{m_val:.1f}",
-                                        "AI Median": f"{p_val:.1f}",
-                                        "Edge": f"{p_val - m_val:+.1f}",
-                                        "Pick": p.get('edge', 'PASS').upper(),
-                                        "Tactical Rationale": p.get('tactical_rationale', '-')
-                                    })
-                                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-                            else:
-                                st.caption(f"No player prop projections available for {t_name}.")
-
-                    p_col1, p_col2 = st.columns(2)
-                    render_prop_matrix(away_team, p_col1)
-                    render_prop_matrix(home_team, p_col2)
+                scheme = analysis_data.get('schematic_matchup', {})
+                sc1, sc2 = st.columns(2)
+                sc1.info(f"**{away_team} Offense vs. {home_team} Defense:**\n\n" + scheme.get('away_offense_vs_home_defense', 'N/A'))
+                sc2.info(f"**{home_team} Offense vs. {away_team} Defense:**\n\n" + scheme.get('home_offense_vs_away_defense', 'N/A'))
 
             st.divider()
 
     if displayed == 0:
         st.info("No matchups match your edge/stake filter thresholds.")
 
-# =========================================================
-# TAB 2: STEAM STATS & CONSENSUS DISCREPANCY
-# =========================================================
 with tab_steam:
-    st.subheader("⚡ Sharp Syndicate Steam & Consensus Discrepancy")
+    st.subheader("⚡ Line Movement & Market Pricing Discrepancies")
     steam_records = []
     for _, r in df.iterrows():
         p_c = float(r.get('home_win_prob') or 0.5)
         p_m = float(r.get('market_prob') or 0.5)
         diff = (p_c - p_m) * 100
-        
-        if diff >= 4.0: signal = "🔥 Sharp Home Steam / Under-Priced"
-        elif diff <= -4.0: signal = "❄️ Heavy Away Steam / Market Inflated"
-        else: signal = "⚖️ Consensus Fairly Priced"
-
+        signal = "🔥 Sharp Home Steam" if diff >= 4.0 else ("❄️ Heavy Away Steam" if diff <= -4.0 else "⚖️ Fairly Priced")
         steam_records.append({
             "Matchup": r["matchup"],
             "Model Win%": f"{p_c * 100:.1f}%",
@@ -445,23 +323,17 @@ with tab_steam:
             "Discrepancy": f"{diff:+.1f}%",
             "Spread Edge": f"{float(r.get('spread_edge') or 0.0)*100:+.1f}%",
             "Projected Score": f"{r.get('predicted_away_score')} - {r.get('predicted_home_score')}",
-            "Steam Signal": signal
+            "Signal": signal
         })
     st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
 
-# =========================================================
-# TAB 3: STRATEGIC GURU WORKBENCH
-# =========================================================
 with tab_guru:
     st.subheader(f"🧠 {guru_mode}")
-    q_title = st.text_input("Evaluation Target / Matchup Headline:", placeholder="e.g., Auditing 4th-down decision logic vs SF front")
+    q_title = st.text_input("Evaluation Target / Matchup Headline:")
     q_payload = st.text_area("Dossier Payload (Tape notes, EPA splits, or prompt code):", height=200)
-
     if st.button("Execute Strategic Guru Evaluation", type="primary", use_container_width=True):
-        if not q_title or not q_payload:
-            st.warning("Supply both an evaluation target and dossier payload.")
-        else:
-            with st.spinner("Processing scheme leverage, pocket mechanics, and statistical hygiene..."):
+        if q_title and q_payload:
+            with st.spinner("Processing scheme leverage and statistical hygiene..."):
                 prompt = f"[{guru_mode.upper()}]\nSUBJECT: {q_title}\n\nINPUT PAYLOAD:\n{q_payload}"
                 try:
                     res = ai_client.models.generate_content(
@@ -473,12 +345,9 @@ with tab_guru:
                 except Exception as e:
                     st.error(f"Inference Failure: {e}")
 
-# =========================================================
-# TAB 4: BLIND HISTORICAL SIMULATION (STRICT AIRLOCK)
-# =========================================================
 with tab_sim:
     st.subheader("🧪 Blind Past-Game Simulation Engine")
-    st.caption("Validating AI predictive accuracy out-of-sample: The AI receives zero final score data.")
+    st.caption("Validating AI predictive accuracy out-of-sample: Final scores are masked from inference.")
 
     sim_season = st.selectbox("Select Historical Season:", [2025, 2024], index=0)
     sim_week = st.slider("Select Historical Week:", 1, 18, 1)
@@ -493,8 +362,7 @@ with tab_sim:
     if hist_games.empty:
         st.warning("No completed games found for the selected schedule.")
     else:
-        st.info(f"Loaded {len(hist_games)} historical fixtures from Season {sim_season} Week {sim_week}. Final scores are masked from inference payload.")
-
+        st.info(f"Loaded {len(hist_games)} fixtures. Final scores are strictly airlocked from the prompt payload.")
         if st.button("Execute Blind Out-of-Sample Simulation", type="primary", use_container_width=True):
             sim_results = []
             progress_bar = st.progress(0)
@@ -504,38 +372,28 @@ with tab_sim:
                 away = str(g["away_team"])
                 matchup_label = f"{away} @ {home}"
 
-                # Extract spread_line (where positive means home is favored in nflverse standard)
                 raw_spread = float(g.get("spread_line", 0.0) or 0.0)
-                # Standardize to home_spread_line (points added to home team, so -raw_spread if home favored)
                 home_spread_line = -raw_spread
                 total_line = float(g.get("total_line", 44.0) or 44.0)
 
-                # Ground Truth (Client-Side Only)
                 actual_home = int(g["home_score"])
                 actual_away = int(g["away_score"])
 
-                # Blind Pre-Game Ingestion Dossier (Zero Score Leakage)
                 blind_payload = {
                     "matchup": matchup_label,
-                    "pre_game_market": {
-                        "spread_line": f"{home} {home_spread_line:+g}",
-                        "total_line": total_line
-                    },
-                    "context": f"Simulating Season {sim_season} Week {sim_week}. Strictly estimate final scores based on pre-game expectation."
+                    "pre_game_market": {"spread_line": f"{home} {home_spread_line:+g}", "total_line": total_line},
+                    "context": f"Season {sim_season} Week {sim_week}. Estimate scores using pre-game expectations."
                 }
 
                 blind_prompt = f"""
-                You are conducting a strict out-of-sample simulation for this NFL game:
+                Conduct a blind simulation for this NFL matchup:
                 {json.dumps(blind_payload, indent=2)}
 
-                CRITICAL DIRECTIVE: You do not know the final score.
-                Using pre-game baseline expectations, estimate the discrete final score.
-                Output STRICTLY valid JSON:
+                CRITICAL DIRECTIVE: You do not know the actual score. Output STRICTLY valid JSON:
                 {{
                   "predicted_away_score": 0,
                   "predicted_home_score": 0,
-                  "predicted_winner": "Team Abbr",
-                  "tactical_thesis": "One-sentence strategic reason"
+                  "predicted_winner": "Team Abbr"
                 }}
                 """
 
@@ -549,11 +407,9 @@ with tab_sim:
                     p_away = int(pred.get("predicted_away_score", 20))
                     p_home = int(pred.get("predicted_home_score", 24))
                 except Exception:
-                    # Mathematical Discrete Fallback
                     p_home = int(round((total_line - home_spread_line) / 2.0))
                     p_away = int(round((total_line + home_spread_line) / 2.0))
 
-                # Run Normalized Evaluation Engine
                 eval_metrics = normalize_and_grade_spread(
                     pred_home_score=p_home,
                     pred_away_score=p_away,
@@ -576,7 +432,7 @@ with tab_sim:
                 progress_bar.progress((idx + 1) / len(hist_games))
 
             df_sim = pd.DataFrame(sim_results)
-            st.success("Simulation Complete. Out-of-sample grading results:")
+            st.success("Simulation Complete.")
             st.dataframe(df_sim, hide_index=True, use_container_width=True)
 
             su_acc = (df_sim["SU Winner Hit"] == "✅ Hit").mean() * 100
