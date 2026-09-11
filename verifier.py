@@ -1,6 +1,6 @@
 """
 verifier.py - Production Fail-Fast Data Verifier & Stop-Block Airlock.
-Hardened to prevent empty or truncated LLM player projections from voiding macro game edges.
+Decouples macro game-edge verification from micro player-prop ingestion to eliminate false stop blocks.
 """
 import json
 import logging
@@ -49,11 +49,11 @@ class NFLDataVerifier:
             return True, f"[{team_abbr}] Pass volume is 0 or unprojected."
 
         ratio = team_rec_yds / total_gross_pass_yds
-        # Tolerate broader bounds [70.0%, 130.0%] to handle scheme variance and backup rotations
+        # Tolerate [70.0%, 130.0%] band to accommodate unscripted backup snaps and edge scheme variance
         if not (0.70 <= ratio <= 1.30):
             return (
                 False,
-                f"[{team_abbr}] Target Tree Alert: Allocated Receiving Yards ({team_rec_yds:.1f}) "
+                f"[{team_abbr}] Target Tree Alert: Receiving Yards ({team_rec_yds:.1f}) "
                 f"is {ratio:.1%} of Gross Pass Volume ({total_gross_pass_yds:.1f}). Expected [70.0%, 130.0%].",
             )
         return True, f"[{team_abbr}] Target tree reconciled at {ratio:.1%} of passing volume."
@@ -113,12 +113,12 @@ class NFLDataVerifier:
         if not bounds_valid:
             fatal_violations.extend(bound_msgs)
         else:
-            audit_trail.append("All tape-metric differentials verified within valid distribution bounds.")
+            audit_trail.append("All tape-metric differentials verified within bounds.")
 
-        # 3. Micro Prop Invariants (Non-Fatal Warning Gate)
+        # 3. Micro Prop Invariants (Non-Fatal Gate)
         projections = parsed_analysis.get("player_projections", [])
         if not projections or not isinstance(projections, list):
-            audit_trail.append("Warning: Empty player projections from LLM. Macro spread edge retained.")
+            audit_trail.append("Warning: Empty player projections array. Macro spread edge preserved.")
         else:
             distinct_teams = list(
                 set(p.get("team", "").strip().upper() for p in projections if p.get("team"))
@@ -135,7 +135,7 @@ class NFLDataVerifier:
                     tt_valid, tt_msg = cls.verify_team_target_tree(t, team_pass_yds, team_props)
                     audit_trail.append(tt_msg)
 
-        # Fatal stop block only triggers on corrupted macro data
+        # Stop-block triggers solely on corrupted macro inputs
         if fatal_violations:
             logger.error(f"[STOP BLOCK ENGAGED] {payload.get('matchup')} failed macro verification.")
             return VerificationResult(
@@ -151,7 +151,5 @@ class NFLDataVerifier:
             status="PASSED",
             error_code=None,
             audit_log=audit_trail,
-            raw_payload=payload,
-        )
             raw_payload=payload,
         )
