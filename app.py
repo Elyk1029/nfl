@@ -1,3 +1,6 @@
+"""
+app.py - Institutional NFL Quantitative Terminal with Game-Script Risk Governance.
+"""
 import os
 import json
 import streamlit as st
@@ -6,9 +9,6 @@ from sqlalchemy import create_engine
 from google import genai
 from google.genai import types
 
-# ---------------------------------------------------------
-# Page Configuration
-# ---------------------------------------------------------
 st.set_page_config(
     page_title="Institutional NFL Quantitative Terminal",
     page_icon="🏈",
@@ -16,29 +16,16 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ---------------------------------------------------------
-# Environment & Client Setup
-# ---------------------------------------------------------
 db_url = os.environ.get("DATABASE_URL")
 api_key = os.environ.get("GEMINI_API_KEY")
 
-if not db_url:
-    st.error("DATABASE_URL environment variable is not configured.")
-    st.stop()
-
-if not api_key:
-    st.error("GEMINI_API_KEY environment variable is not configured.")
+if not db_url or not api_key:
+    st.error("DATABASE_URL and GEMINI_API_KEY environment variables must be configured.")
     st.stop()
 
 @st.cache_resource
 def get_db_engine():
-    return create_engine(
-        db_url,
-        pool_size=5,
-        max_overflow=10,
-        pool_pre_ping=True,
-        pool_recycle=300
-    )
+    return create_engine(db_url, pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=300)
 
 @st.cache_resource
 def get_genai_client(key: str):
@@ -47,44 +34,27 @@ def get_genai_client(key: str):
 engine = get_db_engine()
 ai_client = get_genai_client(api_key)
 
-# ---------------------------------------------------------
-# Persona Definition (Guru & AI Evaluator)
-# ---------------------------------------------------------
 GURU_SYSTEM_INSTRUCTION = """
-# ROLE & PERSONA
-You are the "NFL Analytics Coordinator & Strategic Guru," operating at the intersection of advanced football sabermetrics and high-level coaching tape analysis. You possess elite-level fluency in both traditional football film study (schemes, coverages, run fits, route concepts) and modern predictive analytics (EPA/play, CPOE, Success Rate, DVOA, pressure rate vs. quick game, NGS tracking data).
-
-Your dual mandate:
-1. Deliver razor-sharp, objective, and analytically grounded NFL football analysis.
-2. Act as an expert AI evaluator: Continuously review user-submitted AI prompts, analytical frameworks, model outputs, or predictive systems to pinpoint blind spots, eliminate statistical noise, and recommend improvements.
-
-# CORE COMPETENCIES & KNOWLEDGE BASE
-- Scheme & Tactical Fluency: Personnel groupings (11, 12, 21 personnel), pass-pro schemes, run-blocking schemes (Inside/Outside Zone, Duo, Power/Counter), route distribution vs. MOFO/MOFC (Middle of Field Open/Closed), coverage shells (Cover 1, 2-Man, Quarters, Palms, Cover 3 Match).
-- Advanced Metrics & Modeling: EPA per play, Success Rate, CPOE, DVOA, Adjusted Net Yards Per Attempt (ANY/A), explosive play rate, win probability models, high-leverage 4th-down decision curves.
-- Data Hygiene: Sample size discipline, regressing unstable metrics (turnover luck, fumble recovery rates, red zone TD% variance) toward the mean, distinguishing process from outcome.
+# ROLE & IDENTITY
+You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (Next Gen Stats), and advanced sabermetric modeling.
 
 # OPERATIONAL MODES
-
 ### MODE 1: NFL TACTICAL & STATISTICAL BREAKDOWN
 - Lead with the verdict in the first 1-2 sentences.
-- Contextualize Tape + Data: Never use raw stats without schematic context, and never make film claims without backing data.
-- Structure cleanly: Use markdown tables for multi-player or multi-team statistical comparisons and bullet points for schematic keys.
+- Contextualize Tape + Data: Cross-reference film claims with EPA, pressure-to-sack ratios, and success rates.
+- Epistemic Calibration: Never invent fabricated decimal statistics. Use directional percentiles or scheme tiers if tracking data is absent.
+- Structure cleanly: Use markdown tables for comparisons and concise bullet points for schematic keys.
 
 ### MODE 2: AI & ANALYTICAL SYSTEM EVALUATION
-1. Audit & Blind Spot Detection: Pinpoint where the system relies on flawed proxies, surface-level box-score stats, or narrative-driven biases.
-2. Signal vs. Noise Critique: Evaluate whether feature selection or prompt reasoning isolates true predictive stability vs. game-script variance.
-3. Prompt & Logic Refactoring: Provide an upgraded, production-grade version of their prompt, feature list, or mathematical framework.
-4. Actionable Edge Recommendations: Recommend 2-3 specific data points, contextual filters, or architectural adjustments.
+1. Audit & Blind Spot Detection: Pinpoint reliance on flawed proxies, surface-level box-score stats, or narrative bias.
+2. Signal vs. Noise Critique: Evaluate whether features isolate true predictive stability vs. game-script variance.
+3. Zero-Placeholder Production Refactoring: Deliver fully executable, production-ready code, prompt revisions, or mathematical adjustments.
+4. Actionable Edge Recommendations: Provide 2-3 specific data points or architectural upgrades.
 
 # OUTPUT CONSTRAINTS & TONE
-- Tone: Direct, analytical, objective, and authoritative. Sound like an NFL director of research speaking directly to an analytics engineer or offensive coordinator.
-- Banned Habits: Avoid generic sports platitudes ("they wanted it more", "momentum shifted"). Always explain causation through leverage, numbers, spacing, or probability.
-- Scaffolding: Favor structured bullet points, clear tables, and concise step-by-step logic over dense blocks of text.
+- Direct, analytical, objective, authoritative. No generic sports platitudes. Causation must be established via leverage, spacing, physics, or probability.
 """
 
-# ---------------------------------------------------------
-# Database Ingestion from Neon PostgreSQL
-# ---------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_predictions():
     query = """
@@ -108,16 +78,15 @@ def load_predictions():
 
 df = load_predictions()
 
-# ---------------------------------------------------------
 # Sidebar Controls
-# ---------------------------------------------------------
 st.sidebar.header("Quantitative Risk Controls")
 min_spread_edge = st.sidebar.slider("Minimum Edge Cutoff %", 0.0, 10.0, 1.5, 0.25)
+max_game_exposure = st.sidebar.slider("Max Intra-Game Exposure (Units)", 1.0, 4.0, 2.5, 0.25)
 
 st.sidebar.divider()
 st.sidebar.header("Guru Workbench Mode")
 guru_mode = st.sidebar.radio(
-    "Select Operational Path:",
+    "Operational Focus:",
     ["Mode 1: Tactical & Tape Breakdown", "Mode 2: AI & Analytical System Evaluation"],
     index=0
 )
@@ -126,14 +95,12 @@ if st.sidebar.button("Purge Terminal Cache", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-# ---------------------------------------------------------
-# Global Summary Metrics
-# ---------------------------------------------------------
+# Global Metrics
 st.title("🏈 Institutional NFL Quantitative Engine")
-st.caption("Bivariate Skellam Modeling | DraftKings Prop Benchmarks | Eighth-Kelly Governance")
+st.caption("Opponent-Adjusted EPA | Log-Normal Median Pricing | Correlated Risk Governance")
 
 if df.empty:
-    st.info("No prediction records currently available in Neon PostgreSQL.")
+    st.info("No prediction data currently loaded in Neon PostgreSQL.")
     st.stop()
 
 c1, c2, c3, c4 = st.columns(4)
@@ -145,18 +112,13 @@ c4.metric("Active Slate", f"Week {int(df['week'].max())}")
 
 st.divider()
 
-# ---------------------------------------------------------
-# Master Terminal Navigation
-# ---------------------------------------------------------
 tab_slate, tab_steam, tab_guru = st.tabs([
     "📊 Weekly Board & Player Props",
     "⚡ Steam Stats & Market Delta",
     "🧠 Strategic Guru Workbench"
 ])
 
-# =========================================================
-# TAB 1: MATCHUP CARDS & DRAFTKINGS PROP MATRICES
-# =========================================================
+# TAB 1: Matchup Cards & DraftKings Comparative Props
 with tab_slate:
     for _, row in df.iterrows():
         spread_edge_pct = (row.get('spread_edge') or 0.0) * 100
@@ -169,12 +131,11 @@ with tab_slate:
         kelly = row.get('kelly_units') or 0.0
 
         with st.container():
-            # Header Row: Game & Macro Pricing
             cols = st.columns([2.5, 1.5, 1.5, 1.5, 1.5])
             cols[0].subheader(row['matchup'])
             cols[1].metric("AI Projected Win", f"{home_win_pct:.1f}%")
             cols[2].metric("DraftKings Implied Win", f"{market_win_pct:.1f}%")
-            cols[3].metric("AI Cover Prob", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
+            cols[3].metric("Cover Probability", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
             cols[4].metric("Eighth-Kelly Stake", f"{kelly:.2f}u")
 
             try:
@@ -192,7 +153,7 @@ with tab_slate:
                 with st.expander("Tactical Matchup Breakdown & DraftKings Prop Comparison"):
                     st.write(f"**Tactical Brief:** {analysis_data.get('executive_summary', '')}")
                     
-                    tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 DraftKings Lines vs. AI Projections"])
+                    tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 DraftKings Lines vs. AI Median Projections"])
                     with tab_scheme:
                         st.markdown("**Away Offense vs. Home Front & Shell**")
                         st.write(analysis_data['schematic_matchup'].get('away_offense_vs_home_defense', 'N/A'))
@@ -206,10 +167,7 @@ with tab_slate:
                         def render_comparative_prop_table(team_name, col):
                             with col:
                                 st.markdown(f"#### {team_name.strip()} Output vs. Market Lines")
-                                if isinstance(projections, list):
-                                    team_props = [p for p in projections if p.get("team", "").upper() == team_name.strip().upper()]
-                                else:
-                                    team_props = []
+                                team_props = [p for p in projections if p.get("team", "").upper() == team_name.strip().upper()] if isinstance(projections, list) else []
 
                                 if team_props:
                                     rows = []
@@ -224,21 +182,19 @@ with tab_slate:
                                             "Player": p.get("player", "Unknown"),
                                             "Prop": p.get("prop_category", "Yards"),
                                             "DraftKings Line": f"{m_line:.1f}",
-                                            "AI Estimate": f"{proj:.1f}",
+                                            "AI Median": f"{proj:.1f}",
                                             "Market Edge": f"{delta:+.1f}",
                                             "Pick": action,
                                             "Tactical Rationale": p.get("tactical_rationale", "-")
                                         })
                                     
-                                    prop_df = pd.DataFrame(rows)
-                                    # Render comparative table with visual highlighting
                                     st.dataframe(
-                                        prop_df,
+                                        pd.DataFrame(rows),
                                         column_config={
-                                            "DraftKings Line": st.column_config.TextColumn("Sportsbook Line", help="DraftKings/Consensus Benchmark Line"),
-                                            "AI Estimate": st.column_config.TextColumn("AI Projection", help="Model projected yardage"),
-                                            "Market Edge": st.column_config.TextColumn("Edge (Delta)", help="AI Estimate minus Sportsbook Line"),
-                                            "Pick": st.column_config.TextColumn("Execution", help="Actionable OVER / UNDER / PASS"),
+                                            "DraftKings Line": st.column_config.TextColumn("Sportsbook Line"),
+                                            "AI Median": st.column_config.TextColumn("AI Median (50th%)"),
+                                            "Market Edge": st.column_config.TextColumn("Edge (Delta)"),
+                                            "Pick": st.column_config.TextColumn("Execution"),
                                             "Tactical Rationale": st.column_config.TextColumn("Coaching Film Note", width="large")
                                         },
                                         hide_index=True,
@@ -256,12 +212,10 @@ with tab_slate:
 
             st.divider()
 
-# =========================================================
-# TAB 2: STEAM STATS & MARKET DELTA
-# =========================================================
+# TAB 2: Steam Movement Ledger
 with tab_steam:
     st.subheader("⚡ Consensus Steam & Market Discrepancy Matrix")
-    st.caption("Isolating sharp syndicate line movement vs. AI model power rating differentials.")
+    st.caption("Tracking sharp syndicate steam moves vs. model ratings.")
 
     steam_records = []
     for _, r in df.iterrows():
@@ -272,9 +226,9 @@ with tab_steam:
         units = float(r.get('kelly_units') or 0.0)
 
         if discrepancy >= 4.0:
-            bias = "🔥 Sharp Home Steam / Under-priced"
+            bias = "🔥 Sharp Home Steam / Under-Priced"
         elif discrepancy <= -4.0:
-            bias = "❄️ Heavy Away Steam / Public Inflated"
+            bias = "❄️ Heavy Away Steam / Market Inflated"
         else:
             bias = "⚖️ Consensus Fairly Priced"
 
@@ -290,28 +244,26 @@ with tab_steam:
 
     st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
 
-# =========================================================
-# TAB 3: STRATEGIC GURU WORKBENCH
-# =========================================================
+# TAB 3: Strategic Guru Interactive Workbench
 with tab_guru:
     st.subheader(f"🧠 {guru_mode}")
     st.caption("Direct coaching tape-to-metric analysis and automated AI model/prompt auditing.")
 
     query_title = st.text_input(
-        "Subject / Matchup / Framework Title:",
-        placeholder="e.g. Auditing 4th-Down Aggressiveness Index or Evaluating SF Outside Zone vs Rams Odd Front"
+        "Subject / Framework Headline:",
+        placeholder="e.g., Auditing 4th-down decision logic or Stafford pocket degradation vs SF Odd Front"
     )
     raw_payload = st.text_area(
-        "Input Payload (Tape Notes, EPA Splits, AI Prompt, Python Code, or Projections):",
+        "Payload (Tape Observations, EPA Metrics, Feature Pipeline, or AI Prompt):",
         height=220,
-        placeholder="Paste coaching tape observations, advanced metrics (EPA, CPOE, PBWR), or an AI system prompt/feature schema for review..."
+        placeholder="Paste coaching tape notes, Pass Block Win Rates, EPA splits, or an AI prompt for evaluation..."
     )
 
     if st.button("Execute Strategic Guru Evaluation", type="primary", use_container_width=True):
         if not query_title or not raw_payload:
             st.warning("Please supply both a subject title and an input payload.")
         else:
-            with st.spinner("Analyzing scheme mechanics, coverage shells, and statistical rigor..."):
+            with st.spinner("Executing evaluation via Gemini 3.8 Flash..."):
                 augmented_prompt = f"[{guru_mode.upper()}]\nSUBJECT: {query_title}\n\nINPUT PAYLOAD:\n{raw_payload}"
                 try:
                     res = ai_client.models.generate_content(
