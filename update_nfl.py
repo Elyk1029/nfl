@@ -153,9 +153,6 @@ def compute_opponent_adjusted_epa(pbp_df):
 team_perf = compute_opponent_adjusted_epa(pbp)
 
 def get_latest_team_row(team_abbr, target_season, target_week):
-    """
-    Pulls absolute latest pre-game form across season boundaries without intra-week leakage.
-    """
     if team_perf.empty:
         return pd.DataFrame()
         
@@ -372,6 +369,7 @@ You are the "NFL Research Director & Quantitative Architect," operating at the n
 
 # DIRECTIVES
 - 2026 Orientation: Evaluate all clashes using confirmed 2026 play-callers, defensive coordinators, and active schemes.
+- Accessible Broadcast Breakdown: Mode 1 breakdowns must translate complex coaching tape into plain-English cause-and-effect for an everyday football fan.
 - Anti-Anchoring: Output independent projections derived strictly from scheme volume, not Vegas echoes.
 - Median Pricing: Project median yards (50th percentile expectation), not high-variance ceiling means.
 - Target Tree Sanity: The sum of team receiving yards across all targets must sit within 75% to 125% of that team's gross passing yards.
@@ -384,10 +382,10 @@ Evaluate this NFL advance scouting dossier with sportsbook prop benchmarks:
 
 Output strictly valid JSON matching this exact array schema:
 {{
-  "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS based on market key numbers and early-down leverage.",
+  "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS based on market key numbers and early-down leverage in clear, plain English.",
   "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Film breakdown: Pass protection win rates, blitz packages, run-blocking scheme (Zone vs Gap), and coverage shells (MOFC Cover 1/3 vs MOFO Quarters/Cover 6).",
-    "home_offense_vs_away_defense": "Film breakdown: Pass protection win rates, blitz packages, run-blocking scheme (Zone vs Gap), and coverage shells (MOFC Cover 1/3 vs MOFO Quarters/Cover 6)."
+    "away_offense_vs_home_defense": "Explain the trench and coverage matchup in accessible terms: Who wins the line of scrimmage, whether pass protection will hold, and how safety coverage opens up specific plays.",
+    "home_offense_vs_away_defense": "Explain the trench and coverage matchup in accessible terms: Who wins the line of scrimmage, whether pass protection will hold, and how safety coverage opens up specific plays."
   }},
   "player_projections": [
     {{
@@ -395,7 +393,7 @@ Output strictly valid JSON matching this exact array schema:
       "role": "QB1 / RB1 / RB2 / WR1 / WR2 / WR3 / TE1",
       "player": "Player Name",
       "prop_category": "Pass Yards / Rush Yards / Rec Yards",
-      "tactical_rationale": "Chain-of-thought film/data reasoning evaluating matchup, volume trend, and game script.",
+      "tactical_rationale": "Plain-English explanation evaluating matchup, volume trend, and game script.",
       "projected_value": 0.0,
       "edge": "OVER / UNDER / PASS"
     }}
