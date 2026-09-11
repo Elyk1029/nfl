@@ -1,6 +1,6 @@
 """
 update_nfl.py - Pipeline Orchestrator with Opponent-Adjusted EPA, VORP, Median Conversions,
-and Self-Healing LLM Retry / Structural Fallback Loops.
+Cross-Season Temporal Lookbacks (2026 Season Continuity), and Self-Healing LLM Retry Loops.
 """
 import asyncio
 import json
@@ -36,7 +36,7 @@ if os.path.exists(MODEL_FILE):
 else:
     raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
 
-# 8-feature vector restored to match nfl_model.json signature exactly
+# 8-feature vector matching nfl_model.json signature exactly
 FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
     "diff_explosive", "rest_diff", "is_divisional", "market_home_prob",
@@ -60,7 +60,7 @@ def clean_team_abbr(team_str):
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
 
-print("Ingesting schedules, rosters, and live depth charts...")
+print(f"Ingesting schedules, rosters, and live depth charts for {CURRENT_SEASON}...")
 try:
     schedules = nfl.load_schedules(seasons=[CURRENT_SEASON]).to_pandas()
 except Exception:
@@ -154,14 +154,27 @@ def compute_opponent_adjusted_epa(pbp_df):
 team_perf = compute_opponent_adjusted_epa(pbp)
 
 def get_latest_team_row(team_abbr, target_season, target_week):
+    """
+    Pulls absolute latest pre-game form. For Week 1 of 2026, this correctly looks back 
+    across season boundaries to trailing 2025 games (Week 18 / Playoffs) rather than 
+    returning empty sets or zero defaults.
+    """
     if team_perf.empty:
         return pd.DataFrame()
+        
     t_data = team_perf[
-        (team_perf["team"] == team_abbr) &
-        ((team_perf["season"] < target_season) |
-         ((team_perf["season"] == target_season) & (team_perf["week"] < target_week)))
+        (team_perf["team"] == team_abbr) & 
+        (
+            (team_perf["season"] < target_season) | 
+            ((team_perf["season"] == target_season) & (team_perf["week"] < target_week))
+        )
     ]
-    return t_data.tail(1) if not t_data.empty else pd.DataFrame()
+    
+    if not t_data.empty:
+        t_data = t_data.sort_values(["season", "week"], ascending=[False, False])
+        return t_data.head(1)
+        
+    return pd.DataFrame()
 
 # 4. VORP Injury Delta Haircuts
 VORP_PENALTIES = {"QB1": 0.22, "LT1": 0.05, "EDGE1": 0.04}
@@ -321,7 +334,11 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
 
     if not player_stats.empty and name_stat_col:
         def get_metrics(player_name, role):
-            p_df = player_stats[player_stats[name_stat_col] == player_name]
+            # Prioritize current season stats if available, else trailing 2025 stats
+            p_df = player_stats[(player_stats[name_stat_col] == player_name) & (player_stats["season"] == CURRENT_SEASON)]
+            if p_df.empty:
+                p_df = player_stats[player_stats[name_stat_col] == player_name]
+                
             p_dict = {"player": player_name, "role": role, "team": team_abbr}
             
             if "QB" in role:
