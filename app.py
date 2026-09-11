@@ -1,4 +1,3 @@
-
 import os
 import json
 import streamlit as st
@@ -84,7 +83,7 @@ Your dual mandate:
 """
 
 # ---------------------------------------------------------
-# Database Query
+# Database Ingestion from Neon PostgreSQL
 # ---------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_predictions():
@@ -112,7 +111,7 @@ df = load_predictions()
 # ---------------------------------------------------------
 # Sidebar Controls
 # ---------------------------------------------------------
-st.sidebar.header("Execution Filters")
+st.sidebar.header("Quantitative Risk Controls")
 min_spread_edge = st.sidebar.slider("Minimum Edge Cutoff %", 0.0, 10.0, 1.5, 0.25)
 
 st.sidebar.divider()
@@ -131,10 +130,10 @@ if st.sidebar.button("Purge Terminal Cache", use_container_width=True):
 # Global Summary Metrics
 # ---------------------------------------------------------
 st.title("🏈 Institutional NFL Quantitative Engine")
-st.caption("Flat-Array Prop Ingestion | Dynamic Market Shrinkage | Eighth-Kelly Staking")
+st.caption("Bivariate Skellam Modeling | DraftKings Prop Benchmarks | Eighth-Kelly Governance")
 
 if df.empty:
-    st.info("No prediction data currently available.")
+    st.info("No prediction records currently available in Neon PostgreSQL.")
     st.stop()
 
 c1, c2, c3, c4 = st.columns(4)
@@ -156,7 +155,7 @@ tab_slate, tab_steam, tab_guru = st.tabs([
 ])
 
 # =========================================================
-# TAB 1: EXACT MATCHUP CARDS & FULL PROPS (PRESERVED)
+# TAB 1: MATCHUP CARDS & DRAFTKINGS PROP MATRICES
 # =========================================================
 with tab_slate:
     for _, row in df.iterrows():
@@ -170,12 +169,13 @@ with tab_slate:
         kelly = row.get('kelly_units') or 0.0
 
         with st.container():
+            # Header Row: Game & Macro Pricing
             cols = st.columns([2.5, 1.5, 1.5, 1.5, 1.5])
             cols[0].subheader(row['matchup'])
-            cols[1].metric("Calibrated Home Win", f"{home_win_pct:.1f}%")
-            cols[2].metric("Devigged Consensus", f"{market_win_pct:.1f}%")
-            cols[3].metric("Cover Probability", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
-            cols[4].metric("Eighth-Kelly", f"{kelly:.2f}u")
+            cols[1].metric("AI Projected Win", f"{home_win_pct:.1f}%")
+            cols[2].metric("DraftKings Implied Win", f"{market_win_pct:.1f}%")
+            cols[3].metric("AI Cover Prob", f"{cover_pct:.1f}%", f"{spread_edge_pct:+.1f}% Edge")
+            cols[4].metric("Eighth-Kelly Stake", f"{kelly:.2f}u")
 
             try:
                 analysis_data = json.loads(row['analysis'])
@@ -189,10 +189,10 @@ with tab_slate:
                 else:
                     st.success(f"**Execution:** {verdict}")
 
-                with st.expander("Tactical Matchup Breakdown & Full-Roster Prop Market"):
+                with st.expander("Tactical Matchup Breakdown & DraftKings Prop Comparison"):
                     st.write(f"**Tactical Brief:** {analysis_data.get('executive_summary', '')}")
                     
-                    tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Full-Roster Props vs Market Lines"])
+                    tab_scheme, tab_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 DraftKings Lines vs. AI Projections"])
                     with tab_scheme:
                         st.markdown("**Away Offense vs. Home Front & Shell**")
                         st.write(analysis_data['schematic_matchup'].get('away_offense_vs_home_defense', 'N/A'))
@@ -203,9 +203,9 @@ with tab_slate:
                         projections = analysis_data.get('player_projections', [])
                         teams = row['matchup'].split('@')
                         
-                        def render_flat_player_table(team_name, col):
+                        def render_comparative_prop_table(team_name, col):
                             with col:
-                                st.markdown(f"#### {team_name.strip()} Market Comparison Matrix")
+                                st.markdown(f"#### {team_name.strip()} Output vs. Market Lines")
                                 if isinstance(projections, list):
                                     team_props = [p for p in projections if p.get("team", "").upper() == team_name.strip().upper()]
                                 else:
@@ -216,22 +216,40 @@ with tab_slate:
                                     for p in team_props:
                                         m_line = float(p.get('market_line', 0.0))
                                         proj = float(p.get('projected_value', 0.0))
+                                        delta = proj - m_line
+                                        action = p.get("edge", "PASS").upper()
+                                        
                                         rows.append({
                                             "Role": p.get("role", "SKILL"),
                                             "Player": p.get("player", "Unknown"),
-                                            "Category": p.get("prop_category", "Yards"),
-                                            "Sportsbook Line": f"{m_line:.1f}",
+                                            "Prop": p.get("prop_category", "Yards"),
+                                            "DraftKings Line": f"{m_line:.1f}",
                                             "AI Estimate": f"{proj:.1f}",
-                                            "Market Edge": f"{proj - m_line:+.1f}",
-                                            "Action": p.get("edge", "PASS")
+                                            "Market Edge": f"{delta:+.1f}",
+                                            "Pick": action,
+                                            "Tactical Rationale": p.get("tactical_rationale", "-")
                                         })
-                                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                                    
+                                    prop_df = pd.DataFrame(rows)
+                                    # Render comparative table with visual highlighting
+                                    st.dataframe(
+                                        prop_df,
+                                        column_config={
+                                            "DraftKings Line": st.column_config.TextColumn("Sportsbook Line", help="DraftKings/Consensus Benchmark Line"),
+                                            "AI Estimate": st.column_config.TextColumn("AI Projection", help="Model projected yardage"),
+                                            "Market Edge": st.column_config.TextColumn("Edge (Delta)", help="AI Estimate minus Sportsbook Line"),
+                                            "Pick": st.column_config.TextColumn("Execution", help="Actionable OVER / UNDER / PASS"),
+                                            "Tactical Rationale": st.column_config.TextColumn("Coaching Film Note", width="large")
+                                        },
+                                        hide_index=True,
+                                        use_container_width=True
+                                    )
                                 else:
                                     st.caption("No structured player prop data available for this squad.")
 
                         c_away, c_home = st.columns(2)
-                        render_flat_player_table(teams[0], c_away)
-                        render_flat_player_table(teams[1], c_home)
+                        render_comparative_prop_table(teams[0], c_away)
+                        render_comparative_prop_table(teams[1], c_home)
             else:
                 with st.expander("Analysis Logs"):
                     st.write(row['analysis'])
@@ -243,7 +261,7 @@ with tab_slate:
 # =========================================================
 with tab_steam:
     st.subheader("⚡ Consensus Steam & Market Discrepancy Matrix")
-    st.caption("Real-time divergence between calibrated model win rates and closing market prices.")
+    st.caption("Isolating sharp syndicate line movement vs. AI model power rating differentials.")
 
     steam_records = []
     for _, r in df.iterrows():
@@ -254,16 +272,16 @@ with tab_steam:
         units = float(r.get('kelly_units') or 0.0)
 
         if discrepancy >= 4.0:
-            bias = "🔥 Sharp Home Steam / Value"
+            bias = "🔥 Sharp Home Steam / Under-priced"
         elif discrepancy <= -4.0:
-            bias = "❄️ Heavy Away Steam / Market Inflated"
+            bias = "❄️ Heavy Away Steam / Public Inflated"
         else:
             bias = "⚖️ Consensus Fairly Priced"
 
         steam_records.append({
             "Matchup": r["matchup"],
             "Model Win%": f"{p_cal * 100:.1f}%",
-            "Market Devigged%": f"{p_mkt * 100:.1f}%",
+            "DraftKings Implied%": f"{p_mkt * 100:.1f}%",
             "Market Discrepancy": f"{discrepancy:+.1f}%",
             "Spread Cover Edge": f"{edge:+.1f}%",
             "Eighth-Kelly Stake": f"{units:.2f}u",
@@ -273,7 +291,7 @@ with tab_steam:
     st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
 
 # =========================================================
-# TAB 3: STRATEGIC GURU WORKBENCH (INTERACTIVE PERSONA)
+# TAB 3: STRATEGIC GURU WORKBENCH
 # =========================================================
 with tab_guru:
     st.subheader(f"🧠 {guru_mode}")
@@ -297,7 +315,7 @@ with tab_guru:
                 augmented_prompt = f"[{guru_mode.upper()}]\nSUBJECT: {query_title}\n\nINPUT PAYLOAD:\n{raw_payload}"
                 try:
                     res = ai_client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.8-flash",
                         contents=augmented_prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=GURU_SYSTEM_INSTRUCTION,
