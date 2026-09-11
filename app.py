@@ -1,9 +1,6 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
-Complete Production UI:
-- Reconciles actionable verdict banner with Eighth-Kelly staking allocation.
-- Corrects ATS grading inversion via normalized home_spread_line math.
-- Embeds complete 2026 Play-Caller & Schematic Directory in Guru Workbench.
+Complete UI with Structured Closed-Loop Skill Prop Stat Lines (Passing, Rushing, Receiving, TDs).
 """
 import os
 import json
@@ -111,22 +108,22 @@ You are the "NFL Research Director & Quantitative Architect," operating at the n
 ## 1. 2026 PLAY-CALLER & TACTICAL CONTINUITY DIRECTORY
 * Cardinals: HC Mike LaFleur | OC Nathaniel Hackett | DC Nick Rallis (Wide Zone, 12/21 play-action boot)
 * Falcons: HC Kevin Stefanski | OC Tommy Rees | DC Jeff Ulbrich (Under-center wide zone, Duo power)
-* Ravens: HC Jesse Minter | OC Declan Doyle | DC Anthony Weaver (Simulated pressure creeper defense; Doyle heavy option/gap GT counter)
+* Ravens: HC Jesse Minter | OC Declan Doyle | DC Anthony Weaver (Simulated pressure creepers; Doyle heavy option/gap counter)
 * Bills: HC Joe Brady | OC Pete Carmichael Jr. | DC Jim Leonhard (Spread rhythm, 11 empty; Leonhard disguise 3-safety subpackages)
-* Browns: HC Todd Monken | OC Travis Switzer | DC Ephraim Banda (Monken vertical Dagger/Choice; downhill gap/power)
-* Broncos: HC Sean Payton | OC Davis Webb | DC Vance Joseph (Timing West Coast, high screen/rub volume)
-* Lions: HC Dan Campbell | OC Drew Petzing | DC Jim O'Neil (Under-center Duo/Power interior wash, heavy box aggression)
-* Packers: HC Matt LaFleur | OC Adam Stenavich | DC Jonathan Gannon (Motion-at-snap outside zone; Gannon split-safety match Quarters/Cover 6)
-* Raiders: HC Klint Kubiak | OC Andrew Janocko | DC Rob Leonard (Stretch zone, FB lead-iso, explosive crossing routes)
-* Chargers: HC Jim Harbaugh | OC Mike McDaniel | DC Chris O'Leary (Gap/man trench power paired with McDaniel perimeter speed motions)
-* Rams: HC Sean McVay | OC Nathan Scheelhaase | DC Aubrey Pleasant (Duo/mid-zone foundations, condensed bunch rub concepts)
-* Dolphins: HC Jeff Hafley | OC Bobby Slowik | DC Anthony Weaver (Hafley single-high press-man; Slowik outside zone boot attack)
-* Giants: HC John Harbaugh | OC Matt Nagy | DC Dennard Wilson (Physical edge discipline; Nagy West Coast RPO; Wilson Cover 1/3 robber)
+* Browns: HC Todd Monken | OC Travis Switzer | DC Ephraim Banda (Monken vertical Choice/Dagger; downhill power)
+* Broncos: HC Sean Payton | OC Davis Webb | DC Vance Joseph (Timing West Coast progressions, rub volume)
+* Lions: HC Dan Campbell | OC Drew Petzing | DC Jim O'Neil (Under-center Duo/Power wash, heavy box aggression)
+* Packers: HC Matt LaFleur | OC Adam Stenavich | DC Jonathan Gannon (Motion outside zone; match Quarters/Cover 6)
+* Raiders: HC Klint Kubiak | OC Andrew Janocko | DC Rob Leonard (Stretch zone, FB lead-iso, crossing boots)
+* Chargers: HC Jim Harbaugh | OC Mike McDaniel | DC Chris O'Leary (Gap trench power with perimeter motion)
+* Rams: HC Sean McVay | OC Nathan Scheelhaase | DC Aubrey Pleasant (Duo/mid-zone, condensed bunch rubs)
+* Dolphins: HC Jeff Hafley | OC Bobby Slowik | DC Anthony Weaver (Single-high press-man; Slowik outside zone boot)
+* Giants: HC John Harbaugh | OC Matt Nagy | DC Dennard Wilson (Edge discipline; West Coast RPO; Cover 1/3 robber)
 * Jets: HC Aaron Glenn | OC Frank Reich | DC Brian Duker (Press-man boundary leverage; Reich timing spread RPO)
-* Steelers: HC Mike McCarthy | OC Arthur Smith | DC Patrick Graham (West Coast rhythm blended with Smith heavy 12/13 pistol outside zone)
-* 49ers: HC Kyle Shanahan | OC Klay Kubiak | DC Raheem Morris (Shanahan outside zone/counter masterclass; Morris match-quarters front penetration)
-* Titans: HC Robert Saleh | OC Brian Daboll | DC Dennard Wilson (Saleh 4-3 Wide-9 penetration front; Daboll spread option with QB-designed runs)
-* Commanders: HC Dan Quinn | OC David Blough | DC Joe Whitt Jr. (Cover 3/1 single-high shell; tempo-based RPO spread)
+* Steelers: HC Mike McCarthy | OC Arthur Smith | DC Patrick Graham (West Coast rhythm; Smith heavy 12/13 pistol zone)
+* 49ers: HC Kyle Shanahan | OC Klay Kubiak | DC Raheem Morris (Outside zone masterclass; match-quarters front push)
+* Titans: HC Robert Saleh | OC Brian Daboll | DC Dennard Wilson (Saleh 4-3 Wide-9 penetration front; Daboll spread option)
+* Commanders: HC Dan Quinn | OC David Blough | DC Joe Whitt Jr. (Cover 3/1 single-high; tempo RPO spread)
 
 ---
 
@@ -138,9 +135,10 @@ You are the "NFL Research Director & Quantitative Architect," operating at the n
 ---
 
 ## 3. MATHEMATICAL DISCIPLINE
-* Filter metrics to neutral leverage (WP 10%-90%).
+* Neutral script leverage (WP 10%-90%).
 * Log-normal median conversion for player props: m = mu * exp(-sigma^2 / 2).
-* Eighth-Kelly staking sizing with push probability accounting: f* = (b * p - q) / b.
+* Closed-loop target trees: Sum of receiving yards must reconcile to gross passing volume.
+* Discrete scoring margin optimization (zero ties).
 """
 
 def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float, 
@@ -207,7 +205,7 @@ with st.sidebar:
         st.rerun()
 
 st.title("🏈 Institutional NFL Quantitative Terminal")
-st.caption("Discrete Empirical Score Modeling | Opponent-Adjusted EPA | Out-of-Sample Calibration")
+st.caption("Discrete Empirical Score Modeling | Closed-Loop Skill Props | 2026 Verified Roster Continuous Engine")
 
 if df.empty:
     st.info("No active slate predictions currently loaded.")
@@ -259,7 +257,6 @@ with tab_slate:
         p_away = int(row.get('predicted_away_score') or 21)
         p_total = int(row.get('predicted_total_score') or (p_home + p_away))
 
-        # Reconcile Actionable Verdict Banner with Database Allocation
         if stake > 0.0 and edge_pct > 0.0:
             verdict_str = analysis_data.get('actionable_verdict', f"BET - {stake:.2f}u")
             if "PASS" in verdict_str.upper():
@@ -296,12 +293,57 @@ with tab_slate:
             m3.metric("Projected Margin", f"{home_team} {p_home - p_away:+d}")
             m4.metric("Eighth-Kelly Stake", f"{stake:.2f}u")
 
-            with st.expander("Tactical Matchup Dossier & Tape Clash", expanded=is_bet):
+            with st.expander("Tactical Matchup Dossier & Skill Player Stat Lines", expanded=is_bet):
                 st.markdown(f"**Tactical Brief:** {analysis_data.get('executive_summary', 'Analysis pending.')}")
-                scheme = analysis_data.get('schematic_matchup', {})
-                sc1, sc2 = st.columns(2)
-                sc1.info(f"**{away_team} Offense vs. {home_team} Defense:**\n\n" + scheme.get('away_offense_vs_home_defense', 'N/A'))
-                sc2.info(f"**{home_team} Offense vs. {away_team} Defense:**\n\n" + scheme.get('home_offense_vs_away_defense', 'N/A'))
+                
+                sub_scheme, sub_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Position Projections & Anytime TDs"])
+                with sub_scheme:
+                    scheme = analysis_data.get('schematic_matchup', {})
+                    sc1, sc2 = st.columns(2)
+                    sc1.info(f"**{away_team} Offense vs. {home_team} Defense:**\n\n" + scheme.get('away_offense_vs_home_defense', 'N/A'))
+                    sc2.info(f"**{home_team} Offense vs. {away_team} Defense:**\n\n" + scheme.get('home_offense_vs_away_defense', 'N/A'))
+
+                with sub_props:
+                    player_projs = analysis_data.get('player_projections', {})
+                    
+                    def render_player_stat_table(team_key, container_col, label):
+                        with container_col:
+                            st.markdown(f"##### {label} Skill Player Projections")
+                            projs = player_projs.get(team_key, [])
+                            if projs:
+                                rows = []
+                                for p in projs:
+                                    rows.append({
+                                        "Role": p.get("role"),
+                                        "Player": p.get("player"),
+                                        "Pass Yds": f"{p.get('pass_yards', 0.0):.1f}" if p.get('pass_yards', 0.0) > 0 else "-",
+                                        "Rush Yds": f"{p.get('rush_yards', 0.0):.1f}" if p.get('rush_yards', 0.0) > 0 else "-",
+                                        "Rec Yds": f"{p.get('rec_yards', 0.0):.1f}" if p.get('rec_yards', 0.0) > 0 else "-",
+                                        "Pass TDs": f"{p.get('projected_pass_tds', 0.0):.2f}" if p.get('projected_pass_tds', 0.0) > 0 else "-",
+                                        "Exp. TDs": f"{p.get('total_tds', 0.0):.2f}",
+                                        "Anytime TD%": f"{p.get('anytime_td_prob', 0.0):.1f}%"
+                                    })
+                                st.dataframe(
+                                    pd.DataFrame(rows),
+                                    column_config={
+                                        "Role": st.column_config.TextColumn("Role", width="small"),
+                                        "Player": st.column_config.TextColumn("Player", width="medium"),
+                                        "Pass Yds": st.column_config.TextColumn("Pass Med."),
+                                        "Rush Yds": st.column_config.TextColumn("Rush Med."),
+                                        "Rec Yds": st.column_config.TextColumn("Rec Med."),
+                                        "Pass TDs": st.column_config.TextColumn("Pass TD"),
+                                        "Exp. TDs": st.column_config.TextColumn("Total TD (λ)"),
+                                        "Anytime TD%": st.column_config.TextColumn("Anytime TD")
+                                    },
+                                    hide_index=True,
+                                    use_container_width=True
+                                )
+                            else:
+                                st.caption(f"No structured skill projections available for {label}.")
+
+                    p_col1, p_col2 = st.columns(2)
+                    render_player_stat_table("away", p_col1, away_team)
+                    render_player_stat_table("home", p_col2, home_team)
 
             st.divider()
 
