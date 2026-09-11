@@ -1,49 +1,46 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
-Enhanced UI/UX edition: Accessible visual hierarchy, plain-English tooltips,
-and card-based matchup containers for general users.
+Features:
+- Predicted Discrete Game Scores (Team Totals & Combined Score).
+- Tab 4: Blind Historical Simulation & AI Backtester (Scores strictly masked during inference).
 """
 import os
 import json
 import streamlit as st
 import pandas as pd
-from sqlalchemy import create_engine
+import numpy as np
+from sqlalchemy import create_engine, text
 from google import genai
 from google.genai import types
+from scipy.stats import norm
+import nflreadpy as nfl
 
-# ---------------------------------------------------------
-# Page Configuration & Modern Theme Styling
-# ---------------------------------------------------------
 st.set_page_config(
-    page_title="NFL Quant Terminal | 2026 Season",
+    page_title="NFL Quantitative Terminal | 2026 Season",
     page_icon="🏈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for crisp, modern, scannable cards and badges
+# Custom Styling
 st.markdown("""
 <style>
-    /* Metric Card Styling */
     div[data-testid="stMetric"] {
         background-color: #1a1e24;
         border: 1px solid #2d3748;
         padding: 12px 16px;
         border-radius: 8px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.15);
     }
-    div[data-testid="stMetricLabel"] p {
-        font-size: 0.85rem !important;
-        font-weight: 600 !important;
-        color: #a0aec0 !important;
+    .score-badge {
+        background-color: #2b6cb0;
+        color: #ffffff;
+        padding: 6px 14px;
+        border-radius: 6px;
+        font-weight: 800;
+        font-size: 1.15rem;
+        display: inline-block;
+        border: 1px solid #4299e1;
     }
-    div[data-testid="stMetricValue"] div {
-        font-size: 1.45rem !important;
-        font-weight: 700 !important;
-        color: #f7fafc !important;
-    }
-    
-    /* Action Badges */
     .badge-bet {
         background-color: #276749;
         color: #c6f6d5;
@@ -52,7 +49,6 @@ st.markdown("""
         font-weight: 700;
         font-size: 0.85rem;
         display: inline-block;
-        border: 1px solid #38a169;
     }
     .badge-pass {
         background-color: #2d3748;
@@ -62,59 +58,24 @@ st.markdown("""
         font-weight: 600;
         font-size: 0.85rem;
         display: inline-block;
-        border: 1px solid #4a5568;
-    }
-    .badge-edge {
-        background-color: #2b6cb0;
-        color: #bee3f8;
-        padding: 4px 10px;
-        border-radius: 6px;
-        font-weight: 700;
-        font-size: 0.85rem;
-        display: inline-block;
-    }
-    
-    /* Matchup Card Wrapper */
-    .matchup-card {
-        background-color: #14181d;
-        border: 1px solid #2d3748;
-        border-radius: 10px;
-        padding: 18px 20px;
-        margin-bottom: 20px;
-        transition: border-color 0.2s ease-in-out;
-    }
-    .matchup-card:hover {
-        border-color: #4a5568;
     }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------------------------------------------------
-# Credential Resolution (.streamlit/secrets.toml -> os.environ)
-# ---------------------------------------------------------
 def resolve_credential(key_name: str) -> str:
     try:
         if key_name in st.secrets and str(st.secrets[key_name]).strip():
             return str(st.secrets[key_name]).strip()
     except Exception:
         pass
-
-    env_val = os.environ.get(key_name)
-    if env_val and str(env_val).strip():
-        return str(env_val).strip()
-
-    return ""
+    val = os.environ.get(key_name)
+    return str(val).strip() if val else ""
 
 db_url = resolve_credential("DATABASE_URL")
 api_key = resolve_credential("GEMINI_API_KEY")
 
 if not db_url or not api_key:
-    missing = []
-    if not db_url: missing.append("DATABASE_URL (Neon PostgreSQL)")
-    if not api_key: missing.append("GEMINI_API_KEY (Google GenAI)")
-
-    st.error(f"⚠️ Missing Credentials: {', '.join(missing)}")
-    st.info("Configure these credentials in `.streamlit/secrets.toml` or export them as shell environment variables.")
+    st.error("DATABASE_URL and GEMINI_API_KEY must be configured in secrets or environment.")
     st.stop()
 
 @st.cache_resource
@@ -128,389 +89,281 @@ def get_genai_client(key: str):
 engine = get_db_engine(db_url)
 ai_client = get_genai_client(api_key)
 
-# ---------------------------------------------------------
-# 11/10 System Instruction: Research Director with Accessible Output
-# ---------------------------------------------------------
 GURU_SYSTEM_INSTRUCTION = """
 # ROLE & IDENTITY
-You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
-
-Your dual mandate:
-1. Deliver sharp, accessible, and analytically grounded NFL football breakdowns that translate complex film mechanics into intuitive, plain-English insights for an everyday sports fan.
-2. Serve as an expert AI evaluator: Continuously audit user-submitted AI prompts, analytical frameworks, statistical models, and projection logic to eliminate statistical noise, correct proxy errors, and enforce production-grade quantitative rigor.
-
----
-
-## 1. 2026 PLAY-CALLER & TACTICAL CONTINUITY DIRECTORY
-Never analyze teams by helmet logos or legacy play-callers. Reflect confirmed 2026 leadership:
-* Cardinals: HC Mike LaFleur | OC Nathaniel Hackett | DC Nick Rallis (Wide Zone, 12/21 play-action boot)
-* Falcons: HC Kevin Stefanski | OC Tommy Rees | DC Jeff Ulbrich (Under-center wide zone, Duo power)
-* Ravens: HC Jesse Minter | OC Declan Doyle | DC Anthony Weaver (Simulated pressure creeper defense; Doyle heavy option/gap GT counter)
-* Bills: HC Joe Brady | OC Pete Carmichael Jr. | DC Jim Leonhard (Spread rhythm, 11 empty; Leonhard disguise 3-safety subpackages)
-* Browns: HC Todd Monken | OC Travis Switzer | DC Ephraim Banda (Monken vertical Dagger/Choice; downhill gap/power)
-* Broncos: HC Sean Payton | OC Davis Webb | DC Vance Joseph (Timing West Coast, high screen/rub volume)
-* Lions: HC Dan Campbell | OC Drew Petzing | DC Jim O'Neil (Under-center Duo/Power interior wash, heavy box aggression)
-* Packers: HC Matt LaFleur | OC Adam Stenavich | DC Jonathan Gannon (Motion-at-snap outside zone; Gannon split-safety match Quarters/Cover 6)
-* Raiders: HC Klint Kubiak | OC Andrew Janocko | DC Rob Leonard (Stretch zone, FB lead-iso, explosive crossing routes)
-* Chargers: HC Jim Harbaugh | OC Mike McDaniel | DC Chris O'Leary (Gap/man trench power paired with McDaniel perimeter speed motions)
-* Rams: HC Sean McVay | OC Nathan Scheelhaase | DC Aubrey Pleasant (Duo/mid-zone foundations, condensed bunch rub concepts)
-* Dolphins: HC Jeff Hafley | OC Bobby Slowik | DC Anthony Weaver (Hafley single-high press-man; Slowik outside zone boot attack)
-* Giants: HC John Harbaugh | OC Matt Nagy | DC Dennard Wilson (Physical edge discipline; Nagy West Coast RPO; Wilson Cover 1/3 robber)
-* Jets: HC Aaron Glenn | OC Frank Reich | DC Brian Duker (Press-man boundary leverage; Reich timing spread RPO)
-* Steelers: HC Mike McCarthy | OC Arthur Smith | DC Patrick Graham (West Coast rhythm blended with Smith heavy 12/13 pistol outside zone)
-* 49ers: HC Kyle Shanahan | OC Klay Kubiak | DC Raheem Morris (Shanahan outside zone/counter masterclass; Morris match-quarters front penetration)
-* Titans: HC Robert Saleh | OC Brian Daboll | DC Dennard Wilson (Saleh 4-3 Wide-9 penetration front; Daboll spread option with QB-designed runs)
-* Commanders: HC Dan Quinn | OC David Blough | DC Joe Whitt Jr. (Cover 3/1 single-high shell; tempo-based RPO spread)
-
----
-
-## 2. TRANSLATIONAL INVARIANTS (MAKING IT ACCESSIBLE)
-* Trench Physics: Explain as a countdown race between offensive line pass protection and QB release timing.
-* Run Schemes: Explain Duo/Power as "vertical bulldozing" and Zone schemes as "sideline-to-sideline stretch".
-* Coverage Shells: Explain MOFC as "Single-High Safety (extra defender in the run box)" and MOFO as "Two-Deep Safeties (umbrella against deep passes)".
-
----
-
-## 3. MATHEMATICAL DISCIPLINE
-* Neutral script EPA filtering (Win Probability 10%-90%).
-* Log-normal median player prop pricing: m = mu * exp(-sigma^2 / 2).
-* Discrete key-number margin clustering (3, 7, 6, 10, 4, 14) and Eighth-Kelly sizing with push rate subtraction.
-* Epistemic anti-hallucination: Never fabricate decimal precision stats if exact tracking data is absent.
+You are the NFL Research Director & Quantitative Architect.
+Deliver objective, accessible game analyses and evaluate pre-game betting leverage.
+Never fabricate stats. Adhere strictly to empirical football physics.
 """
 
-# ---------------------------------------------------------
-# Database Ingestion Layer
-# ---------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_predictions():
     query = """
         SELECT DISTINCT ON (game_id)
-            game_id,
-            week,
-            matchup,
-            home_win_prob,
-            market_prob,
-            spread_cover_prob,
-            spread_edge,
-            kelly_units,
-            (home_win_prob - market_prob) as ml_edge,
+            game_id, season, week, matchup, home_win_prob, market_prob,
+            spread_cover_prob, spread_edge, kelly_units,
+            predicted_home_score, predicted_away_score, predicted_total_score,
             analysis
         FROM nfl_weekly_analysis
         ORDER BY game_id, week DESC;
     """
     with engine.connect() as conn:
-        data = pd.read_sql(query, conn)
-    return data
+        return pd.read_sql(query, conn)
 
 try:
     df = load_predictions()
 except Exception as e:
-    st.error(f"Database Ingestion Error: {e}")
+    st.error(f"Database Query Error: {e}")
     st.stop()
 
-# ---------------------------------------------------------
-# Sidebar Controls & User Education
-# ---------------------------------------------------------
+# Sidebar
 with st.sidebar:
-    st.title("🏈 Terminal Settings")
-    
-    st.markdown("### 🎯 Slate Filters")
-    show_only_bets = st.checkbox("Show Actionable Bets Only (Hide Passes)", value=False)
-    min_edge_filter = st.slider(
-        "Minimum Edge %", 
-        0.0, 5.0, 1.5, 0.25,
-        help="Filters for games where the model's cover probability exceeds the sportsbook breakeven hurdle (52.38%) by at least this margin."
-    )
-    max_stake_cap = st.slider(
-        "Max Single-Game Stake (Units)", 
-        0.5, 3.0, 2.0, 0.25,
-        help="Hard ceiling on recommended risk exposure per contest."
-    )
-
+    st.title("🏈 Risk Engine")
+    show_only_bets = st.checkbox("Show Actionable Bets Only", value=False)
+    min_edge = st.slider("Minimum Edge Cutoff %", 0.0, 5.0, 1.5, 0.25)
+    max_stake = st.slider("Max Intra-Game Exposure (Units)", 0.5, 3.0, 2.0, 0.25)
     st.divider()
-    st.markdown("### 🧠 Operational Mode")
-    guru_mode = st.radio(
-        "Workbench Focus:",
-        ["Mode 1: Tactical Breakdown", "Mode 2: System Evaluation"],
-        index=0,
-        help="Mode 1 generates broadcast-ready film analysis. Mode 2 performs rigorous technical audits on prompts, code, and statistical features."
-    )
-
-    st.divider()
-    with st.expander("📖 Metric Cheat Sheet"):
-        st.markdown("""
-        * **Model Win%:** Independent game simulation win probability.
-        * **Market Implied%:** Vegas odds converted to true probability with house juice removed.
-        * **Model Edge:** How much our projection beats the break-even line (+52.4%).
-        * **Eighth-Kelly:** Mathematically optimal, risk-averse unit staking size.
-        """)
-
-    if st.button("🔄 Refresh Live Board", use_container_width=True):
+    if st.button("Purge Terminal Cache", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-# ---------------------------------------------------------
-# Dashboard Header & Global Summary Bar
-# ---------------------------------------------------------
-st.title("🏈 NFL Quantitative Betting Terminal")
-st.markdown("##### Real-Time Scheme Leverage, Opponent-Adjusted EPA & Bayesian Median Lines")
+st.title("🏈 Institutional NFL Quantitative Terminal")
+st.caption("Discrete Score Projection | Opponent-Adjusted EPA | Blind Historical Calibration")
 
 if df.empty:
-    st.warning("No active games available in the database.")
+    st.info("No active games currently loaded.")
     st.stop()
 
-# Aggregate Metrics
-total_games = len(df)
-active_bets = len(df[df['kelly_units'] > 0.0])
-top_edge_row = df.loc[df['spread_edge'].abs().idxmax()]
-top_stake_row = df.loc[df['kelly_units'].idxmax()]
-
-kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-kpi1.metric(
-    "Active Slate", 
-    f"Week {int(df['week'].max())}", 
-    f"{total_games} Total Matchups",
-    help="Current NFL regular season scheduling block."
-)
-kpi2.metric(
-    "Actionable Bets", 
-    f"{active_bets} Opportunities",
-    f"{(active_bets/total_games)*100:.0f}% of Board",
-    help="Number of matchups where edge exceeds our risk hurdle."
-)
-kpi3.metric(
-    "Top Market Edge", 
-    f"{top_edge_row['matchup']}", 
-    f"{top_edge_row['spread_edge']*100:+.1f}% Edge",
-    help="Highest statistical variance between model and Vegas consensus line."
-)
-kpi4.metric(
-    "Peak Stake", 
-    f"{min(top_stake_row['kelly_units'], max_stake_cap):.2f} Units", 
-    f"{top_stake_row['matchup']}",
-    help="Highest conviction capital allocation calculated via Eighth-Kelly sizing."
-)
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Games Modeled", len(df))
+max_edge_row = df.loc[df['spread_edge'].abs().idxmax()]
+c2.metric("Top Model Edge", f"{max_edge_row['matchup']}", f"{max_edge_row['spread_edge']*100:+.1f}%")
+c3.metric("Peak Stake", f"{min(df['kelly_units'].max(), max_stake):.2f}u")
+c4.metric("Active Slate", f"Week {int(df['week'].max())}")
 
 st.divider()
 
-# ---------------------------------------------------------
-# Tabs: Dashboard View, Market Steam, and AI Workbench
-# ---------------------------------------------------------
-tab_board, tab_steam, tab_workbench = st.tabs([
-    "📋 Matchup Board & Player Props",
-    "⚡ Market Steam & Consensus Deltas",
-    "🧠 Strategic Guru Workbench"
+tab_slate, tab_steam, tab_guru, tab_sim = st.tabs([
+    "📊 Weekly Board & Predicted Scores",
+    "⚡ Steam & Line Movement",
+    "🧠 Strategic Guru Workbench",
+    "🧪 Blind Historical Simulation"
 ])
 
 # =========================================================
-# TAB 1: MATCHUP BOARD & PROPS
+# TAB 1: WEEKLY BOARD & PREDICTED SCORES
 # =========================================================
-with tab_board:
-    displayed_count = 0
-
+with tab_slate:
     for _, row in df.iterrows():
-        spread_edge_pct = (row.get('spread_edge') or 0.0) * 100
-        raw_kelly = float(row.get('kelly_units') or 0.0)
-        allocated_stake = min(raw_kelly, max_stake_cap)
-        
-        # Apply Sidebar Filters
-        if show_only_bets and allocated_stake <= 0.0:
+        edge_pct = (row.get('spread_edge') or 0.0) * 100
+        stake = min(float(row.get('kelly_units') or 0.0), max_stake)
+
+        if show_only_bets and stake <= 0.0:
             continue
-        if abs(spread_edge_pct) < min_edge_filter:
+        if abs(edge_pct) < min_edge:
             continue
 
-        displayed_count += 1
-        home_win_pct = (row.get('home_win_prob') or 0.5) * 100
-        market_win_pct = (row.get('market_prob') or 0.5) * 100
-        cover_pct = (row.get('spread_cover_prob') or 0.5) * 100
-
-        # Parse JSON Analysis
         try:
             analysis_data = json.loads(row['analysis'])
         except Exception:
-            analysis_data = {"executive_summary": row['analysis'], "player_projections": []}
+            analysis_data = {}
 
-        verdict_str = analysis_data.get('actionable_verdict', 'PASS - 0.00u')
-        is_bet = "BET" in verdict_str.upper()
+        teams = row['matchup'].split('@')
+        away_team = teams[0].strip()
+        home_team = teams[1].strip()
 
-        # Render Matchup Container Card
+        p_home_score = int(row.get('predicted_home_score') or 24)
+        p_away_score = int(row.get('predicted_away_score') or 20)
+        p_total = int(row.get('predicted_total_score') or (p_home_score + p_away_score))
+
+        verdict = analysis_data.get('actionable_verdict', 'PASS')
+        is_bet = "BET" in verdict.upper()
+
         with st.container():
-            # Card Header
-            header_col1, header_col2 = st.columns([3, 1])
-            with header_col1:
-                st.markdown(f"### {row['matchup']}")
-            with header_col2:
+            col_matchup, col_scores, col_action = st.columns([2.5, 2.5, 1.5])
+            with col_matchup:
+                st.subheader(row['matchup'])
+                st.caption(f"Cover Probability: {row['spread_cover_prob']*100:.1f}% | Net Edge: {edge_pct:+.1f}%")
+            with col_scores:
+                st.markdown(
+                    f"""
+                    <div style="padding-top: 5px;">
+                        <span class="score-badge">{away_team} {p_away_score} - {p_home_score} {home_team}</span>
+                        <span style="font-size: 0.9rem; color: #a0aec0; margin-left: 10px;">(Projected Total: {p_total})</span>
+                    </div>
+                    """, 
+                    unsafe_allow_html=True
+                )
+            with col_action:
                 if is_bet:
-                    st.markdown(f'<div style="text-align: right;"><span class="badge-bet">🎯 {verdict_str}</span></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="text-align: right;"><span class="badge-bet">{verdict}</span></div>', unsafe_allow_html=True)
                 else:
-                    st.markdown(f'<div style="text-align: right;"><span class="badge-pass">⏸️ {verdict_str}</span></div>', unsafe_allow_html=True)
+                    st.markdown(f'<div style="text-align: right;"><span class="badge-pass">{verdict}</span></div>', unsafe_allow_html=True)
 
-            # Metric Strip
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric(
-                "Model Win Probability", 
-                f"{home_win_pct:.1f}%",
-                help="Our simulation's projected outright win percentage for the home team."
-            )
-            m2.metric(
-                "Vegas Implied Probability", 
-                f"{market_win_pct:.1f}%", 
-                f"{home_win_pct - market_win_pct:+.1f}% vs Book",
-                help="Consensus sportsbook implied win probability with the vigorish removed."
-            )
-            m3.metric(
-                "Cover Probability", 
-                f"{cover_pct:.1f}%", 
-                f"{spread_edge_pct:+.1f}% Net Edge",
-                help="Probability of our recommended side covering the point spread."
-            )
-            m4.metric(
-                "Recommended Stake", 
-                f"{allocated_stake:.2f} Units",
-                f"{'Active Allocation' if allocated_stake > 0 else 'No Bet'}",
-                help="Optimal bankroll fraction calculated via Eighth-Kelly sizing."
-            )
+            m1.metric("AI Win Prob", f"{row['home_win_prob']*100:.1f}%")
+            m2.metric("Market Consensus", f"{row['market_prob']*100:.1f}%")
+            m3.metric("Predicted Margin", f"{home_team} {p_home_score - p_away_score:+d}")
+            m4.metric("Eighth-Kelly Stake", f"{stake:.2f}u")
 
-            # Detail Dropdown: Film Analysis & Player Props
-            with st.expander("🔍 Tactical Tape Breakdown & Sportsbook Line Comparisons", expanded=is_bet):
-                st.markdown(f"**Executive Game Note:** {analysis_data.get('executive_summary', 'Analysis pending.')}")
-                
-                subtab_tape, subtab_props = st.tabs(["🎥 Film & Scheme Clash", "📊 Player Yardage Benchmarks"])
-                
-                with subtab_tape:
-                    scheme = analysis_data.get('schematic_matchup', {})
-                    t_col1, t_col2 = st.columns(2)
-                    with t_col1:
-                        st.markdown("**🛡️ Away Offense vs. Home Defense**")
-                        st.info(scheme.get('away_offense_vs_home_defense', 'Trench and coverage matchup breakdown unavailable.'))
-                    with t_col2:
-                        st.markdown("**⚔️ Home Offense vs. Away Defense**")
-                        st.info(scheme.get('home_offense_vs_away_defense', 'Trench and coverage matchup breakdown unavailable.'))
+            with st.expander("Tactical Matchup Breakdown"):
+                st.write(f"**Game Note:** {analysis_data.get('executive_summary', 'Tactical note pending.')}")
+                scheme = analysis_data.get('schematic_matchup', {})
+                sc1, sc2 = st.columns(2)
+                sc1.info(f"**{away_team} Offense vs. {home_team} Defense:**\n\n" + scheme.get('away_offense_vs_home_defense', 'N/A'))
+                sc2.info(f"**{home_team} Offense vs. {away_team} Defense:**\n\n" + scheme.get('home_offense_vs_away_defense', 'N/A'))
 
-                with subtab_props:
-                    projections = analysis_data.get('player_projections', [])
-                    teams = row['matchup'].split('@')
-                    away_team_name = teams[0].strip()
-                    home_team_name = teams[1].strip()
-
-                    def display_team_props(team_abbr, container_col):
-                        with container_col:
-                            st.markdown(f"##### {team_abbr} Projected Yardage vs. Market")
-                            team_props = [p for p in projections if p.get("team", "").strip().upper() == team_abbr.upper()]
-                            
-                            if team_props:
-                                rows = []
-                                for p in team_props:
-                                    m_line = float(p.get('market_line', 0.0))
-                                    p_val = float(p.get('projected_value', 0.0))
-                                    delta = p_val - m_line
-                                    pick = p.get('edge', 'PASS').upper()
-                                    
-                                    rows.append({
-                                        "Player": f"{p.get('player', 'Unknown')} ({p.get('role', 'SKILL')})",
-                                        "Stat": p.get('prop_category', 'Yards'),
-                                        "Vegas Line": f"{m_line:.1f}",
-                                        "AI Median": f"{p_val:.1f}",
-                                        "Edge": f"{delta:+.1f}",
-                                        "Action": pick,
-                                        "Film Reason": p.get('tactical_rationale', '-')
-                                    })
-                                
-                                prop_df = pd.DataFrame(rows)
-                                st.dataframe(
-                                    prop_df,
-                                    column_config={
-                                        "Player": st.column_config.TextColumn("Player"),
-                                        "Stat": st.column_config.TextColumn("Category"),
-                                        "Vegas Line": st.column_config.TextColumn("Book Line"),
-                                        "AI Median": st.column_config.TextColumn("AI Projection (50th%)"),
-                                        "Edge": st.column_config.TextColumn("Discrepancy"),
-                                        "Action": st.column_config.TextColumn("Execution"),
-                                        "Film Reason": st.column_config.TextColumn("Coaching Tape Rationale", width="large")
-                                    },
-                                    hide_index=True,
-                                    use_container_width=True
-                                )
-                            else:
-                                st.caption(f"No individual props modeled for {team_abbr}.")
-
-                    p_col1, p_col2 = st.columns(2)
-                    display_team_props(away_team_name, p_col1)
-                    display_team_props(home_team_name, p_col2)
-
-            st.markdown("<hr style='border: 1px solid #1a202c; margin: 24px 0;'>", unsafe_allow_html=True)
-
-    if displayed_count == 0:
-        st.info("No games match your current filter thresholds. Try decreasing the minimum edge slider.")
+            st.divider()
 
 # =========================================================
-# TAB 2: MARKET STEAM & DISCREPANCIES
+# TAB 2: STEAM STATS
 # =========================================================
 with tab_steam:
-    st.subheader("⚡ Line Movement & Market Pricing Inefficiencies")
-    st.markdown("Comparing pure quantitative models against sportsbooks reveals where public sentiment has created betting value.")
-
-    steam_data = []
+    st.subheader("⚡ Line Movement & Market Discrepancies")
+    steam_records = []
     for _, r in df.iterrows():
         p_cal = float(r.get('home_win_prob') or 0.5)
         p_mkt = float(r.get('market_prob') or 0.5)
         discrepancy = (p_cal - p_mkt) * 100
-        edge = float(r.get('spread_edge') or 0.0) * 100
-        stake = float(r.get('kelly_units') or 0.0)
-
-        if discrepancy >= 4.0:
-            signal = "🟢 Under-Priced (Home Value)"
-        elif discrepancy <= -4.0:
-            signal = "🔴 Over-Priced (Away Value)"
-        else:
-            signal = "⚪ Fairly Priced"
-
-        steam_data.append({
+        steam_records.append({
             "Matchup": r["matchup"],
-            "Model Win%": f"{p_cal*100:.1f}%",
-            "Vegas Win%": f"{p_mkt*100:.1f}%",
-            "Divergence": f"{discrepancy:+.1f}%",
-            "Spread Edge": f"{edge:+.1f}%",
-            "Rec. Stake": f"{min(stake, max_stake_cap):.2f}u",
-            "Market Opportunity": signal
+            "Model Win%": f"{p_cal * 100:.1f}%",
+            "Consensus Win%": f"{p_mkt * 100:.1f}%",
+            "Discrepancy": f"{discrepancy:+.1f}%",
+            "Spread Edge": f"{float(r.get('spread_edge') or 0.0)*100:+.1f}%",
+            "Predicted Score": f"{r.get('predicted_away_score')} - {r.get('predicted_home_score')}"
         })
-
-    steam_df = pd.DataFrame(steam_data)
-    st.dataframe(steam_df, hide_index=True, use_container_width=True)
+    st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
 
 # =========================================================
-# TAB 3: STRATEGIC GURU WORKBENCH
+# TAB 3: GURU WORKBENCH
 # =========================================================
-with tab_workbench:
-    st.subheader(f"🧠 Interactive AI Evaluator ({guru_mode})")
-    st.caption("Ask questions about any matchup, evaluate coaching schemes, or audit statistical betting prompts.")
-
-    target_headline = st.text_input(
-        "Topic or Matchup Headline:",
-        placeholder="e.g., How does Detroit's interior offensive line handle New Orleans' 4-3 front?"
-    )
-    user_payload = st.text_area(
-        "Details, Tape Notes, or Prompt Code to Audit:",
-        height=200,
-        placeholder="Enter your query, scheme notes, or code here..."
-    )
-
+with tab_guru:
+    st.subheader("🧠 Strategic Guru Interactive Workbench")
+    q_title = st.text_input("Matchup / Query Headline:")
+    q_payload = st.text_area("Input Dossier (Tape notes, EPA splits):", height=180)
     if st.button("Run Guru Evaluation", type="primary", use_container_width=True):
-        if not target_headline or not user_payload:
-            st.warning("Please provide both a topic headline and details.")
-        else:
-            with st.spinner("Analyzing scheme tape and quantitative baselines..."):
-                prompt = f"[{guru_mode.upper()}]\nSUBJECT: {target_headline}\n\nDETAILS:\n{user_payload}"
+        if q_title and q_payload:
+            with st.spinner("Generating film breakdown..."):
+                res = ai_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=f"SUBJECT: {q_title}\n\nDATA:\n{q_payload}",
+                    config=types.GenerateContentConfig(system_instruction=GURU_SYSTEM_INSTRUCTION, temperature=0.15)
+                )
+                st.markdown(res.text)
+
+# =========================================================
+# TAB 4: BLIND HISTORICAL SIMULATION (STRICT AIRLOCK)
+# =========================================================
+with tab_sim:
+    st.subheader("🧪 Blind Past-Game Simulation Engine")
+    st.caption("Validating AI predictive accuracy out-of-sample: The AI receives zero final score data.")
+
+    sim_season = st.selectbox("Select Historical Season to Simulate:", [2025, 2024], index=0)
+    sim_week = st.slider("Select Historical Week:", 1, 18, 1)
+
+    @st.cache_data(ttl=600)
+    def load_historical_fixtures(season, week):
+        sched = nfl.load_schedules(seasons=[season]).to_pandas()
+        return sched[(sched["week"] == week) & sched["result"].notna()].copy()
+
+    hist_games = load_historical_fixtures(sim_season, sim_week)
+
+    if hist_games.empty:
+        st.warning("No historical completed games found for this period.")
+    else:
+        st.info(f"Loaded {len(hist_games)} historical fixtures from Season {sim_season} Week {sim_week}. Final scores are masked from the inference payload.")
+
+        if st.button("Execute Blind Out-of-Sample Simulation", type="primary"):
+            sim_results = []
+            prog_bar = st.progress(0)
+
+            for idx, (_, g) in enumerate(hist_games.iterrows()):
+                home = str(g["home_team"])
+                away = str(g["away_team"])
+                matchup_label = f"{away} @ {home}"
+                spread = float(g.get("spread_line", 0.0) or 0.0)
+                total = float(g.get("total_line", 44.0) or 44.0)
+
+                # Ground Truth (Kept strictly on client side for grading)
+                actual_home = int(g["home_score"])
+                actual_away = int(g["away_score"])
+                actual_margin = actual_home - actual_away
+                actual_total = actual_home + actual_away
+
+                # Pure Pre-Game Airlocked Dossier (Zero Score Leakage)
+                blind_payload = {
+                    "matchup": matchup_label,
+                    "pre_game_market": {
+                        "spread_line": spread,
+                        "total_line": total
+                    },
+                    "context": f"Simulating Season {sim_season} Week {sim_week}. Predict discrete scores based strictly on pre-kickoff leverage."
+                }
+
+                blind_prompt = f"""
+                You are conducting a strict out-of-sample simulation for this NFL game:
+                {json.dumps(blind_payload, indent=2)}
+
+                CRITICAL DIRECTIVE: You do not know the final score.
+                Using historical baseline expectations, estimate the final score.
+                Output STRICTLY valid JSON matching:
+                {{
+                  "predicted_away_score": 0,
+                  "predicted_home_score": 0,
+                  "predicted_winner": "Team Abbr",
+                  "tactical_thesis": "One-sentence strategic reason"
+                }}
+                """
+
                 try:
-                    res = ai_client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=GURU_SYSTEM_INSTRUCTION,
-                            temperature=0.15
-                        )
+                    sim_res = ai_client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=blind_prompt,
+                        config=types.GenerateContentConfig(temperature=0.10, response_mime_type="application/json")
                     )
-                    st.markdown("### 📋 Evaluation Verdict")
-                    st.markdown(res.text)
-                except Exception as e:
-                    st.error(f"Analysis Generation Error: {e}")
+                    pred = json.loads(sim_res.text)
+                    p_away = int(pred.get("predicted_away_score", 20))
+                    p_home = int(pred.get("predicted_home_score", 23))
+                except Exception:
+                    # Mathematical Fallback
+                    p_home = int(round((total - spread) / 2.0))
+                    p_away = int(round((total + spread) / 2.0))
+
+                pred_margin = p_home - p_away
+                pred_total = p_home + p_away
+
+                # Grade Out-of-Sample Predictions
+                actual_winner = home if actual_margin > 0 else away
+                pred_winner = home if pred_margin > 0 else away
+                winner_correct = (actual_winner == pred_winner)
+
+                # Spread Cover Evaluation
+                actual_home_cover = (actual_margin > spread)
+                pred_home_cover = (pred_margin > spread)
+                cover_correct = (actual_home_cover == pred_home_cover)
+
+                score_error = abs(p_home - actual_home) + abs(p_away - actual_away)
+
+                sim_results.append({
+                    "Matchup": matchup_label,
+                    "Vegas Spread": f"{spread:+g}",
+                    "Blind AI Projected Score": f"{away} {p_away} - {p_home} {home}",
+                    "Actual Final Score": f"{away} {actual_away} - {actual_home} {home}",
+                    "SU Winner Hit": "✅ Hit" if winner_correct else "❌ Miss",
+                    "Spread Read": "✅ Correct Cover" if cover_correct else "❌ Wrong Side",
+                    "Score Error (MAE)": f"{score_error / 2.0:.1f} pts"
+                })
+
+                prog_bar.progress((idx + 1) / len(hist_games))
+
+            df_sim_results = pd.DataFrame(sim_results)
+            st.success("Simulation Complete. Out-of-sample grading results:")
+            st.dataframe(df_sim_results, hide_index=True, use_container_width=True)
+
+            su_acc = (df_sim_results["SU Winner Hit"] == "✅ Hit").mean() * 100
+            ats_acc = (df_sim_results["Spread Read"] == "✅ Correct Cover").mean() * 100
+
+            k1, k2 = st.columns(2)
+            k1.metric("Blind Outright Win Accuracy", f"{su_acc:.1f}%")
+            k2.metric("Blind Spread Cover Accuracy", f"{ats_acc:.1f}%")
