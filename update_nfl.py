@@ -355,7 +355,7 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
 # ROLE & IDENTITY
-You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (Next Gen Stats), and advanced sabermetric modeling.
+You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
 
 # DIRECTIVES
 - Anti-Anchoring: Output independent projections derived strictly from scheme volume, not Vegas echoes.
@@ -414,7 +414,7 @@ Output strictly valid JSON matching this exact array schema:
             except Exception as e:
                 print(f"Inference warning on attempt {attempt + 1} for {payload.get('matchup')}: {e}")
                 
-            async asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(2 ** attempt)
 
         # Self-healing fallback payload if API repeatedly returns empty arrays
         home_team = payload["rosters"]["home_team"]["team"]
