@@ -35,6 +35,7 @@ FEATURES = [
     "diff_explosive", "rest_diff", "is_divisional", "market_home_prob",
 ]
 
+# Discrete empirical NFL key-number push rates
 NFL_KEY_PUSH_RATES = {
     3: 0.148, 7: 0.094, 6: 0.059, 10: 0.057, 4: 0.052, 14: 0.046, 1: 0.038, 2: 0.036
 }
@@ -92,9 +93,11 @@ for df in [schedules, pbp, player_stats, injuries, depth_charts]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
-# 3. Clean EPA & Early-Down Success Rate (EDSR)
+# 3. Clean EPA & Early-Down Success Rate (EDSR) Feature Engineering
 if not pbp.empty:
     pbp_clean = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
+    
+    # Strict Garbage Time Filter: Win probability must sit between 15% and 85% in second half
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
         leverage_mask = (pbp_clean["qtr"] <= 2) | (pbp_clean["home_wp"].between(0.15, 0.85))
         pbp_clean = pbp_clean[leverage_mask]
@@ -229,7 +232,8 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
                     "market_line": round(pass_yds * pace_factor, 1)
                 })
             elif "RB" in role:
-                rush_yds = round(float(p_df["rushing_yards"].mean()), 1) if not p_df.empty and "rushing_yards" in p_df else (62.5 if "1" in role else 28.5)
+                # Committee touch-share adjustment: RB1 ~ 55%, RB2 ~ 35%
+                rush_yds = round(float(p_df["rushing_yards"].mean()), 1) if not p_df.empty and "rushing_yards" in p_df else (58.5 if "1" in role else 32.5)
                 p_dict.update({
                     "prop_type": "Rush Yards",
                     "market_line": round(rush_yds * pace_factor, 1)
@@ -251,28 +255,36 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
         "scratches": scratches[:5] if scratches else ["None Reported"]
     }
 
-# 6. Strategic Scouting Voice LLM Evaluator with Anti-Anchoring Chain-of-Thought Prompt
+# 6. NFL Analytics Coordinator & Strategic Evaluator Engine
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
-You are an NFL Strategic Research Director and quantitative prop analyst.
-Analyze both team spread edges and discrete player prop projections across ALL skill roles (QB1, RB1, RB2, WR1, WR2, WR3, TE1).
+# ROLE & PERSONA
+You are the "NFL Analytics Coordinator & Strategic Guru," operating at the intersection of advanced football sabermetrics and high-level coaching tape analysis. You possess elite-level fluency in both traditional football film study (schemes, coverages, run fits, route concepts) and modern predictive analytics (EPA/play, CPOE, Success Rate, DVOA, pressure rate vs. quick game, NGS tracking data).
 
-Evaluation Directives:
-1. Anti-Anchoring Mandate: Do NOT default to market benchmarks or copy numbers. Your projection must reflect your own independent read of usage share, game script, and matchup, even when it diverges from market baselines.
-2. Chain-of-Thought First: You must formulate the `tactical_rationale` explaining your film/data read BEFORE determining the final `projected_value`.
-3. Target Tree Sanity: After projecting each player independently, consider as a post-hoc check that total receiving yards should correlate logically with team passing volume.
-4. Output strictly valid JSON matching the exact schema without markdown formatting.
+Your dual mandate:
+1. Deliver razor-sharp, objective, and analytically grounded NFL football analysis.
+2. Act as an expert AI evaluator: Continuously review team matchups, analytical frameworks, and player prop projections to pinpoint blind spots, eliminate statistical noise, and recommend actionable positions.
+
+# CORE COMPETENCIES & KNOWLEDGE BASE
+- Scheme & Tactical Fluency: Personnel groupings (11, 12, 21 personnel), pass-pro schemes, run-blocking schemes (Inside/Outside Zone, Duo, Power/Counter), route distribution vs. MOFO/MOFC (Middle of Field Open/Closed), coverage shells (Cover 1, 2-Man, Quarters, Palms, Cover 3 Match).
+- Advanced Metrics & Modeling: EPA per play, Success Rate, CPOE, Adjusted Net Yards Per Attempt (ANY/A), explosive play rate, early-down success rates (EDSR), pressure-to-sack ratios (P2S).
+- Data Hygiene: Sample size discipline, regressing unstable metrics toward the mean, avoiding bellcow touch monopolies in modern committee backfields, and aDOT-weighted receiving variance.
+
+# EXECUTION PROTOCOL
+- Anti-Anchoring Mandate: Do NOT default to market benchmarks or copy numbers. Your projection must reflect your own independent read of usage share, game script, and matchup.
+- Chain-of-Thought First: You must formulate the `tactical_rationale` explaining your film/data read BEFORE determining the final `projected_value`.
+- Output strictly valid JSON matching the exact array schema without markdown formatting.
 """
     prompt = f"""
-Evaluate this NFL advance scouting dossier:
+Evaluate this NFL advance scouting dossier with sportsbook prop benchmarks:
 {json.dumps(payload, indent=2)}
 
 Output strictly valid JSON matching this exact array schema (note that tactical_rationale must come BEFORE projected_value):
 {{
-  "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS.",
+  "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS based on market key numbers and early-down leverage.",
   "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Film analysis of protection rates, blitz schemes, and coverage families (MOFC vs MOFO).",
-    "home_offense_vs_away_defense": "Film analysis of protection rates, blitz schemes, and coverage families (MOFC vs MOFO)."
+    "away_offense_vs_home_defense": "Film breakdown: Pass protection win rates, blitz packages, run-blocking scheme (Zone vs Gap), and coverage shells (MOFC Cover 1/3 vs MOFO Quarters/Cover 6).",
+    "home_offense_vs_away_defense": "Film breakdown: Pass protection win rates, blitz packages, run-blocking scheme (Zone vs Gap), and coverage shells (MOFC Cover 1/3 vs MOFO Quarters/Cover 6)."
   }},
   "player_projections": [
     {{
@@ -280,7 +292,7 @@ Output strictly valid JSON matching this exact array schema (note that tactical_
       "role": "QB1 / RB1 / RB2 / WR1 / WR2 / WR3 / TE1",
       "player": "Player Name",
       "prop_category": "Pass Yards / Rush Yards / Rec Yards",
-      "tactical_rationale": "Must write chain-of-thought film/data reasoning here first.",
+      "tactical_rationale": "Chain-of-thought film/data reasoning evaluating matchup, volume trend, and game script.",
       "projected_value": 0.0,
       "edge": "OVER / UNDER / PASS"
     }}
@@ -299,7 +311,7 @@ Output strictly valid JSON matching this exact array schema (note that tactical_
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=system_prompt,
-                            temperature=0.2, # Slight temperature lift to encourage independent movement
+                            temperature=0.2,
                             response_mime_type="application/json"
                         )
                     )
@@ -456,7 +468,7 @@ async def main():
         home_ctx = get_full_skill_player_baselines(home_team, implied_home_total)
         away_ctx = get_full_skill_player_baselines(away_team, implied_away_total)
 
-        # Build lookup dictionaries for post-hoc market baseline merging
+        # Baseline lookup maps for post-hoc calculation
         home_market_map = {f"{p['role']}_{p['prop_type']}": p['market_line'] for p in home_ctx["profiles"]}
         away_market_map = {f"{p['role']}_{p['prop_type']}": p['market_line'] for p in away_ctx["profiles"]}
 
@@ -491,7 +503,7 @@ async def main():
     semaphore = asyncio.Semaphore(4)
 
     for item in governed_slate:
-        # Pass stripped payload to Gemini (WITHOUT market lines directly adjacent to projections)
+        # Strip synthetic lines from input payload to eliminate anchoring
         clean_profiles_home = [{"role": p["role"], "player": p["player"], "prop_type": p["prop_type"]} for p in item["rosters"]["home_team"]["profiles"]]
         clean_profiles_away = [{"role": p["role"], "player": p["player"], "prop_type": p["prop_type"]} for p in item["rosters"]["away_team"]["profiles"]]
 
@@ -525,23 +537,22 @@ async def main():
 
     records = []
     for item, text_response in zip(governed_slate, results):
-        # Post-hoc merge market lines back into player projections so Streamlit can compare them
+        # Post-hoc merge market benchmark lines
         try:
             parsed_analysis = json.loads(text_response)
             if "player_projections" in parsed_analysis and isinstance(parsed_analysis["player_projections"], list):
                 for p in parsed_analysis["player_projections"]:
                     team_key = "home" if p.get("team","").upper() == item["rosters"]["home_team"]["team"].upper() else "away"
                     m_map = item["market_maps"][team_key]
-                    map_key = f"{p.get('role')}_{p.get('prop_category')}"
-                    # Matchup prop category strings
-                    if p.get('prop_category') == "Pass Yards":
+                    cat = p.get('prop_category', 'Yards')
+                    if "Pass" in cat:
                         map_key = f"{p.get('role')}_Pass Yards"
-                    elif p.get('prop_category') == "Rush Yards":
+                    elif "Rush" in cat:
                         map_key = f"{p.get('role')}_Rush Yards"
-                    elif p.get('prop_category') == "Rec Yards":
+                    else:
                         map_key = f"{p.get('role')}_Rec Yards"
                     
-                    p["market_line"] = m_map.get(map_key, 50.0)
+                    p["market_line"] = m_map.get(map_key, 45.0)
                 text_response = json.dumps(parsed_analysis)
         except Exception as e:
             print(f"Error merging post-hoc market lines for {item['matchup']}: {e}")
