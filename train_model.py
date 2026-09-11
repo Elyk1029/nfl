@@ -1,11 +1,12 @@
 """
 train_model.py - Historical XGBoost Model Trainer for NFL Spread Prediction.
-Produces the serialized nfl_model.json required by update_nfl.py.
+Produces the exact 8-feature serialized nfl_model.json required by update_nfl.py.
 """
 import os
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
 import xgboost as xgb
@@ -21,7 +22,7 @@ schedules = nfl.load_schedules(seasons=TRAINING_SEASONS).to_pandas()
 if pbp.empty or schedules.empty:
     raise ValueError("FATAL: Failed to ingest historical training data from nflreadpy.")
 
-# Clean team abbreviations
+# Clean team abbreviations to match standard mapping
 TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
 def clean_abbr(s):
     if not isinstance(s, str): return s
@@ -69,7 +70,7 @@ metric_cols = [
     "def_dropback_epa", "def_rush_epa", "def_early_down_success", "def_late_down_epa",
 ]
 for col in metric_cols:
-    team_perf[f"roll_{col}"] = team_perf.groupby("team"][col].transform(
+    team_perf[f"roll_{col}"] = team_perf.groupby("team")[col].transform(
         lambda x: x.shift(1).ewm(span=6, min_periods=1).mean()
     )
 
@@ -77,7 +78,6 @@ def get_row(season, week, team):
     sub = team_perf[(team_perf["season"] == season) & (team_perf["week"] == week) & (team_perf["team"] == team)]
     if not sub.empty:
         return sub.iloc[0]
-    # Fallback to latest prior week if exact match missing
     prior = team_perf[(team_perf["team"] == team) & ((team_perf["season"] < season) | ((team_perf["season"] == season) & (team_perf["week"] < week)))]
     return prior.tail(1).iloc[0] if not prior.empty else pd.Series()
 
@@ -135,7 +135,7 @@ for _, g in completed_games.iterrows():
     })
 
 train_df = pd.DataFrame(training_rows)
-train_df = train_df[train_df["home_win"] != 0.5].dropna() # Drop ties for binary classification
+train_df = train_df[train_df["home_win"] != 0.5].dropna()
 
 FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
