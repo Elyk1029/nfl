@@ -1,5 +1,6 @@
 """
 update_nfl.py - Pipeline Orchestrator with Opponent-Adjusted EPA, VORP, and Median Conversions.
+Restored 8-feature XGBoost signature matching nfl_model.json.
 """
 import asyncio
 import json
@@ -35,10 +36,10 @@ if os.path.exists(MODEL_FILE):
 else:
     raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
 
-# Fundamental feature vector (Collinear market probability stripped to avoid double-shrinkage)
+# 8-feature vector restored to match nfl_model.json signature exactly
 FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
-    "diff_explosive", "rest_diff", "is_divisional",
+    "diff_explosive", "rest_diff", "is_divisional", "market_home_prob",
 ]
 
 NFL_KEY_PUSH_RATES = {
@@ -111,7 +112,6 @@ def compute_opponent_adjusted_epa(pbp_df):
 
     pbp_clean = pbp_df[pbp_df["play_type"].isin(["pass", "run"])].copy()
     
-    # Strictly filter non-garbage time leverage (WP 10% - 90%, exclude late blowouts)
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
         leverage_mask = (pbp_clean["qtr"] <= 3) | (pbp_clean["home_wp"].between(0.10, 0.90))
         pbp_clean = pbp_clean[leverage_mask]
@@ -475,9 +475,10 @@ async def main():
         rest_diff = home_rest - away_rest
         is_divisional = int(game.get("div_game", 0)) if pd.notna(game.get("div_game")) else 0
 
+        # Pass 8 features to match nfl_model.json booster signature exactly
         feature_row = pd.DataFrame([[
             net_pass_edge, net_rush_edge, net_late_down_edge, diff_success,
-            diff_explosive, rest_diff, is_divisional
+            diff_explosive, rest_diff, is_divisional, market_home_prob
         ]], columns=FEATURES)
 
         raw_model_home_prob = float(model.predict_proba(feature_row)[0][1])
@@ -657,7 +658,5 @@ async def main():
         df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
         print(f"Database sync successful: {len(df_results)} matchups committed for Week {target_week}.")
 
-if __name__ == "__main__":
-    asyncio.run(main())
 if __name__ == "__main__":
     asyncio.run(main())
