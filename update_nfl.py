@@ -1,10 +1,12 @@
 """
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
-- Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
+- Multi-source nflreadpy ingestion (schedules, pbp, injuries, depth_charts).
+- Cross-season temporal lookbacks and opponent-adjusted Ridge EPA rolling metrics.
+- Roster injury haircuts via VORP penalties.
 - Closed-Loop Skill Player Volume Allocation (QB, RB1/2, WR1/2/3, TE1) with target-tree conservation.
-- Explicit Roster Name Injection to prevent generic positional placeholders in LLM narratives.
-- Log-normal median yardage transformation and Poisson anytime-TD modeling.
+- Real 2026 Roster Name Resolution (combining first_name and last_name from depth charts).
+- Log-normal median yardage transformations and Poisson anytime-TD modeling.
 - Discrete empirical score generation (zero regular-season ties).
 - Auto-migrating Neon PostgreSQL upsert.
 """
@@ -172,46 +174,46 @@ def generate_closed_loop_skill_projections(team_abbr: str, implied_total: float,
 
     return [
         {
-            "role": "QB1", "player": depth_names.get("QB1", "Starting QB"),
+            "role": "QB1", "player": depth_names.get("QB1", f"{team_abbr} QB"),
             "pass_yards": convert_mean_to_median(team_gross_pass, "QB_Pass"),
             "rush_yards": convert_mean_to_median(qb_mean_rush, "QB_Rush"),
             "rec_yards": 0.0, "projected_pass_tds": round(team_pass_tds, 2),
             "total_tds": round(qb_rush_td, 2), "anytime_td_prob": calc_anytime_td_prob(qb_rush_td)
         },
         {
-            "role": "RB1", "player": depth_names.get("RB1", "Starting RB1"),
+            "role": "RB1", "player": depth_names.get("RB1", f"{team_abbr} RB1"),
             "pass_yards": 0.0, "rush_yards": convert_mean_to_median(rb1_mean_rush, "RB_Rush"),
             "rec_yards": convert_mean_to_median(rb1_mean_rec, "RB_Rec"), "projected_pass_tds": 0.0,
             "total_tds": round(rb1_rush_td + (team_pass_tds * rec_td_shares["RB1"]), 2),
             "anytime_td_prob": calc_anytime_td_prob(rb1_rush_td + (team_pass_tds * rec_td_shares["RB1"]))
         },
         {
-            "role": "RB2", "player": depth_names.get("RB2", "Starting RB2"),
+            "role": "RB2", "player": depth_names.get("RB2", f"{team_abbr} RB2"),
             "pass_yards": 0.0, "rush_yards": convert_mean_to_median(rb2_mean_rush, "RB_Rush"),
             "rec_yards": convert_mean_to_median(rb2_mean_rec, "RB_Rec"), "projected_pass_tds": 0.0,
             "total_tds": round(rb2_rush_td + (team_pass_tds * rec_td_shares["RB2"]), 2),
             "anytime_td_prob": calc_anytime_td_prob(rb2_rush_td + (team_pass_tds * rec_td_shares["RB2"]))
         },
         {
-            "role": "WR1", "player": depth_names.get("WR1", "Starting WR1"),
+            "role": "WR1", "player": depth_names.get("WR1", f"{team_abbr} WR1"),
             "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr1_mean_rec, "WR_Rec"),
             "projected_pass_tds": 0.0, "total_tds": round(team_pass_tds * rec_td_shares["WR1"], 2),
             "anytime_td_prob": calc_anytime_td_prob(team_pass_tds * rec_td_shares["WR1"])
         },
         {
-            "role": "WR2", "player": depth_names.get("WR2", "Starting WR2"),
+            "role": "WR2", "player": depth_names.get("WR2", f"{team_abbr} WR2"),
             "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr2_mean_rec, "WR_Rec"),
             "projected_pass_tds": 0.0, "total_tds": round(team_pass_tds * rec_td_shares["WR2"], 2),
             "anytime_td_prob": calc_anytime_td_prob(team_pass_tds * rec_td_shares["WR2"])
         },
         {
-            "role": "WR3", "player": depth_names.get("WR3", "Starting WR3"),
+            "role": "WR3", "player": depth_names.get("WR3", f"{team_abbr} WR3"),
             "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr3_mean_rec, "WR_Rec"),
             "projected_pass_tds": 0.0, "total_tds": round(team_pass_tds * rec_td_shares["WR3"], 2),
             "anytime_td_prob": calc_anytime_td_prob(team_pass_tds * rec_td_shares["WR3"])
         },
         {
-            "role": "TE1", "player": depth_names.get("TE1", "Starting TE1"),
+            "role": "TE1", "player": depth_names.get("TE1", f"{team_abbr} TE1"),
             "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(te1_mean_rec, "TE_Rec"),
             "projected_pass_tds": 0.0, "total_tds": round(team_pass_tds * rec_td_shares["TE1"], 2),
             "anytime_td_prob": calc_anytime_td_prob(team_pass_tds * rec_td_shares["TE1"])
@@ -316,29 +318,39 @@ def calculate_roster_vorp(team_abbr):
     return penalty
 
 def extract_depth_chart_names(team_abbr: str) -> dict:
-    depth_map = {"QB": ["1"], "RB": ["1", "2"], "WR": ["1", "2", "3"], "TE": ["1"]}
     picks = {
-        "QB1": "Starting QB", "RB1": "Starting RB1", "RB2": "Starting RB2",
-        "WR1": "Starting WR1", "WR2": "Starting WR2", "WR3": "Starting WR3", "TE1": "Starting TE1"
+        "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
+        "WR1": f"{team_abbr} WR1", "WR2": f"{team_abbr} WR2", "WR3": f"{team_abbr} WR3", "TE1": f"{team_abbr} TE1"
     }
     if depth_charts.empty:
         return picks
+
     t_dc = depth_charts[depth_charts["club_code"] == team_abbr] if "club_code" in depth_charts else pd.DataFrame()
     if t_dc.empty:
         return picks
+
+    # Check for first_name and last_name columns in nflreadpy depth charts
+    first_col = next((c for c in ["first_name", "fname"] if c in t_dc.columns), None)
+    last_col = next((c for c in ["last_name", "lname"] if c in t_dc.columns), None)
+    name_col = next((c for c in ["player_name", "full_name", "player"] if c in t_dc.columns), None)
     pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in t_dc.columns), None)
     rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in t_dc.columns), None)
-    name_col = next((c for c in ["player_name", "full_name", "player"] if c in t_dc.columns), None)
-    if pos_col and rank_col and name_col:
-        for pos, ranks in depth_map.items():
-            for r in ranks:
-                matched = t_dc[(t_dc[pos_col] == pos) & (t_dc[rank_col].astype(str).str.strip() == r)]
-                if not matched.empty:
-                    picks[f"{pos}{r}"] = matched.iloc[0][name_col]
+
+    if pos_col and rank_col:
+        mapping = [("QB", "1", "QB1"), ("RB", "1", "RB1"), ("RB", "2", "RB2"), 
+                   ("WR", "1", "WR1"), ("WR", "2", "WR2"), ("WR", "3", "WR3"), ("TE", "1", "TE1")]
+        for pos, rank, key in mapping:
+            matched = t_dc[(t_dc[pos_col] == pos) & (t_dc[rank_col].astype(str).str.strip() == rank)]
+            if not matched.empty:
+                row = matched.iloc[0]
+                if first_col and last_col and pd.notna(row[first_col]) and pd.notna(row[last_col]):
+                    picks[key] = f"{row[first_col]} {row[last_col]}"
+                elif name_col and pd.notna(row[name_col]):
+                    picks[key] = row[name_col]
     return picks
 
 # -------------------------------------------------------------------------
-# 5. LLM Scouting Engine (With Explicit Roster Context Injection)
+# 5. LLM Scouting Engine
 # -------------------------------------------------------------------------
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     system_prompt = """
@@ -346,24 +358,7 @@ async def generate_matchup_analysis(semaphore, payload, recommended_team, recomm
 You are the NFL Research Director & Quantitative Architect operating with full domain authority over coaching tape breakdown and Next Gen Stats.
 
 # 2026 PLAY-CALLER & SCHEME CONTINUITY
-* Cardinals: HC Mike LaFleur | OC Nathaniel Hackett | DC Nick Rallis (Wide Zone, 12/21 play-action boot)
-* Falcons: HC Kevin Stefanski | OC Tommy Rees | DC Jeff Ulbrich (Under-center wide zone, Duo power)
-* Ravens: HC Jesse Minter | OC Declan Doyle | DC Anthony Weaver (Simulated pressure creepers; Doyle heavy option/gap counter)
-* Bills: HC Joe Brady | OC Pete Carmichael Jr. | DC Jim Leonhard (Spread rhythm, 11 empty; Leonhard 3-safety disguises)
-* Browns: HC Todd Monken | OC Travis Switzer | DC Ephraim Banda (Monken vertical Choice/Dagger; downhill power)
-* Broncos: HC Sean Payton | OC Davis Webb | DC Vance Joseph (Timing West Coast progressions, rub volume)
-* Lions: HC Dan Campbell | OC Drew Petzing | DC Jim O'Neil (Under-center Duo/Power wash, heavy box aggression)
-* Packers: HC Matt LaFleur | OC Adam Stenavich | DC Jonathan Gannon (Motion outside zone; match Quarters/Cover 6)
-* Raiders: HC Klint Kubiak | OC Andrew Janocko | DC Rob Leonard (Stretch zone, FB lead-iso, crossing boots)
-* Chargers: HC Jim Harbaugh | OC Mike McDaniel | DC Chris O'Leary (Gap trench power with perimeter motion)
-* Rams: HC Sean McVay | OC Nathan Scheelhaase | DC Aubrey Pleasant (Duo/mid-zone, condensed bunch rubs)
-* Dolphins: HC Jeff Hafley | OC Bobby Slowik | DC Anthony Weaver (Single-high press-man; Slowik outside zone boot)
-* Giants: HC John Harbaugh | OC Matt Nagy | DC Dennard Wilson (Edge discipline; West Coast RPO; Cover 1/3 robber)
-* Jets: HC Aaron Glenn | OC Frank Reich | DC Brian Duker (Press-man boundary leverage; Reich timing spread RPO)
-* Steelers: HC Mike McCarthy | OC Arthur Smith | DC Patrick Graham (West Coast rhythm; Smith heavy 12/13 pistol zone)
-* 49ers: HC Kyle Shanahan | OC Klay Kubiak | DC Raheem Morris (Outside zone masterclass; match-quarters front push)
-* Titans: HC Robert Saleh | OC Brian Daboll | DC Dennard Wilson (Saleh 4-3 Wide-9 penetration front; Daboll spread option)
-* Commanders: HC Dan Quinn | OC David Blough | DC Joe Whitt Jr. (Cover 3/1 single-high; tempo RPO spread)
+* Cardinals: HC Mike LaFleur | Falcons: HC Kevin Stefanski | Ravens: HC Jesse Minter | Bills: HC Joe Brady | Browns: HC Todd Monken | Broncos: HC Sean Payton | Lions: HC Dan Campbell | Packers: HC Matt LaFleur | Raiders: HC Klint Kubiak | Chargers: HC Jim Harbaugh | Rams: HC Sean McVay | Dolphins: HC Jeff Hafley | Giants: HC John Harbaugh | Jets: HC Aaron Glenn | Steelers: HC Mike McCarthy | 49ers: HC Kyle Shanahan | Titans: HC Robert Saleh | Commanders: HC Dan Quinn
 
 # INVARIANTS
 * You MUST reference explicit player names from the provided team rosters (e.g., Lamar Jackson, Derrick Henry, Jonathan Taylor) rather than generic placeholders like RB1 or WR1.
