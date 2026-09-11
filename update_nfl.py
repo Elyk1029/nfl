@@ -36,7 +36,6 @@ if os.path.exists(MODEL_FILE):
 else:
     raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
 
-# 8-feature vector matching nfl_model.json signature exactly
 FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
     "diff_explosive", "rest_diff", "is_divisional", "market_home_prob",
@@ -155,9 +154,7 @@ team_perf = compute_opponent_adjusted_epa(pbp)
 
 def get_latest_team_row(team_abbr, target_season, target_week):
     """
-    Pulls absolute latest pre-game form. For Week 1 of 2026, this correctly looks back 
-    across season boundaries to trailing 2025 games (Week 18 / Playoffs) rather than 
-    returning empty sets or zero defaults.
+    Pulls absolute latest pre-game form across season boundaries without intra-week leakage.
     """
     if team_perf.empty:
         return pd.DataFrame()
@@ -334,7 +331,6 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
 
     if not player_stats.empty and name_stat_col:
         def get_metrics(player_name, role):
-            # Prioritize current season stats if available, else trailing 2025 stats
             p_df = player_stats[(player_stats[name_stat_col] == player_name) & (player_stats["season"] == CURRENT_SEASON)]
             if p_df.empty:
                 p_df = player_stats[player_stats[name_stat_col] == player_name]
@@ -372,12 +368,13 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
 # ROLE & IDENTITY
-You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
+You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (Next Gen Stats), and advanced sabermetric modeling.
 
 # DIRECTIVES
+- 2026 Orientation: Evaluate all clashes using confirmed 2026 play-callers, defensive coordinators, and active schemes.
 - Anti-Anchoring: Output independent projections derived strictly from scheme volume, not Vegas echoes.
 - Median Pricing: Project median yards (50th percentile expectation), not high-variance ceiling means.
-- Target Tree Sanity: The sum of team receiving yards across all targets must sit within 80% to 118% of that team's gross passing yards.
+- Target Tree Sanity: The sum of team receiving yards across all targets must sit within 75% to 125% of that team's gross passing yards.
 - Epistemic Calibration: If exact tracking data is absent, state metrics in directional percentiles or scheme tiers. Never fabricate decimal-precision metrics.
 - Output strictly valid JSON matching the exact array schema without markdown formatting.
 """
@@ -433,7 +430,7 @@ Output strictly valid JSON matching this exact array schema:
                 
             await asyncio.sleep(2 ** attempt)
 
-        # Self-healing fallback payload if API repeatedly returns empty arrays
+        # Self-healing fallback payload
         home_team = payload["rosters"]["home_team"]["team"]
         away_team = payload["rosters"]["away_team"]["team"]
         fallback_json = {
@@ -643,7 +640,6 @@ async def main():
         except Exception:
             parsed_analysis = {"player_projections": []}
 
-        # Multi-key post-hoc market line merging
         if "player_projections" in parsed_analysis and isinstance(parsed_analysis["player_projections"], list):
             for p in parsed_analysis["player_projections"]:
                 p_team = p.get("team", "").strip().upper()
@@ -659,7 +655,6 @@ async def main():
 
             text_response = json.dumps(parsed_analysis)
 
-        # Stop-block verification gate
         verification = NFLDataVerifier.audit_slate_payload(item, parsed_analysis)
         if not verification.is_valid:
             print(f"CRITICAL STOP-BLOCK: {item['matchup']} failed data integrity.")
@@ -683,7 +678,6 @@ async def main():
         })
         print(f"Processed: {item['matchup']} | Line: {item['recommended_line']} | Edge: {item['spread_edge']:+.1%} | Stake: {item['kelly_units']}u")
 
-    # Neon PostgreSQL Commit
     if records:
         df_results = pd.DataFrame(records)
         with engine.begin() as conn:
@@ -706,6 +700,9 @@ async def main():
             )
         df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
         print(f"Database sync successful: {len(df_results)} matchups committed for Week {target_week}.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 if __name__ == "__main__":
     asyncio.run(main())
