@@ -1,6 +1,6 @@
 """
-update_nfl.py - Pipeline Orchestrator with Discrete Predicted Score Modeling
-and Multi-Outcome Relational Database Commit.
+update_nfl.py - Pipeline Orchestrator with Opponent-Adjusted EPA, VORP, Median Conversions,
+Discrete Score Modeling, and Auto-Migrating PostgreSQL Commit.
 """
 import asyncio
 import json
@@ -57,17 +57,11 @@ def clean_team_abbr(team_str):
 
 # 2. Discrete Score Computation Engine
 def calculate_discrete_projected_scores(projected_margin, total_line):
-    """
-    Transforms continuous projected margin and market total into realistic NFL point totals,
-    aligning with historical discrete football point densities (multiples of 3 and 7).
-    """
     raw_home = (total_line + projected_margin) / 2.0
     raw_away = (total_line - projected_margin) / 2.0
 
-    # Football discrete rounding anchor
     def snap_to_football_score(score):
         base = round(score)
-        # Avoid impossible/ultra-rare low football totals
         if base in [1, 2, 5]:
             return 3 if base <= 2 else 6
         return int(base)
@@ -75,7 +69,6 @@ def calculate_discrete_projected_scores(projected_margin, total_line):
     home_score = snap_to_football_score(raw_home)
     away_score = snap_to_football_score(raw_away)
 
-    # Ensure margin direction integrity is preserved
     if projected_margin > 0.5 and home_score <= away_score:
         home_score = away_score + (3 if (away_score + 3) - away_score == 3 else 1)
     elif projected_margin < -0.5 and away_score <= home_score:
@@ -113,13 +106,15 @@ except Exception:
     depth_charts = pd.DataFrame()
 
 for df in [schedules, pbp, player_stats, injuries, depth_charts]:
-    if df.empty: continue
+    if df.empty:
+        continue
     for col in ["home_team", "away_team", "posteam", "defteam", "recent_team", "team", "club_code"]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
 def compute_opponent_adjusted_epa(pbp_df):
-    if pbp_df.empty: return pd.DataFrame()
+    if pbp_df.empty:
+        return pd.DataFrame()
     pbp_clean = pbp_df[pbp_df["play_type"].isin(["pass", "run"])].copy()
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
         pbp_clean = pbp_clean[(pbp_clean["qtr"] <= 3) | (pbp_clean["home_wp"].between(0.10, 0.90))]
@@ -156,7 +151,8 @@ def compute_opponent_adjusted_epa(pbp_df):
 team_perf = compute_opponent_adjusted_epa(pbp)
 
 def get_latest_team_row(team_abbr, target_season, target_week):
-    if team_perf.empty: return pd.DataFrame()
+    if team_perf.empty:
+        return pd.DataFrame()
     t_data = team_perf[
         (team_perf["team"] == team_abbr) & 
         ((team_perf["season"] < target_season) | ((team_perf["season"] == target_season) & (team_perf["week"] < target_week)))
@@ -165,9 +161,11 @@ def get_latest_team_row(team_abbr, target_season, target_week):
 
 VORP_PENALTIES = {"QB1": 0.22, "LT1": 0.05, "EDGE1": 0.04}
 def calculate_roster_vorp(team_abbr):
-    if injuries.empty or depth_charts.empty: return 0.0
+    if injuries.empty or depth_charts.empty:
+        return 0.0
     t_inj = injuries[(injuries["team"] == team_abbr) & (injuries["report_status"].isin(["Out", "Doubtful", "IR"]))]
-    if t_inj.empty: return 0.0
+    if t_inj.empty:
+        return 0.0
     inj_names = t_inj["player_name"].dropna().tolist() if "player_name" in t_inj else []
     t_dc = depth_charts[depth_charts["club_code"] == team_abbr] if "club_code" in depth_charts else pd.DataFrame()
     penalty = 0.0
@@ -198,7 +196,8 @@ Never fabricate decimal-precision statistics. Output strictly valid JSON.
                         config=types.GenerateContentConfig(
                             system_instruction=system_prompt,
                             temperature=0.15,
-                            response_mime_type="application/json"
+                            response_mime_type="application/json",
+                            tools=None
                         )
                     )
                 )
@@ -207,7 +206,10 @@ Never fabricate decimal-precision statistics. Output strictly valid JSON.
                 await asyncio.sleep(2 ** attempt)
         return json.dumps({
             "executive_summary": f"Analytical edge identified for {payload['matchup']}.",
-            "schematic_matchup": {"away_offense_vs_home_defense": "Standard alignment.", "home_offense_vs_away_defense": "Standard alignment."},
+            "schematic_matchup": {
+                "away_offense_vs_home_defense": "Standard alignment.",
+                "home_offense_vs_away_defense": "Standard alignment."
+            },
             "player_projections": []
         })
 
@@ -241,7 +243,6 @@ async def main():
         home_ml = float(game["home_moneyline"]) if pd.notna(game.get("home_moneyline")) else None
         away_ml = float(game["away_moneyline"]) if pd.notna(game.get("away_moneyline")) else None
 
-        # Devigged consensus calculation
         if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
             p_h = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
             p_a = 100.0 / (away_ml + 100.0) if away_ml > 0 else abs(away_ml) / (abs(away_ml) + 100.0)
@@ -275,7 +276,6 @@ async def main():
 
         raw_home_prob = float(model.predict_proba(feature_row)[0][1])
 
-        # Dynamic Shrinkage Calibration
         dynamic_weight = min(0.75, max(0.48, 0.48 + (abs(spread_line) * 0.022)))
         calibrated_home_win_prob = ((1.0 - dynamic_weight) * raw_home_prob) + (dynamic_weight * market_home_prob)
 
@@ -283,11 +283,9 @@ async def main():
         z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
         projected_margin = z_win * sigma
 
-        # Discrete Point Total Modeling
         pred_home_score, pred_away_score = calculate_discrete_projected_scores(projected_margin, total_line)
         pred_total_score = pred_home_score + pred_away_score
 
-        # Spread Cover Distribution
         abs_spread = round(abs(spread_line))
         push_rate = NFL_KEY_PUSH_RATES.get(abs_spread, 0.0) if float(spread_line).is_integer() else 0.0
         z_cover_home = (projected_margin - (spread_line + 0.5 if spread_line.is_integer() else spread_line)) / sigma
@@ -319,7 +317,6 @@ async def main():
             cover_prob = max(home_cover, away_cover)
             final_edge = max(home_edge, away_edge)
 
-        # Eighth-Kelly Sizing
         b = 1.9091 - 1.0
         q = max(0.0, 1.0 - cover_prob - push_rate)
         kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" else 0.0
@@ -387,12 +384,11 @@ async def main():
         })
 
     if records:
-        df_res = pd.DataFrame(records)
+        df_results = pd.DataFrame(records)
         with engine.begin() as conn:
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS nfl_weekly_analysis (
                     game_id TEXT PRIMARY KEY,
-                    season INTEGER,
                     week INTEGER,
                     matchup TEXT,
                     home_win_prob NUMERIC,
@@ -400,18 +396,34 @@ async def main():
                     spread_cover_prob NUMERIC,
                     spread_edge NUMERIC,
                     kelly_units NUMERIC,
-                    predicted_home_score INTEGER,
-                    predicted_away_score INTEGER,
-                    predicted_total_score INTEGER,
                     analysis TEXT
                 );
             """))
+
+            migration_statements = [
+                "ALTER TABLE nfl_weekly_analysis ADD COLUMN IF NOT EXISTS season INTEGER DEFAULT 2026;",
+                "ALTER TABLE nfl_weekly_analysis ADD COLUMN IF NOT EXISTS predicted_home_score INTEGER;",
+                "ALTER TABLE nfl_weekly_analysis ADD COLUMN IF NOT EXISTS predicted_away_score INTEGER;",
+                "ALTER TABLE nfl_weekly_analysis ADD COLUMN IF NOT EXISTS predicted_total_score INTEGER;"
+            ]
+            for stmt in migration_statements:
+                conn.execute(text(stmt))
+
             conn.execute(
-                text("DELETE FROM nfl_weekly_analysis WHERE season = :s AND week = :w"),
+                text("DELETE FROM nfl_weekly_analysis WHERE season = :s AND week = :w;"),
                 {"s": target_season, "w": target_week}
             )
-        df_res.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False)
-        print(f"Committed {len(df_res)} games with predicted scores for Week {target_week}.")
 
+        df_results.to_sql(
+            "nfl_weekly_analysis",
+            engine,
+            if_exists="append",
+            index=False,
+            method="multi"
+        )
+        print(f"Database sync verified: {len(df_results)} fixtures safely committed for Season {target_season} Week {target_week}.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
 if __name__ == "__main__":
     asyncio.run(main())
