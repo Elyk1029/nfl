@@ -35,7 +35,7 @@ FEATURES = [
     "diff_explosive", "rest_diff", "is_divisional", "market_home_prob",
 ]
 
-# Discrete empirical NFL key-number push rates
+# Discrete empirical NFL key-number push frequencies
 NFL_KEY_PUSH_RATES = {
     3: 0.148, 7: 0.094, 6: 0.059, 10: 0.057, 4: 0.052, 14: 0.046, 1: 0.038, 2: 0.036
 }
@@ -93,11 +93,9 @@ for df in [schedules, pbp, player_stats, injuries, depth_charts]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
-# 3. Clean EPA & Early-Down Success Rate (EDSR) Feature Engineering
+# 3. Clean EPA & Early-Down Success Rate (EDSR)
 if not pbp.empty:
     pbp_clean = pbp[pbp["play_type"].isin(["pass", "run"])].copy()
-    
-    # Strict Garbage Time Filter: Win probability must sit between 15% and 85% in second half
     if "home_wp" in pbp_clean.columns and "qtr" in pbp_clean.columns:
         leverage_mask = (pbp_clean["qtr"] <= 2) | (pbp_clean["home_wp"].between(0.15, 0.85))
         pbp_clean = pbp_clean[leverage_mask]
@@ -226,13 +224,11 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
             
             if "QB" in role:
                 pass_yds = round(float(p_df["passing_yards"].mean()), 1) if not p_df.empty and "passing_yards" in p_df else 235.5
-                rush_yds = round(float(p_df["rushing_yards"].mean()), 1) if not p_df.empty and "rushing_yards" in p_df else 14.5
                 p_dict.update({
                     "prop_type": "Pass Yards",
                     "market_line": round(pass_yds * pace_factor, 1)
                 })
             elif "RB" in role:
-                # Committee touch-share adjustment: RB1 ~ 55%, RB2 ~ 35%
                 rush_yds = round(float(p_df["rushing_yards"].mean()), 1) if not p_df.empty and "rushing_yards" in p_df else (58.5 if "1" in role else 32.5)
                 p_dict.update({
                     "prop_type": "Rush Yards",
@@ -255,7 +251,7 @@ def get_full_skill_player_baselines(team_abbr, implied_team_total=22.0):
         "scratches": scratches[:5] if scratches else ["None Reported"]
     }
 
-# 6. NFL Analytics Coordinator & Strategic Evaluator Engine
+# 6. Strategic Scouting Voice Evaluator (Gemini 3.8 Flash)
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, chosen_edge, kelly_units):
     system_prompt = """
 # ROLE & PERSONA
@@ -263,28 +259,28 @@ You are the "NFL Analytics Coordinator & Strategic Guru," operating at the inter
 
 Your dual mandate:
 1. Deliver razor-sharp, objective, and analytically grounded NFL football analysis.
-2. Act as an expert AI evaluator: Continuously review team matchups, analytical frameworks, and player prop projections to pinpoint blind spots, eliminate statistical noise, and recommend actionable positions.
+2. Act as an expert AI evaluator: Continuously review user-submitted AI prompts, analytical frameworks, model outputs, or predictive systems to pinpoint blind spots, eliminate statistical noise, and recommend improvements.
 
 # CORE COMPETENCIES & KNOWLEDGE BASE
 - Scheme & Tactical Fluency: Personnel groupings (11, 12, 21 personnel), pass-pro schemes, run-blocking schemes (Inside/Outside Zone, Duo, Power/Counter), route distribution vs. MOFO/MOFC (Middle of Field Open/Closed), coverage shells (Cover 1, 2-Man, Quarters, Palms, Cover 3 Match).
-- Advanced Metrics & Modeling: EPA per play, Success Rate, CPOE, Adjusted Net Yards Per Attempt (ANY/A), explosive play rate, early-down success rates (EDSR), pressure-to-sack ratios (P2S).
-- Data Hygiene: Sample size discipline, regressing unstable metrics toward the mean, avoiding bellcow touch monopolies in modern committee backfields, and aDOT-weighted receiving variance.
+- Advanced Metrics & Modeling: EPA per play, Success Rate, CPOE, DVOA, Adjusted Net Yards Per Attempt (ANY/A), explosive play rate, win probability models, high-leverage 4th-down decision curves.
+- Data Hygiene: Sample size discipline, regressing unstable metrics (turnover luck, fumble recovery rates, red zone TD% variance) toward the mean, distinguishing process from outcome.
 
-# EXECUTION PROTOCOL
+# OPERATIONAL DIRECTIVES
 - Anti-Anchoring Mandate: Do NOT default to market benchmarks or copy numbers. Your projection must reflect your own independent read of usage share, game script, and matchup.
 - Chain-of-Thought First: You must formulate the `tactical_rationale` explaining your film/data read BEFORE determining the final `projected_value`.
 - Output strictly valid JSON matching the exact array schema without markdown formatting.
 """
     prompt = f"""
-Evaluate this NFL advance scouting dossier with sportsbook prop benchmarks:
+Evaluate this NFL advance scouting dossier:
 {json.dumps(payload, indent=2)}
 
 Output strictly valid JSON matching this exact array schema (note that tactical_rationale must come BEFORE projected_value):
 {{
   "executive_summary": "State whether this game is a BET ({recommended_line} at {chosen_edge:+.1%} edge) or a PASS based on market key numbers and early-down leverage.",
   "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Film breakdown: Pass protection win rates, blitz packages, run-blocking scheme (Zone vs Gap), and coverage shells (MOFC Cover 1/3 vs MOFO Quarters/Cover 6).",
-    "home_offense_vs_away_defense": "Film breakdown: Pass protection win rates, blitz packages, run-blocking scheme (Zone vs Gap), and coverage shells (MOFC Cover 1/3 vs MOFO Quarters/Cover 6)."
+    "away_offense_vs_home_defense": "Film analysis of protection rates, blitz packages, and coverage families (MOFC vs MOFO).",
+    "home_offense_vs_away_defense": "Film analysis of protection rates, blitz packages, and coverage families (MOFC vs MOFO)."
   }},
   "player_projections": [
     {{
@@ -307,11 +303,11 @@ Output strictly valid JSON matching this exact array schema (note that tactical_
                 response = await loop.run_in_executor(
                     None,
                     lambda: client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.8-flash",
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=system_prompt,
-                            temperature=0.2,
+                            temperature=0.15,
                             response_mime_type="application/json"
                         )
                     )
@@ -503,7 +499,6 @@ async def main():
     semaphore = asyncio.Semaphore(4)
 
     for item in governed_slate:
-        # Strip synthetic lines from input payload to eliminate anchoring
         clean_profiles_home = [{"role": p["role"], "player": p["player"], "prop_type": p["prop_type"]} for p in item["rosters"]["home_team"]["profiles"]]
         clean_profiles_away = [{"role": p["role"], "player": p["player"], "prop_type": p["prop_type"]} for p in item["rosters"]["away_team"]["profiles"]]
 
@@ -537,7 +532,6 @@ async def main():
 
     records = []
     for item, text_response in zip(governed_slate, results):
-        # Post-hoc merge market benchmark lines
         try:
             parsed_analysis = json.loads(text_response)
             if "player_projections" in parsed_analysis and isinstance(parsed_analysis["player_projections"], list):
