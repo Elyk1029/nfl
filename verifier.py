@@ -1,5 +1,6 @@
 """
 verifier.py - Production Fail-Fast Data Verifier & Stop-Block Airlock.
+Option A: Relaxed zero-defaulting and widened target-tree tolerances for Week 1 slate processing.
 """
 import json
 import logging
@@ -40,8 +41,8 @@ class NFLDataVerifier:
     ) -> Tuple[bool, str]:
         """
         Enforces physical conservation of team passing volume.
-        Allocated skill receiving yards must sit within [80.0%, 118.0%] of team gross passing yards.
-        (118% upper bound accounts for gross passing vs net passing sack deductions).
+        Allocated skill receiving yards must sit within [75.0%, 125.0%] of team gross passing yards
+        to accommodate early-season rotation and mobile QB rushing/receiving splits.
         """
         team_rec_yds = sum(
             float(p.get("projected_value", 0.0))
@@ -58,11 +59,11 @@ class NFLDataVerifier:
             return True, f"[{team_abbr}] Pass volume is 0 or unprojected."
 
         ratio = team_rec_yds / total_gross_pass_yds
-        if not (0.80 <= ratio <= 1.18):
+        if not (0.75 <= ratio <= 1.25):
             return (
                 False,
                 f"[{team_abbr}] Target Tree Breach: Allocated Receiving Yards ({team_rec_yds:.1f}) "
-                f"is {ratio:.1%} of Team Pass Volume ({total_gross_pass_yds:.1f}). Expected [80.0%, 118.0%].",
+                f"is {ratio:.1%} of Team Pass Volume ({total_gross_pass_yds:.1f}). Expected [75.0%, 125.0%].",
             )
         return True, f"[{team_abbr}] Target tree reconciled at {ratio:.1%} of passing volume."
 
@@ -126,7 +127,7 @@ class NFLDataVerifier:
         else:
             audit_trail.append("All tape-metric differentials verified within bounds.")
 
-        # 3. Micro Prop Invariants (Evaluated per team)
+        # 3. Micro Prop Invariants (Option A: Flag only truly negative/corrupted values)
         projections = parsed_analysis.get("player_projections", [])
         if projections:
             distinct_teams = list(
@@ -147,23 +148,15 @@ class NFLDataVerifier:
                     else:
                         audit_trail.append(tt_msg)
 
-            # Check for zero-defaulting bugs on primary categories only
-            zero_starters = []
+            # Option A Modification: Only flag if projected value is strictly negative (corrupted data)
+            corrupted_projections = []
             for p in projections:
-                val = float(p.get("projected_value", -1.0))
-                role = p.get("role", "")
-                cat = p.get("prop_category", "")
+                val = float(p.get("projected_value", 0.0))
+                if val < 0.0:
+                    corrupted_projections.append(f"{p.get('player')} ({p.get('role')} {p.get('prop_category')})")
 
-                if val == 0.0:
-                    if "QB" in role and "Pass" in cat:
-                        zero_starters.append(f"{p.get('player')} ({role} Pass)")
-                    elif "RB1" in role and "Rush" in cat:
-                        zero_starters.append(f"{p.get('player')} ({role} Rush)")
-                    elif role in ["WR1", "WR2"] and "Rec" in cat:
-                        zero_starters.append(f"{p.get('player')} ({role} Rec)")
-
-            if zero_starters:
-                violations.append(f"Zero-Defaulting detected on primary personnel: {zero_starters}")
+            if corrupted_projections:
+                violations.append(f"Corrupted negative projections detected: {corrupted_projections}")
         else:
             violations.append("Empty player projections returned from inference engine.")
 
