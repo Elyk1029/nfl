@@ -41,8 +41,7 @@ class NFLDataVerifier:
     ) -> Tuple[bool, str]:
         """
         Enforces physical conservation of team passing volume.
-        Allocated skill receiving yards must sit within [75.0%, 125.0%] of team gross passing yards
-        to accommodate early-season rotation and mobile QB rushing/receiving splits.
+        Allocated skill receiving yards must sit within [75.0%, 125.0%] of team gross passing yards.
         """
         team_rec_yds = sum(
             float(p.get("projected_value", 0.0))
@@ -127,7 +126,7 @@ class NFLDataVerifier:
         else:
             audit_trail.append("All tape-metric differentials verified within bounds.")
 
-        # 3. Micro Prop Invariants (Option A: Flag only truly negative/corrupted values)
+        # 3. Micro Prop Invariants (Flag only strictly negative corrupted data)
         projections = parsed_analysis.get("player_projections", [])
         if projections:
             distinct_teams = list(
@@ -148,7 +147,6 @@ class NFLDataVerifier:
                     else:
                         audit_trail.append(tt_msg)
 
-            # Option A Modification: Only flag if projected value is strictly negative (corrupted data)
             corrupted_projections = []
             for p in projections:
                 val = float(p.get("projected_value", 0.0))
