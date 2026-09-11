@@ -1,6 +1,12 @@
 """
-update_nfl.py - Pipeline Orchestrator with Opponent-Adjusted EPA, Closed-Loop Skill
-Projections (QB, RB1/2, WR1/2/3, TE1), Poisson Touchdown Modeling, and Auto-Migrating PostgreSQL Commit.
+update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
+Features:
+- Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
+- Closed-Loop Skill Player Volume Allocation (QB, RB1/2, WR1/2/3, TE1) with target-tree conservation.
+- Explicit Roster Name Injection to prevent generic positional placeholders in LLM narratives.
+- Log-normal median yardage transformation and Poisson anytime-TD modeling.
+- Discrete empirical score generation (zero regular-season ties).
+- Auto-migrating Neon PostgreSQL upsert.
 """
 import asyncio
 import json
@@ -18,12 +24,14 @@ import xgboost as xgb
 
 from verifier import NFLDataVerifier
 
+# -------------------------------------------------------------------------
 # 1. Environment Verification & Client Initialization
+# -------------------------------------------------------------------------
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
 
 if not db_url or not gemini_key:
-    raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured.")
+    raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured in environment or secrets.")
 
 engine = create_engine(db_url, pool_size=5, pool_pre_ping=True)
 client = genai.Client(api_key=gemini_key)
@@ -55,7 +63,9 @@ def clean_team_abbr(team_str):
     cleaned = team_str.strip().upper()
     return TEAM_ABBR_MAP.get(cleaned, cleaned)
 
-# 2. Discrete Empirical Score Engine
+# -------------------------------------------------------------------------
+# 2. Discrete Empirical Score Engine (Zero Regular-Season Ties)
+# -------------------------------------------------------------------------
 NFL_KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
 COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 
@@ -95,73 +105,49 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
 
     return int(best_pair[0]), int(best_pair[1])
 
-# 3. Log-Normal Transformation & Closed-Loop Skill Modeling
+# -------------------------------------------------------------------------
+# 3. Closed-Loop Skill Volume & Log-Normal Median Allocation
+# -------------------------------------------------------------------------
 LOG_SIGMA = {
-    "QB_Pass": 0.32,
-    "QB_Rush": 0.52,
-    "RB_Rush": 0.48,
-    "RB_Rec": 0.55,
-    "WR_Rec": 0.58,
-    "TE_Rec": 0.54,
+    "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
+    "RB_Rec": 0.55, "WR_Rec": 0.58, "TE_Rec": 0.54
 }
 
 def convert_mean_to_median(mean_val: float, role_key: str) -> float:
     if mean_val <= 0.0:
         return 0.0
     sig = LOG_SIGMA.get(role_key, 0.50)
-    return round(float(mean_val * math.exp(-(sig**2) / 2.0)), 1)
+    return round(max(0.0, float(mean_val * math.exp(-(sig**2) / 2.0))), 1)
 
 def generate_closed_loop_skill_projections(team_abbr: str, implied_total: float, spread_line: float,
                                            pass_edge: float, rush_edge: float, depth_names: dict) -> list[dict]:
-    """
-    Distributes team offensive volume to individual roles, enforcing target-tree
-    conservation, log-normal median conversions, and Poisson touchdown probabilities.
-    """
     total_plays = 63.0 * (implied_total / 22.0) ** 0.30
     script_shift = -0.012 * spread_line
     scheme_shift = 0.04 * (pass_edge - rush_edge)
     pass_rate = max(0.44, min(0.72, 0.585 + script_shift + scheme_shift))
     run_rate = 1.0 - pass_rate
 
-    total_pass_attempts = total_plays * pass_rate
-    total_rush_attempts = total_plays * run_rate
+    team_gross_pass = max(100.0, total_plays * pass_rate * max(5.2, min(9.4, 7.15 + (pass_edge * 3.5))))
+    team_gross_rush = max(50.0, total_plays * run_rate * max(3.1, min(5.6, 4.25 + (rush_edge * 2.8))))
 
-    ypa = max(5.2, min(9.4, 7.15 + (pass_edge * 3.5)))
-    ypr = max(3.1, min(5.6, 4.25 + (rush_edge * 2.8)))
-
-    team_gross_pass = total_pass_attempts * ypa
-    team_gross_rush = total_rush_attempts * ypr
-
-    total_tds = implied_total / 7.15
+    total_tds = max(1.0, implied_total / 7.15)
     pass_td_share = max(0.40, min(0.85, 0.65 + (pass_edge - rush_edge) * 0.25))
     team_pass_tds = total_tds * pass_td_share
     team_rush_tds = total_tds * (1.0 - pass_td_share)
 
-    # Rushing Tree Shares
-    qb_rush_share = 0.12
-    rb1_rush_share = 0.58
-    rb2_rush_share = 0.24
-
-    qb_mean_rush = team_gross_rush * qb_rush_share
-    rb1_mean_rush = team_gross_rush * rb1_rush_share
-    rb2_mean_rush = team_gross_rush * rb2_rush_share
+    qb_mean_rush = team_gross_rush * 0.12
+    rb1_mean_rush = team_gross_rush * 0.58
+    rb2_mean_rush = team_gross_rush * 0.24
 
     rb1_rush_td = team_rush_tds * 0.62
     rb2_rush_td = team_rush_tds * 0.22
     qb_rush_td = team_rush_tds * 0.14
 
-    # Target Tree Allocation (Closed-Loop Invariant: Sum of Rec Yds == Pass Yds)
-    raw_target_weights = {
-        "WR1": 0.26, "WR2": 0.18, "WR3": 0.12, "TE1": 0.19,
-        "RB1": 0.13, "RB2": 0.06, "OTHER": 0.06
-    }
+    raw_target_weights = {"WR1": 0.26, "WR2": 0.18, "WR3": 0.12, "TE1": 0.19, "RB1": 0.13, "RB2": 0.06, "OTHER": 0.06}
     w_sum = sum(raw_target_weights.values())
     target_shares = {k: v / w_sum for k, v in raw_target_weights.items()}
 
-    depth_multipliers = {
-        "WR1": 1.18, "WR2": 1.10, "WR3": 0.95, "TE1": 0.92,
-        "RB1": 0.64, "RB2": 0.58, "OTHER": 0.85
-    }
+    depth_multipliers = {"WR1": 1.18, "WR2": 1.10, "WR3": 0.95, "TE1": 0.92, "RB1": 0.64, "RB2": 0.58, "OTHER": 0.85}
     raw_weighted = {k: target_shares[k] * depth_multipliers[k] for k in target_shares}
     rec_norm = sum(raw_weighted.values())
     rec_shares = {k: raw_weighted[k] / rec_norm for k in raw_weighted}
@@ -176,8 +162,7 @@ def generate_closed_loop_skill_projections(team_abbr: str, implied_total: float,
     rz_weights = {
         "WR1": target_shares["WR1"] * 1.25, "WR2": target_shares["WR2"] * 1.05,
         "WR3": target_shares["WR3"] * 0.85, "TE1": target_shares["TE1"] * 1.30,
-        "RB1": target_shares["RB1"] * 0.60, "RB2": target_shares["RB2"] * 0.40,
-        "OTHER": target_shares["OTHER"] * 0.50
+        "RB1": target_shares["RB1"] * 0.60, "RB2": target_shares["RB2"] * 0.40, "OTHER": 0.50
     }
     rz_norm = sum(rz_weights.values())
     rec_td_shares = {k: rz_weights[k] / rz_norm for k in rz_weights}
@@ -185,88 +170,57 @@ def generate_closed_loop_skill_projections(team_abbr: str, implied_total: float,
     def calc_anytime_td_prob(exp_td):
         return round(float((1.0 - poisson.pmf(0, max(0.01, exp_td))) * 100.0), 1)
 
-    projections = [
+    return [
         {
-            "role": "QB1",
-            "player": depth_names.get("QB1", "Starting QB"),
+            "role": "QB1", "player": depth_names.get("QB1", "Starting QB"),
             "pass_yards": convert_mean_to_median(team_gross_pass, "QB_Pass"),
             "rush_yards": convert_mean_to_median(qb_mean_rush, "QB_Rush"),
-            "rec_yards": 0.0,
-            "projected_pass_tds": round(team_pass_tds, 2),
-            "projected_rush_tds": round(qb_rush_td, 2),
-            "total_tds": round(qb_rush_td, 2),
-            "anytime_td_prob": calc_anytime_td_prob(qb_rush_td)
+            "rec_yards": 0.0, "projected_pass_tds": round(team_pass_tds, 2),
+            "total_tds": round(qb_rush_td, 2), "anytime_td_prob": calc_anytime_td_prob(qb_rush_td)
         },
         {
-            "role": "RB1",
-            "player": depth_names.get("RB1", "Starting RB1"),
-            "pass_yards": 0.0,
-            "rush_yards": convert_mean_to_median(rb1_mean_rush, "RB_Rush"),
-            "rec_yards": convert_mean_to_median(rb1_mean_rec, "RB_Rec"),
-            "projected_pass_tds": 0.0,
-            "projected_rush_tds": round(rb1_rush_td, 2),
+            "role": "RB1", "player": depth_names.get("RB1", "Starting RB1"),
+            "pass_yards": 0.0, "rush_yards": convert_mean_to_median(rb1_mean_rush, "RB_Rush"),
+            "rec_yards": convert_mean_to_median(rb1_mean_rec, "RB_Rec"), "projected_pass_tds": 0.0,
             "total_tds": round(rb1_rush_td + (team_pass_tds * rec_td_shares["RB1"]), 2),
             "anytime_td_prob": calc_anytime_td_prob(rb1_rush_td + (team_pass_tds * rec_td_shares["RB1"]))
         },
         {
-            "role": "RB2",
-            "player": depth_names.get("RB2", "Starting RB2"),
-            "pass_yards": 0.0,
-            "rush_yards": convert_mean_to_median(rb2_mean_rush, "RB_Rush"),
-            "rec_yards": convert_mean_to_median(rb2_mean_rec, "RB_Rec"),
-            "projected_pass_tds": 0.0,
-            "projected_rush_tds": round(rb2_rush_td, 2),
+            "role": "RB2", "player": depth_names.get("RB2", "Starting RB2"),
+            "pass_yards": 0.0, "rush_yards": convert_mean_to_median(rb2_mean_rush, "RB_Rush"),
+            "rec_yards": convert_mean_to_median(rb2_mean_rec, "RB_Rec"), "projected_pass_tds": 0.0,
             "total_tds": round(rb2_rush_td + (team_pass_tds * rec_td_shares["RB2"]), 2),
             "anytime_td_prob": calc_anytime_td_prob(rb2_rush_td + (team_pass_tds * rec_td_shares["RB2"]))
         },
         {
-            "role": "WR1",
-            "player": depth_names.get("WR1", "Starting WR1"),
-            "pass_yards": 0.0,
-            "rush_yards": 0.0,
-            "rec_yards": convert_mean_to_median(wr1_mean_rec, "WR_Rec"),
-            "projected_pass_tds": 0.0,
-            "projected_rush_tds": 0.0,
-            "total_tds": round(team_pass_tds * rec_td_shares["WR1"], 2),
+            "role": "WR1", "player": depth_names.get("WR1", "Starting WR1"),
+            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr1_mean_rec, "WR_Rec"),
+            "projected_pass_tds": 0.0, "total_tds": round(team_pass_tds * rec_td_shares["WR1"], 2),
             "anytime_td_prob": calc_anytime_td_prob(team_pass_tds * rec_td_shares["WR1"])
         },
         {
-            "role": "WR2",
-            "player": depth_names.get("WR2", "Starting WR2"),
-            "pass_yards": 0.0,
-            "rush_yards": 0.0,
-            "rec_yards": convert_mean_to_median(wr2_mean_rec, "WR_Rec"),
-            "projected_pass_tds": 0.0,
-            "projected_rush_tds": 0.0,
-            "total_tds": round(team_pass_tds * rec_td_shares["WR2"], 2),
+            "role": "WR2", "player": depth_names.get("WR2", "Starting WR2"),
+            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr2_mean_rec, "WR_Rec"),
+            "projected_pass_tds": 0.0, "total_tds": round(team_pass_tds * rec_td_shares["WR2"], 2),
             "anytime_td_prob": calc_anytime_td_prob(team_pass_tds * rec_td_shares["WR2"])
         },
         {
-            "role": "WR3",
-            "player": depth_names.get("WR3", "Starting WR3"),
-            "pass_yards": 0.0,
-            "rush_yards": 0.0,
-            "rec_yards": convert_mean_to_median(wr3_mean_rec, "WR_Rec"),
-            "projected_pass_tds": 0.0,
-            "projected_rush_tds": 0.0,
-            "total_tds": round(team_pass_tds * rec_td_shares["WR3"], 2),
+            "role": "WR3", "player": depth_names.get("WR3", "Starting WR3"),
+            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr3_mean_rec, "WR_Rec"),
+            "projected_pass_tds": 0.0, "total_tds": round(team_pass_tds * rec_td_shares["WR3"], 2),
             "anytime_td_prob": calc_anytime_td_prob(team_pass_tds * rec_td_shares["WR3"])
         },
         {
-            "role": "TE1",
-            "player": depth_names.get("TE1", "Starting TE1"),
-            "pass_yards": 0.0,
-            "rush_yards": 0.0,
-            "rec_yards": convert_mean_to_median(te1_mean_rec, "TE_Rec"),
-            "projected_pass_tds": 0.0,
-            "projected_rush_tds": 0.0,
-            "total_tds": round(team_pass_tds * rec_td_shares["TE1"], 2),
+            "role": "TE1", "player": depth_names.get("TE1", "Starting TE1"),
+            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(te1_mean_rec, "TE_Rec"),
+            "projected_pass_tds": 0.0, "total_tds": round(team_pass_tds * rec_td_shares["TE1"], 2),
             "anytime_td_prob": calc_anytime_td_prob(team_pass_tds * rec_td_shares["TE1"])
         },
     ]
-    return projections
 
-# 4. Pipeline Ingestion & Opponent-Adjusted EPA
+# -------------------------------------------------------------------------
+# 4. Multi-Source Ingestion & Opponent-Adjusted EPA
+# -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
 
@@ -369,25 +323,23 @@ def extract_depth_chart_names(team_abbr: str) -> dict:
     }
     if depth_charts.empty:
         return picks
-
     t_dc = depth_charts[depth_charts["club_code"] == team_abbr] if "club_code" in depth_charts else pd.DataFrame()
     if t_dc.empty:
         return picks
-
     pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in t_dc.columns), None)
     rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in t_dc.columns), None)
     name_col = next((c for c in ["player_name", "full_name", "player"] if c in t_dc.columns), None)
-
     if pos_col and rank_col and name_col:
         for pos, ranks in depth_map.items():
             for r in ranks:
-                label = f"{pos}{r}"
                 matched = t_dc[(t_dc[pos_col] == pos) & (t_dc[rank_col].astype(str).str.strip() == r)]
                 if not matched.empty:
-                    picks[label] = matched.iloc[0][name_col]
+                    picks[f"{pos}{r}"] = matched.iloc[0][name_col]
     return picks
 
-# 5. LLM Scouting Engine
+# -------------------------------------------------------------------------
+# 5. LLM Scouting Engine (With Explicit Roster Context Injection)
+# -------------------------------------------------------------------------
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     system_prompt = """
 # ROLE & IDENTITY
@@ -414,23 +366,23 @@ You are the NFL Research Director & Quantitative Architect operating with full d
 * Commanders: HC Dan Quinn | OC David Blough | DC Joe Whitt Jr. (Cover 3/1 single-high; tempo RPO spread)
 
 # INVARIANTS
+* You MUST reference explicit player names from the provided team rosters (e.g., Lamar Jackson, Derrick Henry, Jonathan Taylor) rather than generic placeholders like RB1 or WR1.
 * Deliver actionable verdicts and deep film breakdowns.
-* Explain pocket physics as a countdown race between pass protection and release timing.
 * Output strictly valid JSON without markdown fences.
 """
 
     verdict_str = f"Bet {recommended_line} - {kelly_units:.2f}u" if recommended_team != "PASS" and kelly_units > 0.0 else "PASS - 0.00u"
 
     prompt = f"""
-Evaluate this NFL advance scouting dossier:
+Evaluate this NFL advance scouting dossier with explicit roster data:
 {json.dumps(payload, indent=2)}
 
 Output strictly valid JSON matching this schema:
 {{
-  "executive_summary": "Two-sentence strategic verdict explaining line-of-scrimmage leverage and game edge.",
+  "executive_summary": "Two-sentence strategic verdict explaining player matchups, line-of-scrimmage leverage, and game edge.",
   "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Detailed film breakdown of pass protection, run fits, and safety shells.",
-    "home_offense_vs_away_defense": "Detailed film breakdown of pass protection, run fits, and safety shells."
+    "away_offense_vs_home_defense": "Detailed film breakdown referencing specific named players in pass protection, run fits, and safety shells.",
+    "home_offense_vs_away_defense": "Detailed film breakdown referencing specific named players in pass protection, run fits, and safety shells."
   }},
   "actionable_verdict": "{verdict_str}"
 }}
@@ -465,7 +417,6 @@ Output strictly valid JSON matching this schema:
             except Exception:
                 await asyncio.sleep(2 ** attempt)
 
-        # Deterministic Archetype Fallback
         away_team = payload["matchup_context"]["away_team"]
         home_team = payload["matchup_context"]["home_team"]
 
@@ -479,7 +430,9 @@ Output strictly valid JSON matching this schema:
         }
         return json.dumps(fallback)
 
+# -------------------------------------------------------------------------
 # 6. Master Execution Pipeline
+# -------------------------------------------------------------------------
 async def main():
     target_week = 1
     target_season = CURRENT_SEASON
@@ -588,7 +541,6 @@ async def main():
         q = max(0.0, 1.0 - cover_prob - push_rate)
         kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" else 0.0
 
-        # Skill Projections
         implied_home_total = (total_line / 2.0) + (spread_line / 2.0)
         implied_away_total = (total_line / 2.0) - (spread_line / 2.0)
 
@@ -601,6 +553,9 @@ async def main():
         away_skills = generate_closed_loop_skill_projections(
             away_team, implied_away_total, spread_line, -net_pass_edge, -net_rush_edge, away_depth
         )
+
+        home_roster_summary = {p["role"]: p["player"] for p in home_skills}
+        away_roster_summary = {p["role"]: p["player"] for p in away_skills}
 
         pre_processed.append({
             "game_id": str(game.get("game_id", f"{target_season}_{week_num}_{away_team}_{home_team}")),
@@ -622,7 +577,12 @@ async def main():
             "predicted_away_score": pred_away_score,
             "predicted_total_score": pred_total_score,
             "player_projections": {"home": home_skills, "away": away_skills},
-            "matchup_context": {"home_team": home_team, "away_team": away_team},
+            "matchup_context": {
+                "home_team": home_team,
+                "home_roster": home_roster_summary,
+                "away_team": away_team,
+                "away_roster": away_roster_summary
+            },
             "tape_metrics": {
                 "net_pass_epa_diff": f"{net_pass_edge:+.3f}",
                 "net_rush_epa_diff": f"{net_rush_edge:+.3f}",
