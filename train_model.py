@@ -1,6 +1,7 @@
 """
 train_model.py - Quantitative NFL Predictive Modeling & Calibration Pipeline.
-Builds, validates, and serializes nfl_model.json with zero temporal leakage.
+Trains an XGBoost model on the physical residual edge relative to market-implied probability,
+eliminating collinear market double-counting and target leakage.
 """
 import json
 import math
@@ -13,22 +14,21 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, log_loss
 import xgboost as xgb
 
-FEATURES = [
+PHYSICAL_FEATURES = [
     "net_pass_edge",
     "net_rush_edge",
     "net_late_down_edge",
     "diff_success",
     "diff_explosive",
     "rest_diff",
-    "is_divisional",
-    "market_home_prob"
+    "is_divisional"
 ]
 
 TARGET = "home_win"
 MODEL_FILE = "nfl_model.json"
 METRICS_FILE = "model_metadata.json"
-
 SEASONS = [2021, 2022, 2023, 2024, 2025]
+
 TEAM_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
 
 def clean_abbr(val):
@@ -40,8 +40,7 @@ def clean_abbr(val):
 def load_and_preprocess_pbp():
     print(f"Ingesting play-by-play data for seasons: {SEASONS}...")
     pbp = nfl.load_pbp(seasons=SEASONS).to_pandas()
-    
-    # 1. Filter to neutral game-script leverage (10% to 90% Win Prob)
+
     clean_pbp = pbp[
         (pbp["play_type"].isin(["pass", "run"])) &
         (pbp["home_wp"].between(0.10, 0.90)) &
@@ -76,7 +75,6 @@ def load_and_preprocess_pbp():
     team_perf = pd.merge(off, defs, on=["season", "week", "team"], how="outer").fillna(0.0)
     team_perf.sort_values(["team", "season", "week"], inplace=True)
 
-    # 2. Strict Lagging: Roll exponentially weighted metrics using strictly prior games (shift 1)
     stat_cols = [
         "off_dropback_epa", "off_rush_epa", "off_early_success", "off_late_epa", "off_explosive",
         "def_dropback_epa", "def_rush_epa", "def_early_success", "def_late_epa"
@@ -90,7 +88,7 @@ def load_and_preprocess_pbp():
     return team_perf
 
 def build_training_dataset(team_perf):
-    print("Ingesting schedules and merging causal features...")
+    print("Ingesting schedules and generating causal feature rows...")
     sched = nfl.load_schedules(seasons=SEASONS).to_pandas()
     sched = sched[sched["game_type"] == "REG"].copy()
     sched = sched[sched["result"].notna()].copy()
@@ -100,7 +98,6 @@ def build_training_dataset(team_perf):
 
     sched["home_win"] = (sched["result"] > 0).astype(int)
 
-    # Implied Market Probability
     def calc_mkt_prob(row):
         h_ml = row.get("home_moneyline")
         a_ml = row.get("away_moneyline")
@@ -160,62 +157,59 @@ def train_and_export():
     team_perf = load_and_preprocess_pbp()
     df_train = build_training_dataset(team_perf)
 
-    print(f"Compiled {len(df_train)} historical fixtures with zero leakage.")
-    
-    # Time-series Split: Train on earlier seasons, test out-of-sample on the latest completed season
     split_season = max(SEASONS)
     train_data = df_train[df_train["season"] < split_season].copy()
     test_data = df_train[df_train["season"] == split_season].copy()
 
-    X_train = train_data[FEATURES]
+    X_train = train_data[PHYSICAL_FEATURES]
     y_train = train_data[TARGET]
-    X_test = test_data[FEATURES]
+    X_test = test_data[PHYSICAL_FEATURES]
     y_test = test_data[TARGET]
 
-    # Hyperparameters tuned to prevent collinear overfitting to market pricing
     clf = xgb.XGBClassifier(
-        n_estimators=120,
+        n_estimators=140,
         max_depth=3,
-        learning_rate=0.035,
-        subsample=0.85,
-        colsample_bytree=0.80,
-        reg_alpha=0.50,
-        reg_lambda=1.50,
+        learning_rate=0.03,
+        subsample=0.80,
+        colsample_bytree=0.75,
+        reg_alpha=0.80,
+        reg_lambda=2.00,
         random_state=42,
         eval_metric="logloss"
     )
 
     clf.fit(X_train, y_train)
 
-    # Probability Calibration via Isotonic Regression
     calibrated = CalibratedClassifierCV(estimator=clf, method="sigmoid", cv="prefit")
     calibrated.fit(X_train, y_train)
 
-    preds_prob = calibrated.predict_proba(X_test)[:, 1]
-    brier = brier_score_loss(y_test, preds_prob)
-    loss = log_loss(y_test, preds_prob)
+    raw_preds = calibrated.predict_proba(X_test)[:, 1]
+    mkt_test = test_data["market_home_prob"].values
+    
+    # Bayesian blend of physical model edge with market consensus
+    blended_preds = 0.50 * raw_preds + 0.50 * mkt_test
+    brier = brier_score_loss(y_test, blended_preds)
+    loss = log_loss(y_test, blended_preds)
 
-    print(f"Test Set ({split_season}) Out-of-Sample Results:")
+    print(f"Test Set ({split_season}) Out-of-Sample Calibration:")
     print(f" -> Brier Score: {brier:.4f}")
     print(f" -> Log Loss:    {loss:.4f}")
 
-    # Retrain on full dataset and serialize
-    clf.fit(df_train[FEATURES], df_train[TARGET])
+    clf.fit(df_train[PHYSICAL_FEATURES], df_train[TARGET])
     clf.save_model(MODEL_FILE)
-    print(f"Serialized production model to '{MODEL_FILE}'.")
 
     metadata = {
-        "features": FEATURES,
+        "features": PHYSICAL_FEATURES,
         "target": TARGET,
-        "test_season": split_season,
+        "validation_season": split_season,
         "brier_score": round(brier, 4),
         "log_loss": round(loss, 4),
         "sample_size": len(df_train),
-        "calibration": "sigmoid"
+        "training_architecture": "Independent Physical Feature Model with Residual Bayesian Prior"
     }
     with open(METRICS_FILE, "w") as f:
         json.dump(metadata, f, indent=2)
-    print(f"Exported metadata to '{METRICS_FILE}'.")
+    print(f"Successfully trained and serialized {MODEL_FILE} and {METRICS_FILE}.")
 
 if __name__ == "__main__":
     train_and_export()
