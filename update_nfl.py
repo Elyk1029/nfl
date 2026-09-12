@@ -1,11 +1,15 @@
 """
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
+- Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
 - Powered by Gemini 3.8 Flash (gemini-3.8-flash) via Google GenAI SDK.
-- Discrete probability mass calculations across key NFL margins (3, 7, 6, 10, 4, 14).
-- Coverage-shell-conditioned target tree distributions (MOFC vs. MOFO).
-- Dynamic Bayesian QB VORP and injury status haircuts.
-- Set-based depth chart traversal with strict entity uniqueness.
+- Dynamic feature inspection preventing XGBoost feature_names mismatch errors.
+- Dynamic Bayesian QB Injury Adjustment & VORP Haircut Engine.
+- Multi-column schema alias resolution (player_name, full_name, first_name + last_name).
+- Set-aware Depth Chart Cascading (guarantees unique player allocation per role).
+- Closed-Loop Skill Player Volume Allocation (QB, RB1/2, WR1/2/3, TE1).
+- Non-negative clamping, log-normal median conversions, and Poisson TD modeling.
+- Discrete empirical score generation (zero regular-season ties).
 - Auto-migrating Neon PostgreSQL persistence.
 """
 import asyncio
@@ -22,11 +26,14 @@ from scipy.stats import norm, poisson
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
+# -------------------------------------------------------------------------
+# 1. Environment Verification & Client Initialization
+# -------------------------------------------------------------------------
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
 
 if not db_url or not gemini_key:
-    raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured in environment.")
+    raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured in environment or secrets.")
 
 engine = create_engine(db_url, pool_size=5, max_overflow=10, pool_pre_ping=True)
 client = genai.Client(api_key=gemini_key)
@@ -35,15 +42,24 @@ MODEL_FILE = "nfl_model.json"
 model = xgb.XGBClassifier()
 if os.path.exists(MODEL_FILE):
     model.load_model(MODEL_FILE)
+    BOOSTER_FEATURES = model.get_booster().feature_names
+    print(f"XGBoost classifier loaded successfully. Booster features: {BOOSTER_FEATURES}")
 else:
-    raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found.")
+    raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
 
-FEATURES = [
+DEFAULT_FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
-    "diff_explosive", "rest_diff", "is_divisional"
+    "diff_explosive", "rest_diff", "is_divisional", "market_home_prob"
 ]
+EXPECTED_FEATURES = BOOSTER_FEATURES if BOOSTER_FEATURES else DEFAULT_FEATURES
 
-TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
+NFL_KEY_PUSH_RATES = {
+    3: 0.148, 7: 0.094, 6: 0.059, 10: 0.057, 4: 0.052, 14: 0.046, 1: 0.038, 2: 0.036
+}
+
+TEAM_ABBR_MAP = {
+    "LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"
+}
 
 def clean_team_abbr(team_str):
     if not isinstance(team_str, str):
@@ -51,6 +67,9 @@ def clean_team_abbr(team_str):
     cleaned = team_str.strip().upper()
     return TEAM_ABBR_MAP.get(cleaned, cleaned)
 
+# -------------------------------------------------------------------------
+# 2. Discrete Empirical Score Engine (Zero Regular-Season Ties)
+# -------------------------------------------------------------------------
 NFL_KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
 COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 
@@ -85,33 +104,9 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
 
     return int(best_pair[0]), int(best_pair[1])
 
-# Discrete empirical margin probability mass distribution
-EMPIRICAL_MARGIN_PROBS = {
-    3: 0.148, 7: 0.094, 6: 0.059, 10: 0.057, 4: 0.052,
-    14: 0.046, 1: 0.038, 2: 0.036, 8: 0.032, 11: 0.030,
-    13: 0.028, 17: 0.024, 5: 0.022, 9: 0.020, 16: 0.018
-}
-
-def calculate_discrete_cover_probability(projected_margin: float, spread_line: float, sigma: float) -> tuple[float, float, float]:
-    """
-    Computes cover and push probabilities using empirical discrete margin mass modeling.
-    """
-    home_spread = spread_line
-    is_integer = float(home_spread).is_integer()
-    push_prob = EMPIRICAL_MARGIN_PROBS.get(int(abs(home_spread)), 0.02) if is_integer else 0.0
-
-    z = (projected_margin - home_spread) / sigma
-    raw_home_cover = float(norm.cdf(z))
-    
-    if push_prob > 0:
-        home_cover = raw_home_cover * (1.0 - push_prob)
-        away_cover = (1.0 - raw_home_cover) * (1.0 - push_prob)
-    else:
-        home_cover = raw_home_cover
-        away_cover = 1.0 - raw_home_cover
-
-    return home_cover, away_cover, push_prob
-
+# -------------------------------------------------------------------------
+# 3. Dynamic QB Bayesian Adjustment & VORP Engine
+# -------------------------------------------------------------------------
 QB_VORP_TIERS = {
     "Patrick Mahomes": 7.0, "Josh Allen": 7.0, "Lamar Jackson": 6.5, "Joe Burrow": 6.5,
     "C.J. Stroud": 5.0, "Jordan Love": 5.0, "Jalen Hurts": 4.5, "Justin Herbert": 4.5,
@@ -129,6 +124,7 @@ INJURY_PROBABILITY_WEIGHTS = {
     "OUT": 0.00, "IR": 0.00, "INJURED RESERVE": 0.00, "PUP": 0.00,
     "DOUBTFUL": 0.08, "QUESTIONABLE": 0.62, "ACTIVE": 1.00, "HEALTHY": 1.00
 }
+
 INACTIVE_DESIGNATIONS = {"OUT", "IR", "INJURED RESERVE", "DOUBTFUL", "DNR", "PUP", "NFI", "SUSPENDED"}
 
 def resolve_qb_depth_and_adjustment(
@@ -207,6 +203,9 @@ def resolve_qb_depth_and_adjustment(
         round(qb_variance_sigma, 2)
     )
 
+# -------------------------------------------------------------------------
+# 4. Closed-Loop Skill Volume & Log-Normal Median Allocation
+# -------------------------------------------------------------------------
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
     "RB_Rec": 0.55, "WR_Rec": 0.58, "TE_Rec": 0.54
@@ -225,8 +224,7 @@ def generate_closed_loop_skill_projections(
     pass_edge: float, 
     rush_edge: float, 
     depth_names: dict,
-    qb_sigma: float = 0.32,
-    opp_is_mofo_heavy: bool = False
+    qb_sigma: float = 0.32
 ) -> list:
     total_plays = 63.0 * (implied_total / 22.0) ** 0.30
     script_shift = -0.012 * spread_line
@@ -250,12 +248,7 @@ def generate_closed_loop_skill_projections(
     rb2_rush_td = team_rush_tds * 0.22
     qb_rush_td = team_rush_tds * 0.14
 
-    # Coverage shell conditioning: MOFO funnels targets to TE1/RB1, MOFC funnels targets to WR1/WR2
-    if opp_is_mofo_heavy:
-        raw_target_weights = {"WR1": 0.22, "WR2": 0.16, "WR3": 0.11, "TE1": 0.24, "RB1": 0.15, "RB2": 0.06, "OTHER": 0.06}
-    else:
-        raw_target_weights = {"WR1": 0.28, "WR2": 0.19, "WR3": 0.12, "TE1": 0.18, "RB1": 0.12, "RB2": 0.05, "OTHER": 0.06}
-
+    raw_target_weights = {"WR1": 0.26, "WR2": 0.18, "WR3": 0.12, "TE1": 0.19, "RB1": 0.13, "RB2": 0.06, "OTHER": 0.06}
     w_sum = sum(raw_target_weights.values())
     target_shares = {k: v / w_sum for k, v in raw_target_weights.items()}
 
@@ -330,6 +323,9 @@ def generate_closed_loop_skill_projections(
         },
     ]
 
+# -------------------------------------------------------------------------
+# 5. Multi-Source Ingestion & Dynamic Roster Resolution
+# -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
 
@@ -515,6 +511,9 @@ def resolve_active_depth_chart(team_abbr: str, target_week: int) -> dict:
 
     return picks
 
+# -------------------------------------------------------------------------
+# 6. LLM Scouting Engine (With Dual-Mandate Persona via Gemini 3.8 Flash)
+# -------------------------------------------------------------------------
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     system_prompt = """
 # ROLE & IDENTITY
@@ -587,6 +586,9 @@ Output strictly valid JSON matching this schema:
         }
         return json.dumps(fallback)
 
+# -------------------------------------------------------------------------
+# 7. Master Execution Pipeline Loop
+# -------------------------------------------------------------------------
 async def main():
     target_week = 1
     target_season = CURRENT_SEASON
@@ -633,6 +635,7 @@ async def main():
         rest_diff = float(game.get("home_rest", 7.0) or 7.0) - float(game.get("away_rest", 7.0) or 7.0)
         is_divisional = int(game.get("div_game", 0) or 0)
 
+        # Dynamic QB Adjustment & Line Haircut
         home_qb, home_qb_status, adj_spread, adj_total, adj_pass_edge, home_qb_sigma = resolve_qb_depth_and_adjustment(
             team_abbr=home_team,
             depth_charts_df=depth_charts,
@@ -665,15 +668,27 @@ async def main():
         else:
             market_home_prob = float(norm.cdf(spread_line / 13.5))
 
-        feature_row = pd.DataFrame([[
-            net_pass_edge, net_rush_edge, net_late_down_edge, diff_success,
-            diff_explosive, rest_diff, is_divisional
-        ]], columns=FEATURES)
+        feature_dict = {
+            "net_pass_edge": net_pass_edge,
+            "net_rush_edge": net_rush_edge,
+            "net_late_down_edge": net_late_down_edge,
+            "diff_success": diff_success,
+            "diff_explosive": diff_explosive,
+            "rest_diff": rest_diff,
+            "is_divisional": is_divisional,
+            "market_home_prob": market_home_prob
+        }
 
-        raw_physical_win_prob = float(model.predict_proba(feature_row)[0][1])
+        # Dynamically subset and order columns to strictly match loaded model booster
+        ordered_features = [feature_dict[feat] for feat in EXPECTED_FEATURES if feat in feature_dict]
+        feature_row = pd.DataFrame([ordered_features], columns=EXPECTED_FEATURES)
 
-        # Bayesian shrinkage: 50% physical model edge, 50% market prior
-        calibrated_home_win_prob = (0.50 * raw_physical_win_prob) + (0.50 * market_home_prob)
+        raw_model_prob = float(model.predict_proba(feature_row)[0][1])
+
+        if "market_home_prob" in EXPECTED_FEATURES:
+            calibrated_home_win_prob = raw_model_prob
+        else:
+            calibrated_home_win_prob = (0.50 * raw_model_prob) + (0.50 * market_home_prob)
 
         sigma = 13.45 * math.sqrt(max(32.0, total_line) / 44.0)
         z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
@@ -682,7 +697,17 @@ async def main():
         pred_home_score, pred_away_score = project_discrete_nfl_scores(projected_margin, total_line)
         pred_total_score = pred_home_score + pred_away_score
 
-        home_cover, away_cover, push_rate = calculate_discrete_cover_probability(projected_margin, spread_line, sigma)
+        abs_spread = round(abs(spread_line))
+        push_rate = NFL_KEY_PUSH_RATES.get(abs_spread, 0.0) if float(spread_line).is_integer() else 0.0
+        z_cover_home = (projected_margin - (spread_line + 0.5 if spread_line.is_integer() else spread_line)) / sigma
+        z_cover_away = ((spread_line - 0.5 if spread_line.is_integer() else spread_line) - projected_margin) / sigma
+
+        home_cover = float(norm.cdf(z_cover_home))
+        away_cover = float(norm.cdf(z_cover_away))
+        if push_rate > 0:
+            scale = (1.0 - push_rate) / (home_cover + away_cover)
+            home_cover *= scale
+            away_cover *= scale
 
         home_edge = home_cover - 0.5238
         away_edge = away_cover - 0.5238
@@ -715,15 +740,11 @@ async def main():
         home_depth["QB1"] = home_qb
         away_depth["QB1"] = away_qb
 
-        # Condition tree allocations on opponent's defensive coordinator archetype
-        chargers_mofo_teams = {"LAC", "GB", "SF", "BUF"}
         home_skills = generate_closed_loop_skill_projections(
-            home_team, implied_home_total, -spread_line, net_pass_edge, net_rush_edge, home_depth, 
-            qb_sigma=home_qb_sigma, opp_is_mofo_heavy=(away_team in chargers_mofo_teams)
+            home_team, implied_home_total, -spread_line, net_pass_edge, net_rush_edge, home_depth, qb_sigma=home_qb_sigma
         )
         away_skills = generate_closed_loop_skill_projections(
-            away_team, implied_away_total, spread_line, -net_pass_edge, -net_rush_edge, away_depth, 
-            qb_sigma=away_qb_sigma, opp_is_mofo_heavy=(home_team in chargers_mofo_teams)
+            away_team, implied_away_total, spread_line, -net_pass_edge, -net_rush_edge, away_depth, qb_sigma=away_qb_sigma
         )
 
         home_roster_summary = {p["role"]: p["player"] for p in home_skills}
