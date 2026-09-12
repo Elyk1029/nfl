@@ -1,9 +1,9 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
-Production UI:
-- Reconciled Actionable Verdict Banner with Eighth-Kelly Staking Allocation.
-- Structured Pandas DataFrame Table Renderer with Separated Columns (Eliminating Text Collision).
-- Normalized ATS Spread Evaluation Engine & Blind Historical Simulation Airlock.
+Features:
+- Decoupled table layout with explicit DataFrame column configurations.
+- Automatic edge and Eighth-Kelly stake reconciliation.
+- Blind Historical Simulation airlock.
 """
 import os
 import json
@@ -334,11 +334,11 @@ with tab_slate:
                                     table_rows.append({
                                         "Role": role_label,
                                         "Player": player_name,
-                                        "Pass Yds": f"{pass_val:.1f}" if pass_val > 0 else "-",
-                                        "Rush Yds": f"{rush_val:.1f}" if rush_val > 0 else "-",
-                                        "Rec Yds": f"{rec_val:.1f}" if rec_val > 0 else "-",
-                                        "Exp. TD": f"{td_val:.2f}",
-                                        "Anytime TD%": f"{prob_val:.1f}%"
+                                        "Pass Med.": f"{pass_val:.1f}" if pass_val > 0 else "-",
+                                        "Rush Med.": f"{rush_val:.1f}" if rush_val > 0 else "-",
+                                        "Rec Med.": f"{rec_val:.1f}" if rec_val > 0 else "-",
+                                        "Total TD (λ)": f"{td_val:.2f}",
+                                        "Anytime TD": f"{prob_val:.1f}%"
                                     })
                                 
                                 df_display = pd.DataFrame(table_rows)
@@ -347,11 +347,11 @@ with tab_slate:
                                     column_config={
                                         "Role": st.column_config.TextColumn("Role", width="small"),
                                         "Player": st.column_config.TextColumn("Player", width="medium"),
-                                        "Pass Yds": st.column_config.TextColumn("Pass Med."),
-                                        "Rush Yds": st.column_config.TextColumn("Rush Med."),
-                                        "Rec Yds": st.column_config.TextColumn("Rec Med."),
-                                        "Exp. TD": st.column_config.TextColumn("Total TD (λ)"),
-                                        "Anytime TD%": st.column_config.TextColumn("Anytime TD")
+                                        "Pass Med.": st.column_config.TextColumn("Pass Med."),
+                                        "Rush Med.": st.column_config.TextColumn("Rush Med."),
+                                        "Rec Med.": st.column_config.TextColumn("Rec Med."),
+                                        "Total TD (λ)": st.column_config.TextColumn("Total TD (λ)"),
+                                        "Anytime TD": st.column_config.TextColumn("Anytime TD")
                                     },
                                     hide_index=True,
                                     use_container_width=True
