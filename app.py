@@ -1,6 +1,6 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
-Complete Production UI:
+Production UI:
 - Reconciled Actionable Verdict Banner with Eighth-Kelly Staking Allocation.
 - Structured Pandas DataFrame Table Renderer with Separated Columns (Eliminating Text Collision).
 - Normalized ATS Spread Evaluation Engine & Blind Historical Simulation Airlock.
@@ -332,11 +332,11 @@ with tab_slate:
                                     prob_val = max(0.0, float(p.get("anytime_td_prob", 0.0)))
 
                                     table_rows.append({
+                                        "Role": role_label,
                                         "Player": player_name,
-                                        "Pos": role_label,
-                                        "Pass Yds": f"{pass_val:.1f}" if pass_val > 0.0 else "-",
-                                        "Rush Yds": f"{rush_val:.1f}" if rush_val > 0.0 else "-",
-                                        "Rec Yds": f"{rec_val:.1f}" if rec_val > 0.0 else "-",
+                                        "Pass Yds": f"{pass_val:.1f}" if pass_val > 0 else "-",
+                                        "Rush Yds": f"{rush_val:.1f}" if rush_val > 0 else "-",
+                                        "Rec Yds": f"{rec_val:.1f}" if rec_val > 0 else "-",
                                         "Exp. TD": f"{td_val:.2f}",
                                         "Anytime TD%": f"{prob_val:.1f}%"
                                     })
@@ -345,8 +345,8 @@ with tab_slate:
                                 st.dataframe(
                                     df_display,
                                     column_config={
+                                        "Role": st.column_config.TextColumn("Role", width="small"),
                                         "Player": st.column_config.TextColumn("Player", width="medium"),
-                                        "Pos": st.column_config.TextColumn("Role", width="small"),
                                         "Pass Yds": st.column_config.TextColumn("Pass Med."),
                                         "Rush Yds": st.column_config.TextColumn("Rush Med."),
                                         "Rec Yds": st.column_config.TextColumn("Rec Med."),
