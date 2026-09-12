@@ -4,6 +4,7 @@ Features:
 - Self-contained discrete scoring math engine (strictly directionally locked).
 - Live Sportsbook Prop Comparison Engine (Model Median vs. Vegas Prop Line, Delta, Over/Under signal).
 - Eliminates logic paradoxes: Detroit home favorite strictly yields Detroit win and positive margin.
+- Resilient Historical Simulation Module with robust nflreadpy namespace scoping.
 - Powered by Gemini 3.8 Flash (gemini-3.8-flash) for Guru Evaluation & Anonymized Simulations.
 """
 import os
@@ -262,7 +263,6 @@ with tab_slate:
         p_away = int(row.get('predicted_away_score') or 21)
         p_total = int(row.get('predicted_total_score') or (p_home + p_away))
 
-        # Consistent Directional Margin: Positive indicates home team margin
         margin_delta = p_home - p_away
         margin_label = f"{home_team} {margin_delta:+d}"
 
@@ -423,7 +423,8 @@ with tab_sim:
 
     @st.cache_data(ttl=600)
     def load_historical_fixtures(season, week):
-        sched = nfl.load_schedules(seasons=[season]).to_pandas()
+        import nflreadpy as nfl_loader
+        sched = nfl_loader.load_schedules(seasons=[season]).to_pandas()
         return sched[(sched["week"] == week) & sched["result"].notna()].copy()
 
     hist_games = load_historical_fixtures(sim_season, sim_week)
@@ -445,7 +446,6 @@ with tab_sim:
                 actual_home = int(g["home_score"])
                 actual_away = int(g["away_score"])
 
-                # Exact call to self-contained mathematical scoring engine
                 p_home, p_away = project_discrete_nfl_scores(nflfastr_spread, total_line)
 
                 anonymized_payload = {
