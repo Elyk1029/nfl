@@ -1,11 +1,10 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
-Production UI:
-- Fully self-contained discrete empirical scoring engine (eliminating NameError).
+Features:
+- Self-contained discrete scoring math engine (strictly directionally locked).
+- Live Sportsbook Prop Comparison Engine (Model Median vs. Vegas Prop Line, Delta, Over/Under signal).
+- Eliminates logic paradoxes: Detroit home favorite strictly yields Detroit win and positive margin.
 - Powered by Gemini 3.8 Flash (gemini-3.8-flash) for Guru Evaluation & Anonymized Simulations.
-- Reconciled Actionable Verdict Banner with Eighth-Kelly Staking Allocation.
-- Structured Pandas DataFrame Table Renderer with Separated Columns (Eliminating Text Collision).
-- Strict Out-of-Sample Anonymized Simulation Airlock (Entity Alpha vs. Entity Beta).
 """
 import os
 import json
@@ -17,7 +16,6 @@ from sqlalchemy import create_engine, text
 from google import genai
 from google.genai import types
 from scipy.stats import norm
-import nflreadpy as nfl
 
 st.set_page_config(
     page_title="NFL Quantitative Terminal | 2026 Season",
@@ -77,17 +75,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------------------------------------------------------------
-# 1. Discrete Scoring Math Engine (Self-Contained)
-# -------------------------------------------------------------------------
 NFL_KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
 COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 
 def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> tuple[int, int]:
-    """
-    Snaps raw linear projected margins and totals to empirical NFL football key numbers,
-    guaranteeing zero regular-season ties and preserving favorite directionality.
-    """
     effective_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
     home_favored = effective_margin > 0.0
     abs_margin = abs(effective_margin)
@@ -96,11 +87,11 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
     raw_home = (total_line + (selected_discrete_margin if home_favored else -selected_discrete_margin)) / 2.0
     raw_away = (total_line - (selected_discrete_margin if home_favored else -selected_discrete_margin)) / 2.0
 
-    best_pair = (24, 21) if home_favored else (21, 24)
+    best_pair = (27, 17) if home_favored else (17, 27)
     min_loss = float("inf")
 
-    candidate_home = [s for s in COMMON_TEAM_SCORES if abs(s - raw_home) <= 7.0] or [int(round(raw_home))]
-    candidate_away = [s for s in COMMON_TEAM_SCORES if abs(s - raw_away) <= 7.0] or [int(round(raw_away))]
+    candidate_home = [s for s in COMMON_TEAM_SCORES if abs(s - raw_home) <= 6.5] or [int(round(raw_home))]
+    candidate_away = [s for s in COMMON_TEAM_SCORES if abs(s - raw_away) <= 6.5] or [int(round(raw_away))]
 
     for h in candidate_home:
         for a in candidate_away:
@@ -125,15 +116,14 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
 
 def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float, 
                                actual_home_score: int, actual_away_score: int, 
-                               home_spread_line: float) -> dict:
+                               nflfastr_spread_line: float) -> dict:
     actual_margin = float(actual_home_score - actual_away_score)
     pred_margin = float(pred_home_score - pred_away_score)
 
-    # Home covers if margin + spread_line > 0 (where spread_line is negative for home favorite)
-    actual_home_covered = (actual_margin + home_spread_line) > 0.0
-    pred_home_covered = (pred_margin + home_spread_line) > 0.0
+    actual_home_covered = actual_margin > nflfastr_spread_line
+    pred_home_covered = pred_margin > nflfastr_spread_line
 
-    is_actual_push = (actual_margin + home_spread_line) == 0.0
+    is_actual_push = actual_margin == nflfastr_spread_line
     if is_actual_push:
         cover_status = "⏸️ Push"
     elif actual_home_covered == pred_home_covered:
@@ -155,9 +145,6 @@ def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float,
         "margin_error": round(margin_error, 1)
     }
 
-# -------------------------------------------------------------------------
-# 2. Client & Environment Initialization
-# -------------------------------------------------------------------------
 def resolve_credential(key_name: str) -> str:
     try:
         if key_name in st.secrets and str(st.secrets[key_name]).strip():
@@ -188,43 +175,6 @@ ai_client = get_genai_client(api_key)
 GURU_SYSTEM_INSTRUCTION = """
 # ROLE & IDENTITY
 You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
-
----
-
-## 1. 2026 PLAY-CALLER & TACTICAL CONTINUITY DIRECTORY
-* Cardinals: HC Mike LaFleur | OC Nathaniel Hackett | DC Nick Rallis (Wide Zone, 12/21 play-action boot)
-* Falcons: HC Kevin Stefanski | OC Tommy Rees | DC Jeff Ulbrich (Under-center wide zone, Duo power)
-* Ravens: HC Jesse Minter | OC Declan Doyle | DC Anthony Weaver (Simulated pressure creeper defense; Doyle heavy option/gap GT counter)
-* Bills: HC Joe Brady | OC Pete Carmichael Jr. | DC Jim Leonhard (Spread rhythm, 11 empty; Leonhard disguise 3-safety subpackages)
-* Browns: HC Todd Monken | OC Travis Switzer | DC Ephraim Banda (Monken vertical Dagger/Choice; downhill gap/power)
-* Broncos: HC Sean Payton | OC Davis Webb | DC Vance Joseph (Timing West Coast, high screen/rub volume)
-* Lions: HC Dan Campbell | OC Drew Petzing | DC Jim O'Neil (Under-center Duo/Power interior wash, heavy box aggression)
-* Packers: HC Matt LaFleur | OC Adam Stenavich | DC Jonathan Gannon (Motion-at-snap outside zone; Gannon split-safety match Quarters/Cover 6)
-* Raiders: HC Klint Kubiak | OC Andrew Janocko | DC Rob Leonard (Stretch zone, FB lead-iso, explosive crossing routes)
-* Chargers: HC Jim Harbaugh | OC Mike McDaniel | DC Chris O'Leary (Gap/man trench power paired with McDaniel perimeter speed motions)
-* Rams: HC Sean McVay | OC Nathan Scheelhaase | DC Aubrey Pleasant (Duo/mid-zone foundations, condensed bunch rub concepts)
-* Dolphins: HC Jeff Hafley | OC Bobby Slowik | DC Anthony Weaver (Hafley single-high press-man; Slowik outside zone boot attack)
-* Giants: HC John Harbaugh | OC Matt Nagy | DC Dennard Wilson (Physical edge discipline; Nagy West Coast RPO; Wilson Cover 1/3 robber)
-* Jets: HC Aaron Glenn | OC Frank Reich | DC Brian Duker (Press-man boundary leverage; Reich timing spread RPO)
-* Steelers: HC Mike McCarthy | OC Arthur Smith | DC Patrick Graham (West Coast rhythm blended with Smith heavy 12/13 pistol outside zone)
-* 49ers: HC Kyle Shanahan | OC Klay Kubiak | DC Raheem Morris (Shanahan outside zone/counter masterclass; Morris match-quarters front penetration)
-* Titans: HC Robert Saleh | OC Brian Daboll | DC Dennard Wilson (Saleh 4-3 Wide-9 penetration front; Daboll spread option with QB-designed runs)
-* Commanders: HC Dan Quinn | OC David Blough | DC Joe Whitt Jr. (Cover 3/1 single-high shell; tempo-based RPO spread)
-
----
-
-## 2. TRANSLATIONAL INVARIANTS
-* Trench Physics: Explain as countdown race between pass protection and QB release timing.
-* Run Schemes: Explain Duo/Power as "vertical bulldozing" and Zone schemes as "sideline-to-sideline stretch".
-* Coverage Shells: Explain MOFC as "Single-High Safety (extra run defender)" and MOFO as "Two-Deep Safeties (umbrella against deep shots)".
-
----
-
-## 3. MATHEMATICAL DISCIPLINE
-* Neutral script leverage (WP 10%-90%).
-* Log-normal median conversion for player props: m = mu * exp(-sigma^2 / 2).
-* Closed-loop target trees: Sum of receiving yards must reconcile to gross passing volume.
-* Discrete scoring margin optimization (zero ties).
 """
 
 @st.cache_data(ttl=300)
@@ -247,9 +197,6 @@ except Exception as e:
     st.error(f"Database Query Failed: {e}")
     st.stop()
 
-# -------------------------------------------------------------------------
-# 3. Sidebar Configuration
-# -------------------------------------------------------------------------
 with st.sidebar:
     st.title("🏈 Risk Engine")
     show_only_bets = st.checkbox("Show Actionable Bets Only", value=False)
@@ -262,11 +209,8 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-# -------------------------------------------------------------------------
-# 4. Global KPIs
-# -------------------------------------------------------------------------
 st.title("🏈 Institutional NFL Quantitative Terminal")
-st.caption("Discrete Empirical Score Modeling | Closed-Loop Skill Props | Powered by Gemini 3.8 Flash")
+st.caption("Discrete Empirical Score Modeling | Live Sportsbook Prop Benchmarking | Powered by Gemini 3.8 Flash")
 
 if df.empty:
     st.info("No active slate predictions currently loaded.")
@@ -282,15 +226,12 @@ c4.metric("Active Slate", f"Week {int(df['week'].max())}")
 st.divider()
 
 tab_slate, tab_steam, tab_guru, tab_sim = st.tabs([
-    "📊 Weekly Board & Predicted Scores",
+    "📊 Weekly Board & Sportsbook Props",
     "⚡ Market Steam & Consensus Deltas",
     "🧠 Strategic Guru Workbench",
     "🧪 Blind Historical Simulation"
 ])
 
-# -------------------------------------------------------------------------
-# 5. Weekly Board Tab
-# -------------------------------------------------------------------------
 with tab_slate:
     displayed = 0
     for _, row in df.iterrows():
@@ -321,7 +262,7 @@ with tab_slate:
         p_away = int(row.get('predicted_away_score') or 21)
         p_total = int(row.get('predicted_total_score') or (p_home + p_away))
 
-        # Reconciled Directional Margin Metric
+        # Consistent Directional Margin: Positive indicates home team margin
         margin_delta = p_home - p_away
         margin_label = f"{home_team} {margin_delta:+d}"
 
@@ -356,15 +297,15 @@ with tab_slate:
                     st.markdown(f'<div style="text-align: right;"><span class="badge-pass">{verdict_str}</span></div>', unsafe_allow_html=True)
 
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Model Win Prob", f"{home_win_pct:.1f}%")
-            m2.metric("Market Consensus", f"{market_win_pct:.1f}%", f"{home_win_pct - market_win_pct:+.1f}% vs Book")
+            m1.metric(f"{home_team} Model Win Prob", f"{home_win_pct:.1f}%")
+            m2.metric(f"{home_team} Market Prob", f"{market_win_pct:.1f}%", f"{home_win_pct - market_win_pct:+.1f}% vs Book")
             m3.metric("Projected Margin", margin_label)
             m4.metric("Eighth-Kelly Stake", f"{stake:.2f}u")
 
-            with st.expander("Tactical Matchup Dossier & Skill Player Stat Lines", expanded=is_bet):
+            with st.expander("Tactical Matchup Dossier & Live Sportsbook Prop Comparisons", expanded=is_bet):
                 st.markdown(f"**Tactical Brief:** {analysis_data.get('executive_summary', 'Analysis pending.')}")
                 
-                sub_scheme, sub_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Position Projections & Anytime TDs"])
+                sub_scheme, sub_props = st.tabs(["🧠 Trench & Coverage Clash", "🎯 Sportsbook Prop Benchmarks & Anytime TDs"])
                 with sub_scheme:
                     scheme = analysis_data.get('schematic_matchup', {})
                     sc1, sc2 = st.columns(2)
@@ -376,33 +317,31 @@ with tab_slate:
                     
                     def render_player_stat_table(team_key: str, container_col, team_display_name: str):
                         with container_col:
-                            st.markdown(f"##### {team_display_name} Skill Player Projections")
-                            if isinstance(player_projs, dict):
-                                projs = player_projs.get(team_key, [])
-                            elif isinstance(player_projs, list):
-                                projs = [p for p in player_projs if p.get("team", "").strip().upper() == team_display_name.strip().upper()]
-                            else:
-                                projs = []
+                            st.markdown(f"##### {team_display_name} Props vs. Sportsbook Lines")
+                            projs = player_projs.get(team_key, []) if isinstance(player_projs, dict) else []
 
                             if projs:
                                 table_rows = []
                                 for p in projs:
                                     role_label = str(p.get("role", "")).strip()
                                     player_name = str(p.get("player", "")).strip()
-
-                                    pass_val = max(0.0, float(p.get("pass_yards", 0.0)))
-                                    rush_val = max(0.0, float(p.get("rush_yards", 0.0)))
-                                    rec_val = max(0.0, float(p.get("rec_yards", 0.0)))
-                                    td_val = max(0.0, float(p.get("total_tds", 0.0)))
-                                    prob_val = max(0.0, float(p.get("anytime_td_prob", 0.0)))
+                                    stat_type = str(p.get("primary_stat_type", "Yards")).strip()
+                                    model_med = float(p.get("model_median", 0.0))
+                                    sb_line = float(p.get("sportsbook_line", model_med))
+                                    delta = float(p.get("edge_delta", model_med - sb_line))
+                                    rec = str(p.get("prop_recommendation", "PASS"))
+                                    td_val = float(p.get("total_tds", 0.0))
+                                    prob_val = float(p.get("anytime_td_prob", 0.0))
 
                                     table_rows.append({
                                         "Role": role_label,
                                         "Player": player_name,
-                                        "Pass Med.": f"{pass_val:.1f}" if pass_val > 0 else "-",
-                                        "Rush Med.": f"{rush_val:.1f}" if rush_val > 0 else "-",
-                                        "Rec Med.": f"{rec_val:.1f}" if rec_val > 0 else "-",
-                                        "Total TD (λ)": f"{td_val:.2f}",
+                                        "Prop Type": stat_type,
+                                        "Model Med.": f"{model_med:.1f}",
+                                        "Vegas Line": f"{sb_line:.1f}",
+                                        "Edge": f"{delta:+.1f}",
+                                        "Signal": rec,
+                                        "Exp. TD (λ)": f"{td_val:.2f}",
                                         "Anytime TD": f"{prob_val:.1f}%"
                                     })
                                 
@@ -412,10 +351,12 @@ with tab_slate:
                                     column_config={
                                         "Role": st.column_config.TextColumn("Role", width="small"),
                                         "Player": st.column_config.TextColumn("Player", width="medium"),
-                                        "Pass Med.": st.column_config.TextColumn("Pass Med."),
-                                        "Rush Med.": st.column_config.TextColumn("Rush Med."),
-                                        "Rec Med.": st.column_config.TextColumn("Rec Med."),
-                                        "Total TD (λ)": st.column_config.TextColumn("Total TD (λ)"),
+                                        "Prop Type": st.column_config.TextColumn("Prop"),
+                                        "Model Med.": st.column_config.TextColumn("Model"),
+                                        "Vegas Line": st.column_config.TextColumn("Vegas"),
+                                        "Edge": st.column_config.TextColumn("Delta"),
+                                        "Signal": st.column_config.TextColumn("Pick"),
+                                        "Exp. TD (λ)": st.column_config.TextColumn("TD (λ)"),
                                         "Anytime TD": st.column_config.TextColumn("Anytime TD")
                                     },
                                     hide_index=True,
@@ -433,9 +374,6 @@ with tab_slate:
     if displayed == 0:
         st.info("No matchups match your edge/stake filter thresholds.")
 
-# -------------------------------------------------------------------------
-# 6. Market Steam Tab
-# -------------------------------------------------------------------------
 with tab_steam:
     st.subheader("⚡ Line Movement & Market Pricing Discrepancies")
     steam_records = []
@@ -455,9 +393,6 @@ with tab_steam:
         })
     st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
 
-# -------------------------------------------------------------------------
-# 7. Guru Workbench Tab
-# -------------------------------------------------------------------------
 with tab_guru:
     st.subheader(f"🧠 {guru_mode}")
     q_title = st.text_input("Evaluation Target / Matchup Headline:")
@@ -479,9 +414,6 @@ with tab_guru:
                 except Exception as e:
                     st.error(f"Inference Failure: {e}")
 
-# -------------------------------------------------------------------------
-# 8. Historical Simulation Airlock Tab
-# -------------------------------------------------------------------------
 with tab_sim:
     st.subheader("🧪 Blind Past-Game Simulation Engine (Airlocked)")
     st.caption("Validating AI predictive accuracy out-of-sample: Franchise metadata and true scores are strictly masked.")
@@ -507,20 +439,17 @@ with tab_sim:
             for idx, (_, g) in enumerate(hist_games.iterrows()):
                 home = str(g["home_team"])
                 away = str(g["away_team"])
-                raw_spread = float(g.get("spread_line", 0.0) or 0.0)
-                home_spread_line = raw_spread  # Retain standard home spread convention
+                nflfastr_spread = float(g.get("spread_line", 0.0) or 0.0)
                 total_line = float(g.get("total_line", 44.0) or 44.0)
 
                 actual_home = int(g["home_score"])
                 actual_away = int(g["away_score"])
 
                 # Exact call to self-contained mathematical scoring engine
-                projected_margin = -home_spread_line
-                p_home, p_away = project_discrete_nfl_scores(projected_margin, total_line)
+                p_home, p_away = project_discrete_nfl_scores(nflfastr_spread, total_line)
 
-                # Strict entity-masking payload passed to Gemini 3.8 Flash
                 anonymized_payload = {
-                    "entity_alpha": {"role": "Home Front", "spread_target": f"Entity Alpha {home_spread_line:+g}"},
+                    "entity_alpha": {"role": "Home Front", "projected_margin": f"Entity Alpha {nflfastr_spread:+g}"},
                     "entity_beta": {"role": "Away Front"},
                     "game_environment": {"total_points_market": total_line}
                 }
@@ -551,12 +480,12 @@ with tab_sim:
                     pred_away_score=p_away,
                     actual_home_score=actual_home,
                     actual_away_score=actual_away,
-                    home_spread_line=home_spread_line
+                    nflfastr_spread_line=nflfastr_spread
                 )
 
                 sim_results.append({
                     "Matchup": f"{away} @ {home}",
-                    "Vegas Line": f"{home} {home_spread_line:+g}",
+                    "Vegas Spread": f"{home} {-nflfastr_spread:+g}",
                     "Airlocked Model Projection": f"{away} {p_away} - {p_home} {home}",
                     "Actual Final Score": f"{away} {actual_away} - {actual_home} {home}",
                     "SU Hit": eval_metrics["su_grade"],
