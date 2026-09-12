@@ -2,6 +2,7 @@
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
 - Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
+- Powered by Gemini 3.8 Flash (gemini-3.8-flash) for scouting and tape breakdown.
 - Dynamic Bayesian QB Injury Adjustment & VORP Haircut Engine.
 - Multi-column schema alias resolution (player_name, full_name, first_name + last_name).
 - Set-aware Depth Chart Cascading (guarantees unique player allocation per role).
@@ -35,7 +36,7 @@ gemini_key = os.environ.get("GEMINI_API_KEY")
 if not db_url or not gemini_key:
     raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured in environment or secrets.")
 
-engine = create_engine(db_url, pool_size=5, pool_pre_ping=True)
+engine = create_engine(db_url, pool_size=5, max_overflow=10, pool_pre_ping=True)
 client = genai.Client(api_key=gemini_key)
 
 MODEL_FILE = "nfl_model.json"
@@ -510,7 +511,7 @@ def resolve_active_depth_chart(team_abbr: str, target_week: int) -> dict:
     return picks
 
 # -------------------------------------------------------------------------
-# 6. LLM Scouting Engine (With Dual-Mandate Persona)
+# 6. LLM Scouting Engine (With Gemini 3.8 Flash)
 # -------------------------------------------------------------------------
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     system_prompt = """
@@ -548,7 +549,7 @@ Output strictly valid JSON matching this schema:
                 response = await loop.run_in_executor(
                     None,
                     lambda: client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.8-flash",
                         contents=prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=system_prompt,
@@ -603,7 +604,7 @@ async def main():
         print("No active unplayed slate found.")
         sys.exit(0)
 
-    print(f"Executing Season {target_season} Week {target_week} Quant Pipeline ({len(upcoming)} matchups)...")
+    print(f"Executing Season {target_season} Week {target_week} Quant Pipeline ({len(upcoming)} matchups) via Gemini 3.8 Flash...")
     pre_processed = []
 
     for _, game in upcoming.iterrows():
