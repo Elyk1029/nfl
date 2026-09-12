@@ -1,214 +1,144 @@
-import os
-import json
-import streamlit as st
-import pandas as pd
-from datetime import datetime
-from sqlalchemy import create_engine, text
-from google import genai
-from google.genai import types
+import math
+from typing import Dict, Any, Tuple
+import numpy as np
+from scipy.stats import norm
 
-# ---------------------------------------------------------
-# 1. Environment & Client Verification
-# ---------------------------------------------------------
-st.set_page_config(
-    page_title="NFL Strategic Guru & AI Evaluator",
-    page_icon="🏈",
-    layout="wide"
-)
+# Standard position-specific log-standard deviations for NFL player props
+LOG_SIGMA_FACTORS: Dict[str, float] = {
+    "QB_Pass": 0.32,
+    "RB_Rush": 0.48,
+    "WR_Rec": 0.58,
+    "TE_Rec": 0.54,
+}
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# Empirical NFL regular-season margin probabilities (historical frequency distribution)
+KEY_MARGIN_PROBABILITIES: Dict[int, float] = {
+    3: 0.148,
+    7: 0.094,
+    6: 0.059,
+    10: 0.057,
+    4: 0.052,
+    14: 0.046,
+    1: 0.038,
+    2: 0.036
+}
 
-if not DATABASE_URL:
-    st.error("DATABASE_URL environment variable is not configured. Connect your Neon Postgres instance.")
-    st.stop()
 
-if not GEMINI_API_KEY:
-    st.error("GEMINI_API_KEY environment variable is not configured. Add your Google GenAI API key.")
-    st.stop()
+class NFLQuantitativeEngine:
+    """
+    Production-grade quantitative framework for nfl_guru.
+    Enforces mathematical hygiene, discrete scoring distributions, and log-normal median conversions.
+    """
 
-# Neon connection engine with auto-reconnect and pooling
-@st.cache_resource
-def get_neon_engine():
-    return create_engine(
-        DATABASE_URL,
-        pool_size=5,
-        max_overflow=10,
-        pool_recycle=300,
-        pool_pre_ping=True
-    )
+    @staticmethod
+    def calculate_lognormal_median(mean_projection: float, position_group: str) -> float:
+        """
+        Converts expected mean yardage into an estimated median (50th percentile)
+        to align with sportsbook prop line construction: m = mu * exp(-sigma^2 / 2).
+        """
+        if mean_projection <= 0:
+            return 0.0
+        sigma = LOG_SIGMA_FACTORS.get(position_group, 0.50)
+        median_projection = mean_projection * math.exp(-(sigma ** 2) / 2.0)
+        return round(median_projection, 2)
 
-engine = get_neon_engine()
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
-
-# ---------------------------------------------------------
-# 2. Database Schema Initialization
-# ---------------------------------------------------------
-def init_db():
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS nfl_guru_audits (
-                id SERIAL PRIMARY KEY,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                eval_mode TEXT NOT NULL,
-                headline TEXT NOT NULL,
-                input_payload TEXT NOT NULL,
-                verdict TEXT NOT NULL,
-                full_analysis TEXT NOT NULL
-            );
-        """))
-
-init_db()
-
-# ---------------------------------------------------------
-# 3. Core Persona System Instructions
-# ---------------------------------------------------------
-GURU_SYSTEM_INSTRUCTION = """
-# ROLE & PERSONA
-You are the "NFL Analytics Coordinator & Strategic Guru," operating at the intersection of advanced football sabermetrics and high-level coaching tape analysis. You possess elite-level fluency in both traditional football film study (schemes, coverages, run fits, route concepts) and modern predictive analytics (EPA/play, CPOE, Success Rate, DVOA, pressure rate vs. quick game, NGS tracking data).
-
-Your dual mandate:
-1. Deliver razor-sharp, objective, and analytically grounded NFL football analysis.
-2. Act as an expert AI evaluator: Continuously review user-submitted AI prompts, analytical frameworks, model outputs, or predictive systems to pinpoint blind spots, eliminate statistical noise, and recommend improvements.
-
-# CORE COMPETENCIES & KNOWLEDGE BASE
-- Scheme & Tactical Fluency: Personnel groupings (11, 12, 21 personnel), pass-pro schemes, run-blocking schemes (Inside/Outside Zone, Duo, Power/Counter), route distribution vs. MOFO/MOFC (Middle of Field Open/Closed), coverage shells (Cover 1, 2-Man, Quarters, Palms, Cover 3 Match).
-- Advanced Metrics & Modeling: EPA per play, Success Rate, CPOE, Adjusted Net Yards Per Attempt (ANY/A), explosive play rate, win probability models, high-leverage 4th-down decision curves.
-- Data Hygiene: Sample size discipline, regressing unstable metrics (turnover luck, fumble recovery rates, red zone TD% variance) toward the mean, distinguishing process from outcome.
-
-# OPERATIONAL MODES
-
-### MODE 1: NFL TACTICAL & STATISTICAL BREAKDOWN
-- Lead with the verdict in the first 1-2 sentences.
-- Contextualize Tape + Data: Never cite raw numbers without schematic root causes; never make tape claims without EPA, pressure rate, or success rate metrics.
-- Structure cleanly: Use Markdown tables for comparative data and bullet points for strategic keys.
-
-### MODE 2: AI & ANALYTICAL SYSTEM EVALUATION
-1. Audit & Blind Spot Detection: Pinpoint reliance on flawed proxies, raw box-score counting stats, or narrative bias.
-2. Signal vs. Noise Critique: Evaluate whether features isolate true predictive stability vs. game-script variance.
-3. Prompt & Logic Refactoring: Deliver production-ready code, prompt revisions, or mathematical adjustments.
-4. Actionable Edge Recommendations: Provide 2-3 specific data points or architectural upgrades.
-
-# OUTPUT CONSTRAINTS & TONE
-- Tone: Direct, analytical, objective, authoritative. Sound like an NFL director of research speaking directly to an analytics engineer or offensive coordinator.
-- Banned Habits: No generic sports platitudes ("they wanted it more", "momentum shifted"). Explain causation via leverage, numbers, spacing, or probability.
-- Scaffolding: Favor tables, bold inline callouts, and structured bullet points over walls of text.
-"""
-
-# ---------------------------------------------------------
-# 4. LLM Generation & Neon Persistence Service
-# ---------------------------------------------------------
-def run_guru_evaluation(mode: str, topic_headline: str, user_payload: str) -> str:
-    prompt = f"""
-### EXECUTION REQUEST: {mode.upper()}
-**TOPIC / HEADLINE:** {topic_headline}
-
-**INPUT PAYLOAD / RAW DATA / PROMPT:**
-{user_payload}
-
-Analyze the input strictly according to your defined system instructions and operational modes.
-"""
-    response = ai_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=GURU_SYSTEM_INSTRUCTION,
-            temperature=0.15
-        )
-    )
-    analysis_text = response.text
-
-    # Extract first sentence as primary verdict
-    first_line = analysis_text.strip().split("\n")[0].replace("#", "").strip()
-
-    # Save execution to Neon PostgreSQL
-    with engine.begin() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO nfl_guru_audits (eval_mode, headline, input_payload, verdict, full_analysis)
-                VALUES (:eval_mode, :headline, :input_payload, :verdict, :full_analysis)
-            """),
-            {
-                "eval_mode": mode,
-                "headline": topic_headline,
-                "input_payload": user_payload,
-                "verdict": first_line[:255],
-                "full_analysis": analysis_text
-            }
-        )
-    return analysis_text
-
-# ---------------------------------------------------------
-# 5. Streamlit User Interface
-# ---------------------------------------------------------
-st.title("🏈 NFL Analytics Coordinator & Strategic Guru Terminal")
-st.caption("Tape-Grounded Sabermetrics | Quantitative Prompt & Pipeline Auditing | Neon DB Sync")
-
-# Tabs for Execution Modes & Database Logs
-tab_mode1, tab_mode2, tab_history = st.tabs([
-    "Mode 1: Tactical & Tape Breakdown",
-    "Mode 2: AI & Pipeline Auditor",
-    "🗄️ Neon Audit Archive"
-])
-
-# --- MODE 1: Tactical & Tape Breakdown ---
-with tab_mode1:
-    st.markdown("### Matchup, Scheme, and Player Evaluation")
-    m1_headline = st.text_input("Matchup / Evaluation Subject", placeholder="e.g. SF 21-Personnel Outside Zone vs LA Odd-Front Quarters")
-    m1_payload = st.text_area(
-        "Tape Observations & Quantitative Baselines",
-        height=200,
-        placeholder="Paste personnel usage rates, EPA/play splits, pressure-to-sack ratios, or film tendencies..."
-    )
-
-    if st.button("Generate Strategic Breakdown", type="primary", use_container_width=True):
-        if not m1_headline or not m1_payload:
-            st.warning("Provide both an evaluation subject and data/tape context.")
-        else:
-            with st.spinner("Analyzing coverage shells, trench leverage, and EPA metrics..."):
-                output = run_guru_evaluation("Mode 1: Tactical & Statistical Breakdown", m1_headline, m1_payload)
-                st.markdown(output)
-
-# --- MODE 2: AI & System Evaluation ---
-with tab_mode2:
-    st.markdown("### Prompt, Model Architecture & Thesis Audit")
-    m2_headline = st.text_input("Model / Architecture Title", placeholder="e.g. Fourth-Down Decision Classifier or WR Prop XGBoost Framework")
-    m2_payload = st.text_area(
-        "Paste AI System Prompt, Python Feature Pipeline, or Math Framework",
-        height=250,
-        placeholder="Paste your prompt, feature vector list, betting heuristic, or raw LLM output here..."
-    )
-
-    if st.button("Audit Analytical Framework", type="primary", use_container_width=True):
-        if not m2_headline or not m2_payload:
-            st.warning("Provide both a framework title and prompt/code payload.")
-        else:
-            with st.spinner("Auditing for proxy errors, proxy leakage, and structural blind spots..."):
-                output = run_guru_evaluation("Mode 2: AI & Analytical System Evaluation", m2_headline, m2_payload)
-                st.markdown(output)
-
-# --- TAB 3: Neon Audit Archive ---
-with tab_history:
-    st.markdown("### Historical Evaluations Synced to Neon")
-    
-    with engine.connect() as conn:
-        archive_df = pd.read_sql(
-            "SELECT id, created_at, eval_mode, headline, verdict, full_analysis FROM nfl_guru_audits ORDER BY created_at DESC LIMIT 50;",
-            conn
-        )
-
-    if archive_df.empty:
-        st.info("No audit evaluations recorded yet.")
-    else:
-        st.dataframe(
-            archive_df[["id", "created_at", "eval_mode", "headline", "verdict"]],
-            use_container_width=True,
-            hide_index=True
-        )
-
-        selected_id = st.selectbox("Inspect Full Evaluation Record", archive_df["id"].tolist())
-        selected_record = archive_df[archive_df["id"] == selected_id].iloc[0]
+    @staticmethod
+    def evaluate_spread_edge(
+        projected_margin: float,
+        market_spread: float,
+        standard_deviation: float = 13.45
+    ) -> Tuple[float, float, float]:
+        """
+        Calculates home cover, away cover, and push probabilities using
+        empirical discrete point mass adjustments around key NFL numbers.
+        Spread is expressed from the home team perspective (e.g., -3.5).
+        """
+        # Continuous z-score baseline
+        z = (projected_margin - (-market_spread)) / standard_deviation
+        raw_home_cover = float(norm.cdf(z))
         
-        with st.expander(f"Record #{selected_record['id']} - {selected_record['headline']}", expanded=True):
-            st.caption(f"Executed on {selected_record['created_at']} | {selected_record['eval_mode']}")
-            st.markdown(selected_record["full_analysis"])
+        # Check if spread falls on a discrete integer push number
+        abs_spread = round(abs(market_spread))
+        is_integer_spread = float(market_spread).is_integer()
+        
+        if is_integer_spread and abs_spread in KEY_MARGIN_PROBABILITIES:
+            p_push = KEY_MARGIN_PROBABILITIES[abs_spread]
+        else:
+            p_push = 0.0
+
+        # Adjust continuous CDF across discrete push mass
+        p_home_cover = raw_home_cover * (1.0 - p_push)
+        p_away_cover = (1.0 - raw_home_cover) * (1.0 - p_push)
+
+        return round(p_home_cover, 4), round(p_away_cover, 4), round(p_push, 4)
+
+    @staticmethod
+    def calculate_eighth_kelly(
+        win_prob: float,
+        push_prob: float,
+        decimal_odds: float = 1.9091  # Standard -110 American odds
+    ) -> float:
+        """
+        Calculates conservative Eighth-Kelly stake sizing accounting for push equity.
+        f* = (b * p - q) / b, where q = 1.0 - p - p_push.
+        """
+        b = decimal_odds - 1.0
+        q = 1.0 - win_prob - push_prob
+        edge = (b * win_prob) - q
+
+        if edge <= 0:
+            return 0.0
+
+        full_kelly = edge / b
+        eighth_kelly = full_kelly * 0.125
+        # Cap intra-game exposure at 2.5 units
+        return round(min(max(eighth_kelly * 100.0, 0.0), 2.5), 2)
+
+
+class NFLTacticalDossierBuilder:
+    """
+    Constructs leak-proof, highly structured input payloads for AI scouting models.
+    Strictly forbids open-ended generation of unverifiable tracking metrics.
+    """
+
+    @staticmethod
+    def build_matchup_payload(
+        matchup_name: str,
+        home_offense_personnel: Dict[str, float],
+        away_defense_coverage_vs_personnel: Dict[str, float],
+        trench_metrics: Dict[str, float],
+        projected_game_script: Dict[str, Any]
+    ) -> str:
+        dossier = {
+            "matchup": matchup_name,
+            "tactical_context": {
+                "home_11_personnel_rate": home_offense_personnel.get("11_rate", 0.0),
+                "home_12_personnel_rate": home_offense_personnel.get("12_rate", 0.0),
+                "away_coverage_shell_vs_11": {
+                    "MOFO_Quarters_Cover6": away_defense_coverage_vs_personnel.get("mofo_rate_vs_11", 0.0),
+                    "MOFC_Cover1_Cover3": away_defense_coverage_vs_personnel.get("mofc_rate_vs_11", 0.0)
+                },
+                "trench_clock": {
+                    "offensive_TTT": trench_metrics.get("time_to_throw", 0.0),
+                    "defensive_TTP": trench_metrics.get("time_to_pressure", 0.0),
+                    "protection_delta": round(
+                        trench_metrics.get("time_to_pressure", 0.0) - trench_metrics.get("time_to_throw", 0.0), 2
+                    )
+                }
+            },
+            "market_and_model_projections": projected_game_script
+        }
+
+        prompt = (
+            f"SYSTEM INSTRUCTION: You are an NFL Director of Research analyzing coaching film.\n"
+            f"RULES:\n"
+            f"1. You must ONLY cite the concrete tracking metrics and rates provided in the dossier below.\n"
+            f"2. Never fabricate decimal-precision statistics not present in the payload.\n"
+            f"3. Frame pocket integrity as the exact Delta: TTP ({trench_metrics.get('time_to_pressure')}s) vs "
+            f"TTT ({trench_metrics.get('time_to_throw')}s).\n"
+            f"4. If protection_delta < 0, evaluate pocket collapse and checkdown rates; do not praise downfield progression.\n\n"
+            f"DATA DOSSIER:\n{dossier}\n\n"
+            f"DELIVERABLE:\n"
+            f"Provide an executive tactical breakdown detailing run-fit geometry and coverage shell leverage."
+        )
+        return prompt
