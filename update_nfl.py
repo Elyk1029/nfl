@@ -1,20 +1,21 @@
 """
-update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
+update_nfl.py - Autonomous Quantitative NFL Terminal Pipeline Orchestrator.
 Features:
-- Powered by Gemini 3.8 Flash (gemini-3.8-flash) via Google GenAI SDK.
-- Canonically aligns nflreadpy spread_line: spread_line > 0 strictly designates Home Favorite.
-- Opponent-adjusted Net EPA formula synchronized with train_model.py.
-- Closed-Loop Dirichlet Target Tree Conservation (Sum of Rec Means == Gross Pass Mean).
-- Team-budgeted Poisson TD allocation (breaking static mirrored lambdas).
-- Live Sportsbook Prop Comparison Engine (Passing, Rushing, Receiving).
-- Auto-migrating Neon PostgreSQL persistence.
+- Autonomous live injury polling via nflreadpy: dynamically cascades depth charts
+  when players are marked OUT, IR, PUP, or DOUBTFUL (zero manual player overrides).
+- Opponent-adjusted Net EPA formula synchronized with training:
+  net_edge = (off_home - def_away) - (off_away - def_home).
+- Canonical market spread alignment: spread_line > 0 strictly designates Home Favorite.
+- Dirichlet target tree volume conservation: Sum of Rec Means == Gross Pass Mean.
+- Team-budgeted Poisson TD allocation bound to implied scoring capacity.
+- Full sportsbook benchmark schema serialization to Neon PostgreSQL.
 """
 import asyncio
 import json
 import math
 import os
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from google import genai
 from google.genai import types
@@ -26,7 +27,7 @@ from sqlalchemy import create_engine, text
 import xgboost as xgb
 
 # -------------------------------------------------------------------------
-# 1. Environment & Infrastructure Initialization
+# 1. Environment & Database Configuration
 # -------------------------------------------------------------------------
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -56,21 +57,21 @@ NFL_KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
 COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
 
+INACTIVE_STATUSES: Set[str] = {
+    "OUT", "IR", "INJURED RESERVE", "PUP", "RESERVE/PUP",
+    "NFI", "NON-FOOTBALL INJURY", "SUSPENDED", "DOUBTFUL"
+}
+
 def clean_team_abbr(team_str: str) -> str:
     if not isinstance(team_str, str):
-        return team_str
-    c = team_str.strip().upper()
+        return ""
+    c = str(team_str).strip().upper()
     return TEAM_ABBR_MAP.get(c, c)
 
 # -------------------------------------------------------------------------
 # 2. Canonical Directional Scoring Engine
 # -------------------------------------------------------------------------
 def resolve_directional_market_context(total_line: float, nflfastr_spread_line: float) -> Tuple[float, float, float, float]:
-    """
-    In nflreadpy schedules:
-    spread_line > 0 strictly indicates HOME is favored (e.g., DET +7.0 vs NO).
-    spread_line < 0 strictly indicates AWAY is favored.
-    """
     canonical_home_margin = float(nflfastr_spread_line)
     implied_home = (total_line + canonical_home_margin) / 2.0
     implied_away = (total_line - canonical_home_margin) / 2.0
@@ -81,10 +82,6 @@ def resolve_directional_market_context(total_line: float, nflfastr_spread_line: 
     return canonical_home_margin, round(implied_home, 2), round(implied_away, 2), market_home_prob
 
 def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> Tuple[int, int]:
-    """
-    Snaps continuous projected margin to discrete NFL key numbers.
-    Strict Invariant: If projected_margin > 0, home team MUST win.
-    """
     effective_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
     home_favored = effective_margin > 0.0
     abs_margin = abs(effective_margin)
@@ -121,7 +118,7 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> T
     return int(best_pair[0]), int(best_pair[1])
 
 # -------------------------------------------------------------------------
-# 3. Closed-Loop Skill Engine & Sportsbook Benchmarks
+# 3. Dynamic Player Skill Modeling & Target Tree Conservation
 # -------------------------------------------------------------------------
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
@@ -171,7 +168,8 @@ def generate_closed_loop_skill_projections(
     team_spread_margin: float,
     pass_edge: float, 
     rush_edge: float, 
-    depth_names: Dict[str, str]
+    depth_names: Dict[str, str],
+    pbp_df: pd.DataFrame
 ) -> List[Dict[str, Any]]:
     total_plays = 63.5 * (implied_total / 22.0) ** 0.25
     
@@ -191,12 +189,25 @@ def generate_closed_loop_skill_projections(
     team_pass_tds = team_td_budget * pass_td_share
     team_rush_tds = team_td_budget * (1.0 - pass_td_share)
 
-    # Dirichlet target tree simplex
-    target_shares = {"WR1": 0.26, "WR2": 0.18, "WR3": 0.12, "TE1": 0.20, "RB1": 0.12, "RB2": 0.06, "OTHER": 0.06}
+    # Calculate empirical opportunity shares from trailing neutral-script PBP
+    target_weights = {"WR1": 0.27, "WR2": 0.18, "WR3": 0.12, "TE1": 0.20, "RB1": 0.12, "RB2": 0.05, "OTHER": 0.06}
     ypt_multipliers = {"WR1": 1.16, "WR2": 1.05, "WR3": 0.95, "TE1": 0.92, "RB1": 0.62, "RB2": 0.55, "OTHER": 0.80}
-    weighted_rec = {k: target_shares[k] * ypt_multipliers[k] for k in target_shares}
-    norm_factor = sum(weighted_rec.values())
-    rec_yard_shares = {k: weighted_rec[k] / norm_factor for k in weighted_rec}
+
+    if not pbp_df.empty:
+        t_passes = pbp_df[(pbp_df["posteam"] == team_abbr) & (pbp_df["play_type"] == "pass") & (pbp_df["home_wp"].between(0.10, 0.90))]
+        if len(t_passes) > 50:
+            counts = t_passes["receiver_player_name"].value_counts(normalize=True)
+            for role_key in ["WR1", "WR2", "WR3", "TE1", "RB1", "RB2"]:
+                p_name = depth_names.get(role_key, "")
+                if p_name in counts:
+                    target_weights[role_key] = float(counts[p_name])
+
+    norm_factor = sum(target_weights.values())
+    norm_target_shares = {k: target_weights[k] / norm_factor for k in target_weights}
+
+    weighted_rec = {k: norm_target_shares[k] * ypt_multipliers[k] for k in norm_target_shares}
+    rec_sum = sum(weighted_rec.values())
+    rec_yard_shares = {k: weighted_rec[k] / rec_sum for k in weighted_rec}
 
     rec_means = {k: gross_pass_mean * rec_yard_shares[k] for k in rec_yard_shares}
 
@@ -204,13 +215,13 @@ def generate_closed_loop_skill_projections(
     rb2_rush_mean = gross_rush_mean * 0.28
     qb_rush_mean = gross_rush_mean * 0.08
 
-    rb1_td_lambda = (team_rush_tds * 0.65) + (team_pass_tds * (target_shares["RB1"] * 0.55))
-    rb2_td_lambda = (team_rush_tds * 0.25) + (team_pass_tds * (target_shares["RB2"] * 0.40))
+    rb1_td_lambda = (team_rush_tds * 0.65) + (team_pass_tds * (norm_target_shares["RB1"] * 0.55))
+    rb2_td_lambda = (team_rush_tds * 0.25) + (team_pass_tds * (norm_target_shares["RB2"] * 0.40))
     qb_td_lambda = team_rush_tds * 0.10
-    wr1_td_lambda = team_pass_tds * (target_shares["WR1"] * 1.30)
-    wr2_td_lambda = team_pass_tds * (target_shares["WR2"] * 1.05)
-    wr3_td_lambda = team_pass_tds * (target_shares["WR3"] * 0.80)
-    te1_td_lambda = team_pass_tds * (target_shares["TE1"] * 1.25)
+    wr1_td_lambda = team_pass_tds * (norm_target_shares["WR1"] * 1.30)
+    wr2_td_lambda = team_pass_tds * (norm_target_shares["WR2"] * 1.05)
+    wr3_td_lambda = team_pass_tds * (norm_target_shares["WR3"] * 0.80)
+    te1_td_lambda = team_pass_tds * (norm_target_shares["TE1"] * 1.25)
 
     def calc_anytime_td(lam: float) -> float:
         return round(float((1.0 - math.exp(-max(0.001, lam))) * 100.0), 1)
@@ -256,7 +267,7 @@ def generate_closed_loop_skill_projections(
     ]
 
 # -------------------------------------------------------------------------
-# 4. Multi-Source Ingestion & Franchise-Aligned Depth Resolution
+# 4. Multi-Source Ingestion & Autonomous Roster Resolution
 # -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
@@ -335,10 +346,8 @@ def get_latest_team_row(team_abbr: str, target_season: int, target_week: int) ->
     ]
     return t_data.sort_values(["season", "week"], ascending=[False, False]).head(1) if not t_data.empty else pd.DataFrame()
 
-INACTIVE_DESIGNATIONS = {"OUT", "IR", "INJURED RESERVE", "DOUBTFUL", "DNR", "PUP", "NFI", "SUSPENDED"}
-
 def extract_injury_map() -> Dict[str, Dict[str, str]]:
-    injury_map = {}
+    injury_map: Dict[str, Dict[str, str]] = {}
     if injuries.empty:
         return injury_map
 
@@ -369,7 +378,11 @@ def extract_injury_map() -> Dict[str, Dict[str, str]]:
 
 LIVE_INJURY_MAP = extract_injury_map()
 
-def resolve_active_depth_chart(team_abbr: str, target_week: int) -> Dict[str, str]:
+def resolve_autonomous_depth_chart(team_abbr: str, target_week: int) -> Dict[str, str]:
+    """
+    Scans depth charts, autonomously filters inactive players (OUT, IR, PUP, DOUBTFUL),
+    and promotes the healthy next-man-up (e.g. promoting Cooper Rush when Tua is OUT).
+    """
     picks = {
         "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
         "WR1": f"{team_abbr} WR1", "WR2": f"{team_abbr} WR2", "WR3": f"{team_abbr} WR3", "TE1": f"{team_abbr} TE1"
@@ -413,11 +426,11 @@ def resolve_active_depth_chart(team_abbr: str, target_week: int) -> Dict[str, st
         ("TE", ["TE1"])
     ]
 
-    assigned_players = set()
+    assigned_players: Set[str] = set()
 
     for pos, slots in slot_configs:
         cands = t_dc[t_dc[pos_col] == pos]
-        healthy_unique_players = []
+        healthy_candidates: List[str] = []
 
         for _, row in cands.iterrows():
             if name_col and pd.notna(row[name_col]) and str(row[name_col]).strip():
@@ -430,16 +443,17 @@ def resolve_active_depth_chart(team_abbr: str, target_week: int) -> Dict[str, st
             if full_name.lower() in assigned_players:
                 continue
 
+            # Check live injury designation
             status = team_injuries.get(full_name, "ACTIVE")
-            if status in INACTIVE_DESIGNATIONS:
+            if status in INACTIVE_STATUSES:
                 continue
 
-            healthy_unique_players.append(full_name)
+            healthy_candidates.append(full_name)
             assigned_players.add(full_name.lower())
 
         for idx, slot_key in enumerate(slots):
-            if idx < len(healthy_unique_players):
-                picks[slot_key] = healthy_unique_players[idx]
+            if idx < len(healthy_candidates):
+                picks[slot_key] = healthy_candidates[idx]
             else:
                 picks[slot_key] = f"{team_abbr} {slot_key}"
 
@@ -458,7 +472,7 @@ You are the "NFL Research Director & Quantitative Architect," operating at the n
 * Frame pocket integrity strictly as the countdown race between pass protection and release timing (TTP vs TTT).
 * Map Duo/Power as vertical interior displacement and Zone schemes as horizontal sideline stretch.
 * Deliver direct verdicts without conversational setups or labeled conclusions.
-* Output strictly valid JSON without markdown formatting backticks.
+* Output strictly valid JSON without markdown backticks.
 """
     verdict_str = f"Bet {recommended_line} - {kelly_units:.2f}u" if recommended_team != "PASS" and kelly_units > 0.0 else "PASS - 0.00u"
 
@@ -518,7 +532,7 @@ Output strictly valid JSON matching this schema:
         return json.dumps(fallback)
 
 # -------------------------------------------------------------------------
-# 6. Master Production Pipeline Loop
+# 6. Master Production Execution Loop
 # -------------------------------------------------------------------------
 async def main():
     target_week = 1
@@ -554,7 +568,7 @@ async def main():
         def get_stat(df, col, default=0.0):
             return float(df[col].values[0]) if not df.empty and col in df.columns and pd.notna(df[col].values[0]) else float(default)
 
-        # STRICT Opponent-Cross Subtraction (Synchronized with train_model.py)
+        # STRICT Opponent-Cross Subtraction: (off_home - def_away) - (off_away - def_home)
         net_pass_edge = (get_stat(home_row, "roll_off_dropback_epa") - get_stat(away_row, "roll_def_dropback_epa")) - \
                         (get_stat(away_row, "roll_off_dropback_epa") - get_stat(home_row, "roll_def_dropback_epa"))
         net_rush_edge = (get_stat(home_row, "roll_off_rush_epa") - get_stat(away_row, "roll_def_rush_epa")) - \
@@ -596,7 +610,7 @@ async def main():
 
         raw_model_prob = float(model.predict_proba(feature_row)[0][1])
 
-        # Directionally Stable Bayesian Prior Weighting
+        # Directionally Anchored Bayesian Shrinkage
         if canonical_spread >= 3.0:
             market_weight = 0.70 if abs(raw_model_prob - market_home_prob) > 0.25 else 0.50
             calibrated_home_win_prob = (1.0 - market_weight) * max(raw_model_prob, 1.0 - raw_model_prob) + (market_weight * market_home_prob)
@@ -643,15 +657,16 @@ async def main():
         q = max(0.0, 1.0 - cover_prob)
         kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" else 0.0
 
-        home_depth = resolve_active_depth_chart(home_team, week_num)
-        away_depth = resolve_active_depth_chart(away_team, week_num)
+        # Autonomous depth-chart resolution using live injury wire
+        home_depth = resolve_autonomous_depth_chart(home_team, week_num)
+        away_depth = resolve_autonomous_depth_chart(away_team, week_num)
 
         # Generate Complete Projections with Sportsbook Benchmarks
         home_skills = generate_closed_loop_skill_projections(
-            home_team, implied_home_total, model_projected_margin, net_pass_edge, net_rush_edge, home_depth
+            home_team, implied_home_total, model_projected_margin, net_pass_edge, net_rush_edge, home_depth, pbp
         )
         away_skills = generate_closed_loop_skill_projections(
-            away_team, implied_away_total, -model_projected_margin, -net_pass_edge, -net_rush_edge, away_depth
+            away_team, implied_away_total, -model_projected_margin, -net_pass_edge, -net_rush_edge, away_depth, pbp
         )
 
         home_roster_summary = {p["role"]: p["player"] for p in home_skills}
