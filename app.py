@@ -1,9 +1,10 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
-Features:
-- Self-contained discrete scoring math engine (strictly directionally locked).
-- Live Sportsbook Prop Comparison Engine (Model Median vs. Vegas Prop Line, Delta, Over/Under signal).
-- Scoped nflreadpy import inside load_historical_fixtures, resolving NameError in caching layer.
+Production UI:
+- Fully self-contained discrete empirical scoring engine.
+- Complete Guru System Prompt integrated via nfl_guru.py.
+- Live Sportsbook Prop Comparison Engine (Passing, Rushing, Receiving, Touchdown lambdas).
+- Scoped nflreadpy import inside load_historical_fixtures resolving NameError in caching layer.
 - Powered by Gemini 3.8 Flash (gemini-3.8-flash) for Guru Evaluation & Anonymized Simulations.
 """
 import os
@@ -16,6 +17,8 @@ from sqlalchemy import create_engine, text
 from google import genai
 from google.genai import types
 from scipy.stats import norm
+
+from nfl_guru import NFL_GURU_FULL_SYSTEM_PROMPT
 
 st.set_page_config(
     page_title="NFL Quantitative Terminal | 2026 Season",
@@ -172,11 +175,6 @@ def get_genai_client(key: str):
 engine = get_db_engine(db_url)
 ai_client = get_genai_client(api_key)
 
-GURU_SYSTEM_INSTRUCTION = """
-# ROLE & IDENTITY
-You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
-"""
-
 @st.cache_data(ttl=300)
 def load_predictions():
     query = """
@@ -213,7 +211,7 @@ st.title("🏈 Institutional NFL Quantitative Terminal")
 st.caption("Discrete Empirical Score Modeling | Live Sportsbook Prop Benchmarking | Powered by Gemini 3.8 Flash")
 
 if df.empty:
-    st.info("No active slate predictions currently loaded.")
+    st.info("No active slate predictions currently loaded in the database.")
     st.stop()
 
 c1, c2, c3, c4 = st.columns(4)
@@ -398,14 +396,14 @@ with tab_guru:
     q_payload = st.text_area("Dossier Payload (Tape notes, EPA splits, or prompt code):", height=200)
     if st.button("Execute Strategic Guru Evaluation", type="primary", use_container_width=True):
         if q_title and q_payload:
-            with st.spinner("Processing scheme leverage and statistical hygiene via Gemini 3.8 Flash..."):
+            with st.spinner("Processing scheme leverage via Gemini 3.8 Flash..."):
                 prompt = f"[{guru_mode.upper()}]\nSUBJECT: {q_title}\n\nINPUT PAYLOAD:\n{q_payload}"
                 try:
                     res = ai_client.models.generate_content(
                         model="gemini-3.8-flash",
                         contents=prompt,
                         config=types.GenerateContentConfig(
-                            system_instruction=GURU_SYSTEM_INSTRUCTION,
+                            system_instruction=NFL_GURU_FULL_SYSTEM_PROMPT,
                             temperature=0.15
                         )
                     )
@@ -421,7 +419,7 @@ with tab_sim:
     sim_week = st.slider("Select Historical Week:", 1, 18, 1)
 
     @st.cache_data(ttl=600)
-    def load_historical_fixtures(season, week):
+    def load_historical_fixtures(season: int, week: int):
         import nflreadpy as nfl_loader
         sched = nfl_loader.load_schedules(seasons=[season]).to_pandas()
         return sched[(sched["week"] == week) & sched["result"].notna()].copy()
@@ -431,7 +429,7 @@ with tab_sim:
     if hist_games.empty:
         st.warning("No completed games found for the selected schedule.")
     else:
-        st.info(f"Loaded {len(hist_games)} fixtures. Franchise names, years, and outcomes are airlocked via Entity Alpha/Beta tokens.")
+        st.info(f"Loaded {len(hist_games)} fixtures. Franchise names and outcomes are airlocked via Entity Alpha/Beta tokens.")
         if st.button("Execute Airlocked Out-of-Sample Simulation", type="primary", use_container_width=True):
             sim_results = []
             progress_bar = st.progress(0)
@@ -474,23 +472,29 @@ with tab_sim:
                 except Exception:
                     thesis = "Neutral script trench efficiency and third-down conversion rates govern margin."
 
-                eval_metrics = normalize_and_grade_spread(
-                    pred_home_score=p_home,
-                    pred_away_score=p_away,
-                    actual_home_score=actual_home,
-                    actual_away_score=actual_away,
-                    nflfastr_spread_line=nflfastr_spread
-                )
+                actual_margin = float(actual_home - actual_away)
+                pred_margin = float(p_home - p_away)
+                actual_covered = actual_margin > nflfastr_spread
+                pred_covered = pred_margin > nflfastr_spread
+
+                if actual_margin == nflfastr_spread:
+                    ats_grade = "⏸️ Push"
+                elif actual_covered == pred_covered:
+                    ats_grade = "✅ Correct Cover"
+                else:
+                    ats_grade = "❌ Wrong Side"
+
+                su_grade = "✅ Hit" if (actual_margin > 0) == (pred_margin > 0) else "❌ Miss"
 
                 sim_results.append({
                     "Matchup": f"{away} @ {home}",
                     "Vegas Spread": f"{home} {-nflfastr_spread:+g}",
                     "Airlocked Model Projection": f"{away} {p_away} - {p_home} {home}",
                     "Actual Final Score": f"{away} {actual_away} - {actual_home} {home}",
-                    "SU Hit": eval_metrics["su_grade"],
-                    "Spread Read": eval_metrics["ats_grade"],
-                    "Score MAE": f"{eval_metrics['score_mae']:.1f} pts",
-                    "Margin Delta": f"{eval_metrics['margin_error']:.1f} pts",
+                    "SU Hit": su_grade,
+                    "Spread Read": ats_grade,
+                    "Score MAE": f"{(abs(p_away - actual_away) + abs(p_home - actual_home)) / 2.0:.1f} pts",
+                    "Margin Delta": f"{abs(pred_margin - actual_margin):.1f} pts",
                     "Airlocked Tape Breakdown": thesis
                 })
 
