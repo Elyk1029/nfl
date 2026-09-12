@@ -1,7 +1,7 @@
 """
-update_nfl.py - Autonomous Quantitative NFL Terminal Pipeline Orchestrator.
+update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
-- Autonomous live injury polling via nflreadpy: dynamically cascades depth charts
+- Autonomous live injury polling via autonomous_roster_engine: cascades depth charts
   when players are marked OUT, IR, PUP, or DOUBTFUL (zero manual player overrides).
 - Opponent-adjusted Net EPA formula synchronized with training:
   net_edge = (off_home - def_away) - (off_away - def_home).
@@ -25,6 +25,8 @@ import pandas as pd
 from scipy.stats import norm, poisson
 from sqlalchemy import create_engine, text
 import xgboost as xgb
+
+from autonomous_roster_engine import AutonomousNFLRosterEngine
 
 # -------------------------------------------------------------------------
 # 1. Environment & Database Configuration
@@ -56,11 +58,6 @@ EXPECTED_FEATURES = BOOSTER_FEATURES if BOOSTER_FEATURES else DEFAULT_FEATURES
 NFL_KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
 COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
-
-INACTIVE_STATUSES: Set[str] = {
-    "OUT", "IR", "INJURED RESERVE", "PUP", "RESERVE/PUP",
-    "NFI", "NON-FOOTBALL INJURY", "SUSPENDED", "DOUBTFUL"
-}
 
 def clean_team_abbr(team_str: str) -> str:
     if not isinstance(team_str, str):
@@ -118,7 +115,7 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> T
     return int(best_pair[0]), int(best_pair[1])
 
 # -------------------------------------------------------------------------
-# 3. Dynamic Player Skill Modeling & Target Tree Conservation
+# 3. Closed-Loop Skill Engine & Sportsbook Benchmarks
 # -------------------------------------------------------------------------
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
@@ -189,7 +186,6 @@ def generate_closed_loop_skill_projections(
     team_pass_tds = team_td_budget * pass_td_share
     team_rush_tds = team_td_budget * (1.0 - pass_td_share)
 
-    # Calculate empirical opportunity shares from trailing neutral-script PBP
     target_weights = {"WR1": 0.27, "WR2": 0.18, "WR3": 0.12, "TE1": 0.20, "RB1": 0.12, "RB2": 0.05, "OTHER": 0.06}
     ypt_multipliers = {"WR1": 1.16, "WR2": 1.05, "WR3": 0.95, "TE1": 0.92, "RB1": 0.62, "RB2": 0.55, "OTHER": 0.80}
 
@@ -267,7 +263,7 @@ def generate_closed_loop_skill_projections(
     ]
 
 # -------------------------------------------------------------------------
-# 4. Multi-Source Ingestion & Autonomous Roster Resolution
+# 4. Multi-Source Ingestion & Franchise-Aligned Aggregation
 # -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
@@ -282,20 +278,10 @@ try:
 except Exception:
     pbp = pd.DataFrame()
 
-try:
-    injuries = nfl.load_injuries(seasons=[CURRENT_SEASON]).to_pandas()
-except Exception:
-    injuries = pd.DataFrame()
-
-try:
-    depth_charts = nfl.load_depth_charts(seasons=[CURRENT_SEASON]).to_pandas()
-except Exception:
-    depth_charts = pd.DataFrame()
-
-for df in [schedules, pbp, injuries, depth_charts]:
+for df in [schedules, pbp]:
     if df.empty:
         continue
-    for col in ["home_team", "away_team", "posteam", "defteam", "recent_team", "team", "club_code"]:
+    for col in ["home_team", "away_team", "posteam", "defteam", "recent_team", "team"]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
@@ -346,119 +332,6 @@ def get_latest_team_row(team_abbr: str, target_season: int, target_week: int) ->
     ]
     return t_data.sort_values(["season", "week"], ascending=[False, False]).head(1) if not t_data.empty else pd.DataFrame()
 
-def extract_injury_map() -> Dict[str, Dict[str, str]]:
-    injury_map: Dict[str, Dict[str, str]] = {}
-    if injuries.empty:
-        return injury_map
-
-    team_col = next((c for c in ["team", "club_code", "team_abbr"] if c in injuries.columns), None)
-    status_col = next((c for c in ["report_status", "practice_status", "game_status"] if c in injuries.columns), None)
-    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in injuries.columns), None)
-    first_col = next((c for c in ["first_name", "fname"] if c in injuries.columns), None)
-    last_col = next((c for c in ["last_name", "lname"] if c in injuries.columns), None)
-
-    if not team_col or not status_col:
-        return injury_map
-
-    for _, row in injuries.iterrows():
-        t = str(row[team_col]).strip().upper()
-        if name_col and pd.notna(row[name_col]):
-            p_name = str(row[name_col]).strip()
-        elif first_col and last_col and pd.notna(row[first_col]) and pd.notna(row[last_col]):
-            p_name = f"{row[first_col]} {row[last_col]}".strip()
-        else:
-            continue
-
-        status = str(row[status_col]).strip().upper() if pd.notna(row[status_col]) else "ACTIVE"
-        if t not in injury_map:
-            injury_map[t] = {}
-        injury_map[t][p_name] = status
-
-    return injury_map
-
-LIVE_INJURY_MAP = extract_injury_map()
-
-def resolve_autonomous_depth_chart(team_abbr: str, target_week: int) -> Dict[str, str]:
-    """
-    Scans depth charts, autonomously filters inactive players (OUT, IR, PUP, DOUBTFUL),
-    and promotes the healthy next-man-up (e.g. promoting Cooper Rush when Tua is OUT).
-    """
-    picks = {
-        "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
-        "WR1": f"{team_abbr} WR1", "WR2": f"{team_abbr} WR2", "WR3": f"{team_abbr} WR3", "TE1": f"{team_abbr} TE1"
-    }
-    if depth_charts.empty:
-        return picks
-
-    team_col = next((c for c in ["club_code", "team", "team_abbr"] if c in depth_charts.columns), None)
-    if not team_col:
-        return picks
-
-    t_dc = depth_charts[depth_charts[team_col] == team_abbr].copy()
-    if t_dc.empty:
-        return picks
-
-    if "week" in t_dc.columns:
-        valid_weeks = t_dc[t_dc["week"] == target_week]
-        if not valid_weeks.empty:
-            t_dc = valid_weeks.copy()
-        else:
-            max_wk = t_dc["week"].max()
-            t_dc = t_dc[t_dc["week"] == max_wk].copy()
-
-    first_col = next((c for c in ["first_name", "fname"] if c in t_dc.columns), None)
-    last_col = next((c for c in ["last_name", "lname"] if c in t_dc.columns), None)
-    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in t_dc.columns), None)
-    pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in t_dc.columns), None)
-    rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in t_dc.columns), None)
-
-    if not pos_col or not rank_col:
-        return picks
-
-    t_dc["rank_int"] = pd.to_numeric(t_dc[rank_col], errors="coerce").fillna(99).astype(int)
-    t_dc.sort_values(by=["rank_int"], ascending=True, inplace=True)
-
-    team_injuries = LIVE_INJURY_MAP.get(team_abbr, {})
-    slot_configs = [
-        ("QB", ["QB1"]),
-        ("RB", ["RB1", "RB2"]),
-        ("WR", ["WR1", "WR2", "WR3"]),
-        ("TE", ["TE1"])
-    ]
-
-    assigned_players: Set[str] = set()
-
-    for pos, slots in slot_configs:
-        cands = t_dc[t_dc[pos_col] == pos]
-        healthy_candidates: List[str] = []
-
-        for _, row in cands.iterrows():
-            if name_col and pd.notna(row[name_col]) and str(row[name_col]).strip():
-                full_name = str(row[name_col]).strip()
-            elif first_col and last_col and pd.notna(row[first_col]) and pd.notna(row[last_col]):
-                full_name = f"{row[first_col]} {row[last_col]}".strip()
-            else:
-                continue
-
-            if full_name.lower() in assigned_players:
-                continue
-
-            # Check live injury designation
-            status = team_injuries.get(full_name, "ACTIVE")
-            if status in INACTIVE_STATUSES:
-                continue
-
-            healthy_candidates.append(full_name)
-            assigned_players.add(full_name.lower())
-
-        for idx, slot_key in enumerate(slots):
-            if idx < len(healthy_candidates):
-                picks[slot_key] = healthy_candidates[idx]
-            else:
-                picks[slot_key] = f"{team_abbr} {slot_key}"
-
-    return picks
-
 # -------------------------------------------------------------------------
 # 5. Gemini 3.8 Flash Scouting Engine
 # -------------------------------------------------------------------------
@@ -472,7 +345,7 @@ You are the "NFL Research Director & Quantitative Architect," operating at the n
 * Frame pocket integrity strictly as the countdown race between pass protection and release timing (TTP vs TTT).
 * Map Duo/Power as vertical interior displacement and Zone schemes as horizontal sideline stretch.
 * Deliver direct verdicts without conversational setups or labeled conclusions.
-* Output strictly valid JSON without markdown backticks.
+* Output strictly valid JSON without markdown formatting backticks.
 """
     verdict_str = f"Bet {recommended_line} - {kelly_units:.2f}u" if recommended_team != "PASS" and kelly_units > 0.0 else "PASS - 0.00u"
 
@@ -551,6 +424,10 @@ async def main():
         sys.exit(0)
 
     print(f"Executing Season {target_season} Week {target_week} Quant Pipeline ({len(upcoming)} matchups)...")
+    
+    roster_engine = AutonomousNFLRosterEngine(season=target_season, week=target_week)
+    roster_engine.sync_live_feeds()
+    
     pre_processed = []
 
     for _, game in upcoming.iterrows():
@@ -568,7 +445,7 @@ async def main():
         def get_stat(df, col, default=0.0):
             return float(df[col].values[0]) if not df.empty and col in df.columns and pd.notna(df[col].values[0]) else float(default)
 
-        # STRICT Opponent-Cross Subtraction: (off_home - def_away) - (off_away - def_home)
+        # STRICT Opponent-Cross Subtraction (Synchronized with train_model.py)
         net_pass_edge = (get_stat(home_row, "roll_off_dropback_epa") - get_stat(away_row, "roll_def_dropback_epa")) - \
                         (get_stat(away_row, "roll_off_dropback_epa") - get_stat(home_row, "roll_def_dropback_epa"))
         net_rush_edge = (get_stat(home_row, "roll_off_rush_epa") - get_stat(away_row, "roll_def_rush_epa")) - \
@@ -629,7 +506,6 @@ async def main():
         pred_home_score, pred_away_score = project_discrete_nfl_scores(model_projected_margin, raw_total_line)
         pred_total_score = pred_home_score + pred_away_score
 
-        # Spread cover probability (canonical_spread > 0 means home favored)
         z_cover_home = (model_projected_margin - canonical_spread) / sigma
         home_cover = float(norm.cdf(z_cover_home))
         away_cover = 1.0 - home_cover
@@ -658,8 +534,11 @@ async def main():
         kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" else 0.0
 
         # Autonomous depth-chart resolution using live injury wire
-        home_depth = resolve_autonomous_depth_chart(home_team, week_num)
-        away_depth = resolve_autonomous_depth_chart(away_team, week_num)
+        home_core = roster_engine.resolve_active_depth_hierarchy(home_team)
+        away_core = roster_engine.resolve_active_depth_hierarchy(away_team)
+
+        home_depth = {role: meta["name"] for role, meta in home_core.items()}
+        away_depth = {role: meta["name"] for role, meta in away_core.items()}
 
         # Generate Complete Projections with Sportsbook Benchmarks
         home_skills = generate_closed_loop_skill_projections(
