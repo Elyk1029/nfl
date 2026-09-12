@@ -1,9 +1,9 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
-Features:
-- Decoupled table layout with explicit DataFrame column configurations.
-- Automatic edge and Eighth-Kelly stake reconciliation.
-- Blind Historical Simulation airlock.
+Complete Production UI:
+- Reconciled Actionable Verdict Banner with Eighth-Kelly Staking Allocation.
+- Structured Pandas DataFrame Table Renderer with Separated Columns (Eliminating Text Collision).
+- Normalized ATS Spread Evaluation Engine & Blind Historical Simulation Airlock.
 """
 import os
 import json
