@@ -1,6 +1,6 @@
 """
 verifier.py - Production System Auditor & Mathematical Invariant Verifier.
-Validates model weights, schema compliance, target-tree conservation, and absence of halluncinations.
+Validates model weights, schema compliance, target-tree conservation, and absence of hallucinations.
 """
 import json
 import math
@@ -11,9 +11,9 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
-EXPECTED_FEATURES = [
+PHYSICAL_FEATURES = [
     "net_pass_edge", "net_rush_edge", "net_late_down_edge", "diff_success",
-    "diff_explosive", "rest_diff", "is_divisional", "market_home_prob"
+    "diff_explosive", "rest_diff", "is_divisional"
 ]
 
 class NFLDataVerifier:
@@ -23,7 +23,6 @@ class NFLDataVerifier:
         self.engine = create_engine(self.db_url, pool_pre_ping=True) if self.db_url else None
 
     def verify_model_weights(self) -> bool:
-        """Verifies XGBoost model integrity and input dimensionality."""
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"Model file '{self.model_path}' is missing.")
 
@@ -33,29 +32,24 @@ class NFLDataVerifier:
         except Exception as e:
             raise RuntimeError(f"Failed to load XGBoost model from '{self.model_path}': {e}")
 
-        # Test inference on dummy vector
-        test_vec = pd.DataFrame([[0.0] * len(EXPECTED_FEATURES)], columns=EXPECTED_FEATURES)
+        test_vec = pd.DataFrame([[0.0] * len(PHYSICAL_FEATURES)], columns=PHYSICAL_FEATURES)
         try:
             prob = model.predict_proba(test_vec)[0]
             assert len(prob) == 2, "Model must output binary probability distribution."
             assert 0.0 <= prob[1] <= 1.0, "Probability must fall in [0, 1]."
-            print("Model weights and inference dimensionality verified.")
+            print("Model weights and physical feature dimensions verified.")
             return True
         except Exception as e:
             raise ValueError(f"Inference sanity check failed: {e}")
 
     def verify_skill_volume_conservation(self, team_gross_pass: float, player_projections: list) -> bool:
-        """
-        Enforces line-of-scrimmage physical invariant:
-        Sum of individual skill receiving medians must not exceed gross team passing capacity.
-        """
         rec_medians = [
             float(p.get("rec_yards", 0.0)) for p in player_projections
             if p.get("role") not in ["QB1"]
         ]
         total_rec_median = sum(rec_medians)
 
-        # Due to right-skew (log-normal), sum of medians is mathematically <= gross mean pass yards
+        # Log-normal inequality: Sum of medians must sit below gross mean capacity
         if total_rec_median > team_gross_pass * 1.05:
             raise AssertionError(
                 f"Volume conservation failure: Allocated medians ({total_rec_median:.1f} yds) "
@@ -67,11 +61,10 @@ class NFLDataVerifier:
         if len(roles) != len(unique_roles):
             raise AssertionError(f"Duplicate positional slot detected in projections: {roles}")
 
-        print(f"Volume conservation verified: {total_rec_median:.1f} yds allocated across {len(roles)} roles.")
+        print(f"Volume conservation verified: {total_rec_median:.1f} yds allocated across {len(roles)} unique roles.")
         return True
 
     def verify_database_records(self, season: int, week: int) -> bool:
-        """Audits database records to ensure zero tie scores and non-null analysis payloads."""
         if not self.engine:
             print("No database connection available; skipping DB record audit.")
             return True
