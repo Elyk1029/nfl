@@ -1,15 +1,15 @@
 """
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
-- Full Multi-Tier Injury Engine: Evaluates QB, OL (LT/RT/C), Secondary (CB1/CB2/FS),
-  Front-7 (EDGE/IDL), and Skill injuries to dynamically adjust spreads, totals, TTP, and shell distributions.
-- Autonomous Roster Cascading: Live ingestion of league injury wires; prunes IR/PUP/OUT scratches.
-- Strict Opponent-Cross EPA Mathematics: (off_home - def_away) - (off_away - def_home).
-- Canonical Spread Alignment: spread_line > 0 strictly designates Home Favorite.
-- Closed-Loop Dirichlet Target Tree Simplex: Sum of Rec Means == Gross Team Pass Mean.
-- Log-Normal Median Conversions: m = mu * exp(-sigma^2 / 2).
-- Team-Budgeted Poisson TD Allocation bound to Implied Total / 7.15.
-- Research Director & Quantitative Architect System Prompt embedded via Gemini 3.8 Flash.
+- Research Director & Quantitative Architect Architecture via Gemini 3.8 Flash.
+- Macro-to-Micro Yardage Elasticity: Enforces 12.5 to 16.5 yards/point scoring floor.
+- Logistic Bounded Script Response: Clamps pass rate between 48% and 67%, applying
+  negative YPA efficiency drag to trailing passing scripts under duress.
+- Closed-Loop Dirichlet Target/Carry Simplex: Enforces Sum(Rec Means) == Gross Pass Mean.
+- Finite Poisson Touchdown Allocation: Strictly enforces Sum(Lambdas) == Team Implied TDs.
+- Multi-Tier Schematic Injury Engine: Quantifies LT/RT TTP degradation, CB1 MOFO coverage
+  shifts, and IDL run-leakage differentials before score generation.
+- Canonical Spread Conventions: spread_line > 0 strictly designates Home Favorite.
 - Auto-Migrating Neon PostgreSQL Persistence.
 """
 import asyncio
@@ -33,7 +33,7 @@ import xgboost as xgb
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -------------------------------------------------------------------------
-# 1. Environment Verification & Client Initialization
+# 1. Environment Verification & Database Initialization
 # -------------------------------------------------------------------------
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -68,19 +68,6 @@ INACTIVE_STATUS_DESIGNATIONS: Set[str] = {
     "NFI", "NON-FOOTBALL INJURY", "DOUBTFUL", "SUSPENDED"
 }
 
-STATUS_PROBABILITY_WEIGHTS: Dict[str, float] = {
-    "OUT": 0.00,
-    "IR": 0.00,
-    "PUP": 0.00,
-    "DOUBTFUL": 0.05,
-    "QUESTIONABLE_DNP": 0.25,
-    "QUESTIONABLE_LP": 0.55,
-    "QUESTIONABLE_FP": 0.85,
-    "QUESTIONABLE": 0.60,
-    "ACTIVE": 1.00,
-    "HEALTHY": 1.00
-}
-
 # Empirical Multi-Tier Positional Valuation Matrix (VORP & Schematic Gradients)
 POSITIONAL_IMPACT_METRICS: Dict[str, Dict[str, float]] = {
     "QB_ELITE": {"spread_val": 4.5, "total_drop": 4.0, "pass_epa_delta": 0.160, "ttp_delta": 0.00},
@@ -95,6 +82,15 @@ POSITIONAL_IMPACT_METRICS: Dict[str, Dict[str, float]] = {
     "FS1": {"spread_val": 0.7, "total_drop": -0.6, "pass_epa_delta": -0.045, "deep_hole_leak": 0.12},
     "WR1": {"spread_val": 1.3, "total_drop": 1.1, "pass_epa_delta": 0.070, "target_funnel_loss": 0.28},
     "RB1": {"spread_val": 0.5, "total_drop": 0.4, "rush_epa_delta": 0.030, "target_funnel_loss": 0.12}
+}
+
+LOG_SIGMA = {
+    "QB_Pass": 0.32,
+    "QB_Rush": 0.52,
+    "RB_Rush": 0.48,
+    "RB_Rec": 0.55,
+    "WR_Rec": 0.58,
+    "TE_Rec": 0.54
 }
 
 def clean_team_abbr(team_str: str) -> str:
@@ -168,13 +164,8 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> T
     return int(best_pair[0]), int(best_pair[1])
 
 # -------------------------------------------------------------------------
-# 3. Closed-Loop Skill Engine & Sportsbook Benchmarks
+# 3. Macro-to-Micro Elasticity & Closed-Loop Skill Engine
 # -------------------------------------------------------------------------
-LOG_SIGMA = {
-    "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
-    "RB_Rec": 0.55, "WR_Rec": 0.58, "TE_Rec": 0.54
-}
-
 def convert_mean_to_median(mean_val: float, role_key: str) -> float:
     if mean_val <= 0.0:
         return 0.0
@@ -213,49 +204,82 @@ def synthesize_sportsbook_consensus_line(stat_type: str, role: str, model_median
     return float(max(0.5, line))
 
 def generate_closed_loop_skill_projections(
-    team_abbr: str, 
-    implied_total: float, 
+    team_abbr: str,
+    implied_total: float,
     team_spread_margin: float,
-    pass_edge: float, 
-    rush_edge: float, 
+    pass_edge: float,
+    rush_edge: float,
     depth_names: Dict[str, str],
     pbp_df: pd.DataFrame,
     ttp_shift: float = 0.0,
     mofo_shift: float = 0.0
 ) -> List[Dict[str, Any]]:
-    total_plays = 63.5 * (implied_total / 22.0) ** 0.25
-    
-    script_shift = -0.007 * team_spread_margin
-    scheme_shift = 0.025 * (pass_edge - rush_edge)
-    pass_rate = max(0.48, min(0.66, 0.575 + script_shift + scheme_shift))
+    """
+    Enforces Macro-to-Micro Conservation:
+    1. Bounded Logistic Game-Script response.
+    2. Negative YPA drag under heavy trailing conditions.
+    3. Strict yardage-to-point elasticity floor (Gross Yards >= Implied Points * 12.5).
+    4. Closed-loop Dirichlet target tree and finite Poisson touchdown allocation.
+    """
+    base_plays = 63.5 * (implied_total / 22.0) ** 0.25
+
+    # 1. Bounded Logistic Script Function (Prevents Runaway Passing Volume)
+    # team_spread_margin: Positive = Leading, Negative = Trailing
+    script_logit = 1.0 / (1.0 + math.exp(0.12 * team_spread_margin))
+    pass_rate_base = 0.51 + (0.16 * script_logit)  # Bounded strictly within [0.51, 0.67]
+    scheme_tilt = 0.025 * (pass_edge - rush_edge)
+    pass_rate = max(0.48, min(0.68, pass_rate_base + scheme_tilt))
     run_rate = 1.0 - pass_rate
 
-    # TTP degradation compresses Yards Per Attempt (YPA)
-    base_ypa = 7.35 + (pass_edge * 2.8) + (ttp_shift * 0.85)
-    ypa = max(5.8, min(9.0, base_ypa))
+    # 2. Efficiency Conditioning with Trailing Script Drag
+    # Trailing offenses in obvious passing down scenarios face elevated sacks and MOFO shell containment
+    trailing_drag = 0.0 if team_spread_margin >= 0 else max(-0.85, team_spread_margin * 0.045)
+    base_ypa = 7.35 + (pass_edge * 2.8) + (ttp_shift * 0.85) + trailing_drag
+    ypa = max(5.8, min(8.8, base_ypa))
     ypc = max(3.4, min(5.4, 4.30 + (rush_edge * 2.2)))
 
-    gross_pass_mean = total_plays * pass_rate * ypa
-    gross_rush_mean = total_plays * run_rate * ypc
+    gross_pass_mean = base_plays * pass_rate * ypa
+    gross_rush_mean = base_plays * run_rate * ypc
+    gross_total_yards = gross_pass_mean + gross_rush_mean
 
-    team_td_budget = max(0.90, implied_total / 7.15)
-    pass_td_share = max(0.42, min(0.75, 0.58 + (pass_edge - rush_edge) * 0.15))
+    # 3. Macro-to-Micro Yardage Elasticity Enforcer (12.5 to 16.5 yards per point)
+    min_required_yards = implied_total * 12.5
+    max_allowable_yards = implied_total * 16.5
+
+    if gross_total_yards < min_required_yards:
+        scaling = min_required_yards / max(1.0, gross_total_yards)
+        gross_pass_mean *= scaling
+        gross_rush_mean *= scaling
+    elif gross_total_yards > max_allowable_yards:
+        scaling = max_allowable_yards / gross_total_yards
+        gross_pass_mean *= scaling
+        gross_rush_mean *= scaling
+
+    # 4. Finite Team Touchdown Budget
+    team_td_budget = max(0.85, (implied_total * 0.78) / 7.0)
+    pass_td_share = max(0.38, min(0.75, 0.58 + (pass_edge - rush_edge) * 0.15))
     team_pass_tds = team_td_budget * pass_td_share
     team_rush_tds = team_td_budget * (1.0 - pass_td_share)
 
-    target_weights = {"WR1": 0.27, "WR2": 0.18, "WR3": 0.12, "TE1": 0.20, "RB1": 0.12, "RB2": 0.05, "OTHER": 0.06}
-    ypt_multipliers = {"WR1": 1.16, "WR2": 1.05, "WR3": 0.95, "TE1": 0.92, "RB1": 0.62, "RB2": 0.55, "OTHER": 0.80}
+    # 5. Dirichlet Target Simplex Normalization
+    target_weights = {
+        "WR1": 0.27, "WR2": 0.18, "WR3": 0.12,
+        "TE1": 0.20, "RB1": 0.12, "RB2": 0.05, "OTHER": 0.06
+    }
+    ypt_multipliers = {
+        "WR1": 1.16, "WR2": 1.05, "WR3": 0.95,
+        "TE1": 0.92, "RB1": 0.62, "RB2": 0.55, "OTHER": 0.80
+    }
 
-    # Trench & Secondary Schematic Adaptations:
+    # Pass protection degradation pushes targets underneath
     if ttp_shift < -0.20:
-        # Pass protection collapse: checkdown expansion
         target_weights["RB1"] += 0.04
         target_weights["TE1"] += 0.03
         target_weights["WR2"] -= 0.04
         target_weights["WR3"] -= 0.03
 
+    # Opponent CB1 scratch expands boundary volume
     if mofo_shift > 0.10:
-        # Opponent secondary missing CB1: split safety shade opens boundary target volume
         target_weights["WR1"] += 0.04
         target_weights["WR2"] += 0.02
         target_weights["RB1"] -= 0.03
@@ -271,25 +295,34 @@ def generate_closed_loop_skill_projections(
                     target_weights[role_key] = float(counts[p_name])
 
     norm_factor = sum(target_weights.values())
-    norm_target_shares = {k: target_weights[k] / norm_factor for k in target_weights}
+    norm_targets = {k: target_weights[k] / norm_factor for k in target_weights}
 
-    weighted_rec = {k: norm_target_shares[k] * ypt_multipliers[k] for k in norm_target_shares}
+    weighted_rec = {k: norm_targets[k] * ypt_multipliers[k] for k in norm_targets}
     rec_sum = sum(weighted_rec.values())
     rec_yard_shares = {k: weighted_rec[k] / rec_sum for k in weighted_rec}
 
     rec_means = {k: gross_pass_mean * rec_yard_shares[k] for k in rec_yard_shares}
 
-    rb1_rush_mean = gross_rush_mean * 0.60
-    rb2_rush_mean = gross_rush_mean * 0.28
-    qb_rush_mean = gross_rush_mean * 0.08
+    # 6. Rushing Simplex Normalization
+    rb1_rush_mean = gross_rush_mean * 0.65
+    rb2_rush_mean = gross_rush_mean * 0.25
+    qb_rush_mean = gross_rush_mean * 0.10
 
-    rb1_td_lambda = (team_rush_tds * 0.65) + (team_pass_tds * (norm_target_shares["RB1"] * 0.55))
-    rb2_td_lambda = (team_rush_tds * 0.25) + (team_pass_tds * (norm_target_shares["RB2"] * 0.40))
-    qb_td_lambda = team_rush_tds * 0.10
-    wr1_td_lambda = team_pass_tds * (norm_target_shares["WR1"] * 1.30)
-    wr2_td_lambda = team_pass_tds * (norm_target_shares["WR2"] * 1.05)
-    wr3_td_lambda = team_pass_tds * (norm_target_shares["WR3"] * 0.80)
-    te1_td_lambda = team_pass_tds * (norm_target_shares["TE1"] * 1.25)
+    # 7. High-Value Touch (HVT) Partitioned Touchdown Lambdas
+    lambdas = {
+        "QB1": team_rush_tds * 0.10,
+        "RB1": (team_rush_tds * 0.65) + (team_pass_tds * (norm_targets["RB1"] * 0.60)),
+        "RB2": (team_rush_tds * 0.25) + (team_pass_tds * (norm_targets["RB2"] * 0.40)),
+        "WR1": team_pass_tds * (norm_targets["WR1"] * 1.25),
+        "WR2": team_pass_tds * (norm_targets["WR2"] * 1.05),
+        "WR3": team_pass_tds * (norm_targets["WR3"] * 0.80),
+        "TE1": team_pass_tds * (norm_targets["TE1"] * 1.20),
+    }
+
+    # Normalize lambdas to strictly equal team touchdown capacity
+    sum_lambdas = sum(lambdas.values())
+    lambda_scale = team_td_budget / max(0.01, sum_lambdas)
+    norm_lambdas = {k: lambdas[k] * lambda_scale for k in lambdas}
 
     def calc_anytime_td(lam: float) -> float:
         return round(float((1.0 - math.exp(-max(0.001, lam))) * 100.0), 1)
@@ -325,13 +358,13 @@ def generate_closed_loop_skill_projections(
     te1_rec = convert_mean_to_median(rec_means["TE1"], "TE_Rec")
 
     return [
-        build_entry("WR1", depth_names.get("WR1", f"{team_abbr} WR1"), "Rec Yds", wr1_rec, 0.0, 0.0, wr1_rec, wr1_td_lambda),
-        build_entry("WR2", depth_names.get("WR2", f"{team_abbr} WR2"), "Rec Yds", wr2_rec, 0.0, 0.0, wr2_rec, wr2_td_lambda),
-        build_entry("WR3", depth_names.get("WR3", f"{team_abbr} WR3"), "Rec Yds", wr3_rec, 0.0, 0.0, wr3_rec, wr3_td_lambda),
-        build_entry("TE1", depth_names.get("TE1", f"{team_abbr} TE1"), "Rec Yds", te1_rec, 0.0, 0.0, te1_rec, te1_td_lambda),
-        build_entry("RB1", depth_names.get("RB1", f"{team_abbr} RB1"), "Rush Yds", rb1_rush, 0.0, rb1_rush, rb1_rec, rb1_td_lambda),
-        build_entry("RB2", depth_names.get("RB2", f"{team_abbr} RB2"), "Rush Yds", rb2_rush, 0.0, rb2_rush, rb2_rec, rb2_td_lambda),
-        build_entry("QB1", depth_names.get("QB1", f"{team_abbr} QB"), "Pass Yds", qb_pass, qb_pass, qb_rush, 0.0, qb_td_lambda),
+        build_entry("WR1", depth_names.get("WR1", f"{team_abbr} WR1"), "Rec Yds", wr1_rec, 0.0, 0.0, wr1_rec, norm_lambdas["WR1"]),
+        build_entry("WR2", depth_names.get("WR2", f"{team_abbr} WR2"), "Rec Yds", wr2_rec, 0.0, 0.0, wr2_rec, norm_lambdas["WR2"]),
+        build_entry("WR3", depth_names.get("WR3", f"{team_abbr} WR3"), "Rec Yds", wr3_rec, 0.0, 0.0, wr3_rec, norm_lambdas["WR3"]),
+        build_entry("TE1", depth_names.get("TE1", f"{team_abbr} TE1"), "Rec Yds", te1_rec, 0.0, 0.0, te1_rec, norm_lambdas["TE1"]),
+        build_entry("RB1", depth_names.get("RB1", f"{team_abbr} RB1"), "Rush Yds", rb1_rush, 0.0, rb1_rush, rb1_rec, norm_lambdas["RB1"]),
+        build_entry("RB2", depth_names.get("RB2", f"{team_abbr} RB2"), "Rush Yds", rb2_rush, 0.0, rb2_rush, rb2_rec, norm_lambdas["RB2"]),
+        build_entry("QB1", depth_names.get("QB1", f"{team_abbr} QB"), "Pass Yds", qb_pass, qb_pass, qb_rush, 0.0, norm_lambdas["QB1"]),
     ]
 
 # -------------------------------------------------------------------------
@@ -502,10 +535,9 @@ def resolve_autonomous_depth_chart(team_abbr: str, target_week: int) -> Dict[str
             if full_name.lower() in assigned_players:
                 continue
 
-            # Autonomous Inactive Cascade: pop scratched starters (IR/PUP/OUT)
             status_meta = team_injuries.get(full_name, {"status": "ACTIVE", "is_out": False})
             if status_meta["is_out"]:
-                logging.info(f"SCRATCH PRUNED: {team_abbr} {pos} {full_name} is [{status_meta['status']}]. Cascading depth.")
+                logging.info(f"SCRATCH PRUNED: {team_abbr} {pos} {full_name} is [{status_meta['status']}]. Cascading next-man-up.")
                 continue
 
             healthy_candidates.append(full_name)
@@ -520,10 +552,6 @@ def resolve_autonomous_depth_chart(team_abbr: str, target_week: int) -> Dict[str
     return picks
 
 def quantify_unit_level_injuries(home_team: str, away_team: str) -> Dict[str, Any]:
-    """
-    Evaluates defensive front-7, secondary, and offensive line scratches
-    to quantify net TTP shifts, box fit leaks, and EPA drift.
-    """
     net_spread_shift = 0.0
     net_total_shift = 0.0
     pass_epa_shift = 0.0
@@ -571,24 +599,19 @@ def quantify_unit_level_injuries(home_team: str, away_team: str) -> Dict[str, An
     }
 
 # -------------------------------------------------------------------------
-# 5. Gemini 3.8 Flash Scouting Engine (Exact Research Director Persona)
+# 5. Gemini 3.8 Flash Scouting Engine (Operational Protocols)
 # -------------------------------------------------------------------------
 RESEARCH_DIRECTOR_SYSTEM_PROMPT = """# ROLE & IDENTITY
-You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling. You possess complete domain authority over offensive and defensive playbooks, scheme-on-scheme mechanics, Bayesian calibration, and automated AI evaluation.
+You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
 
-Your dual mandate:
-1. Deliver razor-sharp, objective, and analytically grounded NFL football breakdowns.
-2. Serve as an expert AI evaluator: Continuously audit user-submitted AI prompts, analytical frameworks, statistical models, and projection logic to eliminate statistical noise, correct proxy errors, and enforce production-grade quantitative rigor.
-
-## OPERATIONAL INVARIANTS
-* Trench & Pocket Physics: Time-to-Pressure (TTP) vs. Time-to-Throw (TTT) determines pocket degradation. If TTP < TTT, evaluate pocket mobility archetype. Immobile pocket passers collapse under duress (P2S > 20%); dual threats convert pressure into scramble EPA or extended attempts.
-* Run-Fit Geometry:
-  - Gap / Duo / Power creates vertical displacement via double-teams. Exploits light nickel boxes (6-man fronts); neutralized by Odd 3-4 fronts with 0/1-technique two-gapping interior tackles.
-  - Wide / Outside Zone creates horizontal flow to stress edge contain. Neutralized by Wide-9 alignments and disciplined C-gap setters.
-* Coverage Shell Conditioning: Defenses do not play static coverage rates; coverage shell distributions are conditioned on offensive personnel groupings (11 vs. 12/21 personnel).
-  - MOFC (Cover 1 / Cover 3): Single-high safety; leaves perimeter 1-on-1s; vulnerable to intermediate Dagger concepts, crossers, and deep seam shots.
-  - MOFO (Cover 2 / Quarters / Cover 6): Split safeties; caps vertical boundary routes; vulnerable to underneath checkdowns and intermediate hole shots.
-* Output strictly valid JSON matching the target schema without markdown wrappers."""
+## OPERATIONAL PROTOCOLS
+* Lead with the core strategic conclusion in the first 1-2 sentences.
+* Time-to-Pressure (TTP) vs. Time-to-Throw (TTT) determines pocket degradation. If TTP < TTT, evaluate pocket mobility archetype. Immobile pocket passers collapse under duress (P2S > 20%); dual threats convert pressure into scramble EPA.
+* Gap / Duo / Power creates vertical displacement via double-teams. Exploits light nickel boxes (6-man fronts); neutralized by Odd 3-4 fronts with 0/1-technique two-gapping interior tackles.
+* Wide / Outside Zone creates horizontal flow to stress edge contain. Neutralized by Wide-9 alignments and disciplined C-gap setters.
+* MOFC (Cover 1 / Cover 3) leaves perimeter 1-on-1s on the boundary; vulnerable to intermediate Dagger concepts, crossers, and deep seam shots.
+* MOFO (Cover 2 / Quarters / Cover 6) caps vertical boundary routes; vulnerable to underneath checkdowns, intermediate hole shots, and gap runs vs light boxes.
+* Output strictly valid JSON matching the schema without markdown formatting backticks."""
 
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     verdict_str = f"Bet {recommended_line} - {kelly_units:.2f}u" if recommended_team != "PASS" and kelly_units > 0.0 else "PASS - 0.00u"
@@ -637,7 +660,7 @@ Output strictly valid JSON matching this schema:
         home_team = payload["matchup_context"]["home_team"]
 
         fallback = {
-            "executive_summary": f"Line-of-scrimmage leverage establishes foundational value on {recommended_line}. Neutral-down efficiency dictates drive sustainability.",
+            "executive_summary": f"Line-of-scrimmage leverage establishes foundational execution value on {recommended_line}. Neutral-down efficiency dictates drive sustainability.",
             "schematic_matchup": {
                 "away_offense_vs_home_defense": f"{away_team} must establish interior run push to keep pass protection ahead of down-and-distance against {home_team}'s front seven.",
                 "home_offense_vs_away_defense": f"{home_team} establishes early-down rushing tempo to stress {away_team}'s edge contain, opening vertical crossing lanes."
@@ -683,7 +706,7 @@ async def main():
         def get_stat(df, col, default=0.0):
             return float(df[col].values[0]) if not df.empty and col in df.columns and pd.notna(df[col].values[0]) else float(default)
 
-        # Base Opponent-Cross Subtraction (Synchronized with train_model.py)
+        # Base Opponent-Cross Subtraction: (off_home - def_away) - (off_away - def_home)
         net_pass_edge = (get_stat(home_row, "roll_off_dropback_epa") - get_stat(away_row, "roll_def_dropback_epa")) - \
                         (get_stat(away_row, "roll_off_dropback_epa") - get_stat(home_row, "roll_def_dropback_epa"))
         net_rush_edge = (get_stat(home_row, "roll_off_rush_epa") - get_stat(away_row, "roll_def_rush_epa")) - \
@@ -699,7 +722,6 @@ async def main():
         # Multi-Tier Holistic Unit Injury Quantification (Trench, Secondary, OL)
         injury_shifts = quantify_unit_level_injuries(home_team, away_team)
         
-        # Apply injury adjustments to market lines and EPA
         adjusted_spread_line = raw_spread_line + injury_shifts["spread_shift"]
         adjusted_total_line = max(33.0, raw_total_line + injury_shifts["total_shift"])
         net_pass_edge += injury_shifts["pass_epa_shift"]
