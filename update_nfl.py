@@ -1,6 +1,13 @@
 """
-update_nfl.py - Production Pipeline Orchestrator with Strict Directional Consistency,
-Poisson TD Normalization, Closed-Loop Volume Conservation, and Neon PostgreSQL Synchronization.
+update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
+Features:
+- Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
+- Powered by Gemini 3.8 Flash (gemini-3.8-flash) via Google GenAI SDK.
+- Directionally invariant spread and implied total resolution (eliminating team inversions).
+- Closed-loop Dirichlet target-tree volume conservation (Sum of Rec Means == Gross Pass Mean).
+- Dynamic team-specific Poisson touchdown budgeting (breaking hardcoded mirrored lambdas).
+- Dynamic booster schema inspection preventing feature_names mismatch errors.
+- Auto-migrating Neon PostgreSQL persistence.
 """
 import asyncio
 import json
@@ -17,7 +24,7 @@ from sqlalchemy import create_engine, text
 import xgboost as xgb
 
 # -------------------------------------------------------------------------
-# 1. Environment & Client Initialization
+# 1. Environment Verification & Client Initialization
 # -------------------------------------------------------------------------
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -55,12 +62,27 @@ def clean_team_abbr(team_str):
     return TEAM_ABBR_MAP.get(cleaned, cleaned)
 
 # -------------------------------------------------------------------------
-# 2. Strict Directional Discrete Score Generation Engine
+# 2. Strict Directional Scoring Engine
 # -------------------------------------------------------------------------
+def resolve_directional_market_context(total_line: float, home_spread_line: float) -> tuple[float, float, float, float]:
+    """
+    home_spread_line: Negative indicates Home is favored (e.g., DET -9.5).
+    Returns:
+        (projected_home_margin, implied_home_total, implied_away_total, market_home_prob)
+    """
+    projected_home_margin = -home_spread_line
+    implied_home = (total_line + projected_home_margin) / 2.0
+    implied_away = (total_line - projected_home_margin) / 2.0
+
+    sigma = 13.45 * math.sqrt(max(32.0, total_line) / 44.0)
+    market_home_prob = float(norm.cdf(projected_home_margin / sigma))
+
+    return projected_home_margin, round(implied_home, 2), round(implied_away, 2), market_home_prob
+
 def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> tuple[int, int]:
     """
     Snaps continuous projected margin (Home - Away) to discrete NFL key numbers.
-    Enforces that home favorites (projected_margin > 0) MUST have pred_home > pred_away.
+    Strict Invariant: If projected_margin > 0, home team MUST win (home_score > away_score).
     """
     effective_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
     home_favored = effective_margin > 0.0
@@ -70,17 +92,16 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
     raw_home = (total_line + (selected_discrete_margin if home_favored else -selected_discrete_margin)) / 2.0
     raw_away = (total_line - (selected_discrete_margin if home_favored else -selected_discrete_margin)) / 2.0
 
-    best_pair = (24, 21) if home_favored else (21, 24)
+    best_pair = (27, 17) if home_favored else (17, 27)
     min_loss = float("inf")
 
-    candidate_home = [s for s in COMMON_TEAM_SCORES if abs(s - raw_home) <= 7.0] or [int(round(raw_home))]
-    candidate_away = [s for s in COMMON_TEAM_SCORES if abs(s - raw_away) <= 7.0] or [int(round(raw_away))]
+    candidate_home = [s for s in COMMON_TEAM_SCORES if abs(s - raw_home) <= 6.5] or [int(round(raw_home))]
+    candidate_away = [s for s in COMMON_TEAM_SCORES if abs(s - raw_away) <= 6.5] or [int(round(raw_away))]
 
     for h in candidate_home:
         for a in candidate_away:
             if h == a:
                 continue
-            # Directional Invariant Enforcement
             if home_favored and h <= a:
                 continue
             if not home_favored and a <= h:
@@ -99,7 +120,7 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
     return int(best_pair[0]), int(best_pair[1])
 
 # -------------------------------------------------------------------------
-# 3. Closed-Loop Skill Volume & Normalized Poisson TD Engine
+# 3. Organic Skill Volume Allocation & Touchdown Capacity Budgeting
 # -------------------------------------------------------------------------
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
@@ -115,130 +136,111 @@ def convert_mean_to_median(mean_val: float, role_key: str, custom_sigma: float =
 def generate_closed_loop_skill_projections(
     team_abbr: str, 
     implied_total: float, 
-    spread_line: float,
+    team_spread_margin: float,  # Positive = favored, Negative = trailing
     pass_edge: float, 
     rush_edge: float, 
     depth_names: dict,
-    qb_sigma: float = 0.32,
-    opp_is_mofo_heavy: bool = False
+    qb_sigma: float = 0.32
 ) -> list:
-    total_plays = 63.0 * (implied_total / 22.0) ** 0.30
-    script_shift = -0.012 * spread_line
-    scheme_shift = 0.04 * (pass_edge - rush_edge)
-    pass_rate = max(0.44, min(0.72, 0.585 + script_shift + scheme_shift))
+    """
+    Organic volume allocation preserving balanced run/pass ratios, closed target trees,
+    and team-specific touchdown budgets.
+    """
+    total_plays = 63.5 * (implied_total / 22.0) ** 0.25
+    
+    # Script adjustments: favorites run moderately more, trailing teams pass moderately more
+    script_shift = -0.007 * team_spread_margin
+    scheme_shift = 0.025 * (pass_edge - rush_edge)
+    pass_rate = max(0.48, min(0.66, 0.575 + script_shift + scheme_shift))
     run_rate = 1.0 - pass_rate
 
-    team_gross_pass = max(100.0, total_plays * pass_rate * max(5.2, min(9.4, 7.15 + (pass_edge * 3.5))))
-    team_gross_rush = max(50.0, total_plays * run_rate * max(3.1, min(5.6, 4.25 + (rush_edge * 2.8))))
+    ypa = max(6.0, min(9.0, 7.35 + (pass_edge * 2.8)))
+    ypc = max(3.4, min(5.4, 4.30 + (rush_edge * 2.2)))
 
-    # Conservation of Touchdown Capacity (Lambda Budget)
-    team_td_budget = max(0.8, implied_total / 7.15)
-    pass_td_share = max(0.40, min(0.85, 0.65 + (pass_edge - rush_edge) * 0.25))
+    gross_pass_mean = total_plays * pass_rate * ypa
+    gross_rush_mean = total_plays * run_rate * ypc
+
+    # Touchdown budget bound to team scoring capacity
+    team_td_budget = max(0.90, implied_total / 7.15)
+    pass_td_share = max(0.42, min(0.75, 0.58 + (pass_edge - rush_edge) * 0.15))
     team_pass_tds = team_td_budget * pass_td_share
     team_rush_tds = team_td_budget * (1.0 - pass_td_share)
 
-    qb_mean_rush = team_gross_rush * 0.12
-    rb1_mean_rush = team_gross_rush * 0.58
-    rb2_mean_rush = team_gross_rush * 0.24
-
-    # Initial Lambda Estimates
-    qb_raw_td = team_rush_tds * 0.15
-    rb1_raw_rush_td = team_rush_tds * 0.60
-    rb2_raw_rush_td = team_rush_tds * 0.20
-
-    if opp_is_mofo_heavy:
-        raw_target_weights = {"WR1": 0.22, "WR2": 0.16, "WR3": 0.11, "TE1": 0.24, "RB1": 0.15, "RB2": 0.06, "OTHER": 0.06}
-    else:
-        raw_target_weights = {"WR1": 0.28, "WR2": 0.19, "WR3": 0.12, "TE1": 0.18, "RB1": 0.12, "RB2": 0.05, "OTHER": 0.06}
-
-    w_sum = sum(raw_target_weights.values())
-    target_shares = {k: v / w_sum for k, v in raw_target_weights.items()}
-
-    depth_multipliers = {"WR1": 1.18, "WR2": 1.10, "WR3": 0.95, "TE1": 0.92, "RB1": 0.64, "RB2": 0.58, "OTHER": 0.85}
-    raw_weighted = {k: target_shares[k] * depth_multipliers[k] for k in target_shares}
-    rec_norm = sum(raw_weighted.values())
-    rec_shares = {k: raw_weighted[k] / rec_norm for k in raw_weighted}
-
-    wr1_mean_rec = team_gross_pass * rec_shares["WR1"]
-    wr2_mean_rec = team_gross_pass * rec_shares["WR2"]
-    wr3_mean_rec = team_gross_pass * rec_shares["WR3"]
-    te1_mean_rec = team_gross_pass * rec_shares["TE1"]
-    rb1_mean_rec = team_gross_pass * rec_shares["RB1"]
-    rb2_mean_rec = team_gross_pass * rec_shares["RB2"]
-
-    rz_weights = {
-        "WR1": target_shares["WR1"] * 1.25, "WR2": target_shares["WR2"] * 1.05,
-        "WR3": target_shares["WR3"] * 0.85, "TE1": target_shares["TE1"] * 1.30,
-        "RB1": target_shares["RB1"] * 0.60, "RB2": target_shares["RB2"] * 0.40, "OTHER": 0.50
+    # Closed-Loop Target Tree Dirichlet Simplex
+    target_shares = {
+        "WR1": 0.26, "WR2": 0.18, "WR3": 0.12, "TE1": 0.20, "RB1": 0.12, "RB2": 0.06, "OTHER": 0.06
     }
-    rz_norm = sum(rz_weights.values())
-    rec_td_shares = {k: rz_weights[k] / rz_norm for k in rz_weights}
-
-    # Strict Lambda Budget Normalization to Team Total Capacity
-    raw_lambdas = {
-        "QB1": qb_raw_td,
-        "RB1": rb1_raw_rush_td + (team_pass_tds * rec_td_shares["RB1"]),
-        "RB2": rb2_raw_rush_td + (team_pass_tds * rec_td_shares["RB2"]),
-        "WR1": team_pass_tds * rec_td_shares["WR1"],
-        "WR2": team_pass_tds * rec_td_shares["WR2"],
-        "WR3": team_pass_tds * rec_td_shares["WR3"],
-        "TE1": team_pass_tds * rec_td_shares["TE1"]
+    ypt_multipliers = {
+        "WR1": 1.16, "WR2": 1.05, "WR3": 0.95, "TE1": 0.92, "RB1": 0.62, "RB2": 0.55, "OTHER": 0.80
     }
-    total_raw_lambda = sum(raw_lambdas.values())
-    lambda_scale = (team_td_budget * 0.92) / max(0.01, total_raw_lambda)  # Retain residual for depth/special teams
-    norm_lambdas = {k: max(0.01, v * lambda_scale) for k, v in raw_lambdas.items()}
+    weighted_rec = {k: target_shares[k] * ypt_multipliers[k] for k in target_shares}
+    norm_factor = sum(weighted_rec.values())
+    rec_yard_shares = {k: weighted_rec[k] / norm_factor for k in weighted_rec}
 
-    def calc_anytime_td_prob(exp_td):
-        return round(float((1.0 - poisson.pmf(0, exp_td)) * 100.0), 1)
+    # Derive Mean Yards: Sum of parts strictly equals gross team pass volume
+    rec_means = {k: gross_pass_mean * rec_yard_shares[k] for k in rec_yard_shares}
+
+    # Rushing distribution
+    rb1_rush_mean = gross_rush_mean * 0.60
+    rb2_rush_mean = gross_rush_mean * 0.28
+    qb_rush_mean = gross_rush_mean * 0.08
+
+    # Dynamic Touchdown Lambdas
+    rb1_td_lambda = (team_rush_tds * 0.65) + (team_pass_tds * (target_shares["RB1"] * 0.55))
+    rb2_td_lambda = (team_rush_tds * 0.25) + (team_pass_tds * (target_shares["RB2"] * 0.40))
+    qb_td_lambda = team_rush_tds * 0.10
+    wr1_td_lambda = team_pass_tds * (target_shares["WR1"] * 1.30)
+    wr2_td_lambda = team_pass_tds * (target_shares["WR2"] * 1.05)
+    wr3_td_lambda = team_pass_tds * (target_shares["WR3"] * 0.80)
+    te1_td_lambda = team_pass_tds * (target_shares["TE1"] * 1.25)
+
+    def calc_anytime_td(lam: float) -> float:
+        return round(float((1.0 - math.exp(-max(0.001, lam))) * 100.0), 1)
 
     return [
         {
             "role": "QB1", "player": depth_names.get("QB1", f"{team_abbr} QB"),
-            "pass_yards": convert_mean_to_median(team_gross_pass, "QB_Pass", custom_sigma=qb_sigma),
-            "rush_yards": convert_mean_to_median(qb_mean_rush, "QB_Rush"),
+            "pass_yards": convert_mean_to_median(gross_pass_mean, "QB_Pass", custom_sigma=qb_sigma),
+            "rush_yards": convert_mean_to_median(qb_rush_mean, "QB_Rush"),
             "rec_yards": 0.0, "projected_pass_tds": round(team_pass_tds, 2),
-            "total_tds": round(norm_lambdas["QB1"], 2), "anytime_td_prob": calc_anytime_td_prob(norm_lambdas["QB1"])
+            "total_tds": round(qb_td_lambda, 2), "anytime_td_prob": calc_anytime_td(qb_td_lambda)
         },
         {
             "role": "RB1", "player": depth_names.get("RB1", f"{team_abbr} RB1"),
-            "pass_yards": 0.0, "rush_yards": convert_mean_to_median(rb1_mean_rush, "RB_Rush"),
-            "rec_yards": convert_mean_to_median(rb1_mean_rec, "RB_Rec"), "projected_pass_tds": 0.0,
-            "total_tds": round(norm_lambdas["RB1"], 2), "anytime_td_prob": calc_anytime_td_prob(norm_lambdas["RB1"])
+            "pass_yards": 0.0, "rush_yards": convert_mean_to_median(rb1_rush_mean, "RB_Rush"),
+            "rec_yards": convert_mean_to_median(rec_means["RB1"], "RB_Rec"), "projected_pass_tds": 0.0,
+            "total_tds": round(rb1_td_lambda, 2), "anytime_td_prob": calc_anytime_td(rb1_td_lambda)
         },
         {
             "role": "RB2", "player": depth_names.get("RB2", f"{team_abbr} RB2"),
-            "pass_yards": 0.0, "rush_yards": convert_mean_to_median(rb2_mean_rush, "RB_Rush"),
-            "rec_yards": convert_mean_to_median(rb2_mean_rec, "RB_Rec"), "projected_pass_tds": 0.0,
-            "total_tds": round(norm_lambdas["RB2"], 2), "anytime_td_prob": calc_anytime_td_prob(norm_lambdas["RB2"])
+            "pass_yards": 0.0, "rush_yards": convert_mean_to_median(rb2_rush_mean, "RB_Rush"),
+            "rec_yards": convert_mean_to_median(rec_means["RB2"], "RB_Rec"), "projected_pass_tds": 0.0,
+            "total_tds": round(rb2_td_lambda, 2), "anytime_td_prob": calc_anytime_td(rb2_td_lambda)
         },
         {
             "role": "WR1", "player": depth_names.get("WR1", f"{team_abbr} WR1"),
-            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr1_mean_rec, "WR_Rec"),
-            "projected_pass_tds": 0.0, "total_tds": round(norm_lambdas["WR1"], 2),
-            "anytime_td_prob": calc_anytime_td_prob(norm_lambdas["WR1"])
+            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(rec_means["WR1"], "WR_Rec"),
+            "projected_pass_tds": 0.0, "total_tds": round(wr1_td_lambda, 2), "anytime_td_prob": calc_anytime_td(wr1_td_lambda)
         },
         {
             "role": "WR2", "player": depth_names.get("WR2", f"{team_abbr} WR2"),
-            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr2_mean_rec, "WR_Rec"),
-            "projected_pass_tds": 0.0, "total_tds": round(norm_lambdas["WR2"], 2),
-            "anytime_td_prob": calc_anytime_td_prob(norm_lambdas["WR2"])
+            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(rec_means["WR2"], "WR_Rec"),
+            "projected_pass_tds": 0.0, "total_tds": round(wr2_td_lambda, 2), "anytime_td_prob": calc_anytime_td(wr2_td_lambda)
         },
         {
             "role": "WR3", "player": depth_names.get("WR3", f"{team_abbr} WR3"),
-            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(wr3_mean_rec, "WR_Rec"),
-            "projected_pass_tds": 0.0, "total_tds": round(norm_lambdas["WR3"], 2),
-            "anytime_td_prob": calc_anytime_td_prob(norm_lambdas["WR3"])
+            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(rec_means["WR3"], "WR_Rec"),
+            "projected_pass_tds": 0.0, "total_tds": round(wr3_td_lambda, 2), "anytime_td_prob": calc_anytime_td(wr3_td_lambda)
         },
         {
             "role": "TE1", "player": depth_names.get("TE1", f"{team_abbr} TE1"),
-            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(te1_mean_rec, "TE_Rec"),
-            "projected_pass_tds": 0.0, "total_tds": round(norm_lambdas["TE1"], 2),
-            "anytime_td_prob": calc_anytime_td_prob(norm_lambdas["TE1"])
+            "pass_yards": 0.0, "rush_yards": 0.0, "rec_yards": convert_mean_to_median(rec_means["TE1"], "TE_Rec"),
+            "projected_pass_tds": 0.0, "total_tds": round(te1_td_lambda, 2), "anytime_td_prob": calc_anytime_td(te1_td_lambda)
         },
     ]
 
 # -------------------------------------------------------------------------
-# 4. Ingestion & Dynamic Roster Resolution
+# 4. Multi-Source Ingestion & Dynamic Roster Resolution
 # -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
@@ -428,7 +430,7 @@ def resolve_active_depth_chart(team_abbr: str, target_week: int) -> dict:
     return picks
 
 # -------------------------------------------------------------------------
-# 5. Gemini 3.8 Flash Scouting Engine
+# 5. Gemini 3.8 Flash Scouting Engine (Full Dual-Mandate Integration)
 # -------------------------------------------------------------------------
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     system_prompt = """
@@ -521,7 +523,7 @@ async def main():
         print("No active unplayed slate found.")
         sys.exit(0)
 
-    print(f"Executing Season {target_season} Week {target_week} Quant Pipeline ({len(upcoming)} matchups)...")
+    print(f"Executing Season {target_season} Week {target_week} Quant Pipeline ({len(upcoming)} matchups) via Gemini 3.8 Flash...")
     pre_processed = []
 
     for _, game in upcoming.iterrows():
@@ -530,7 +532,6 @@ async def main():
         matchup = f"{away_team} @ {home_team}"
         week_num = int(game["week"]) if pd.notna(game["week"]) else target_week
 
-        # Market Conventions: spread_line is Home Spread (e.g., -9.5 means Home is favored by 9.5)
         raw_spread_line = float(game["spread_line"]) if pd.notna(game.get("spread_line")) else 0.0
         raw_total_line = float(game["total_line"]) if pd.notna(game.get("total_line")) else 44.0
 
@@ -552,8 +553,10 @@ async def main():
         rest_diff = float(game.get("home_rest", 7.0) or 7.0) - float(game.get("away_rest", 7.0) or 7.0)
         is_divisional = int(game.get("div_game", 0) or 0)
 
+        # Directional Invariant Resolution
         spread_line = raw_spread_line
         total_line = raw_total_line
+        projected_home_margin, implied_home_total, implied_away_total, raw_market_prob = resolve_directional_market_context(total_line, spread_line)
 
         home_ml = float(game["home_moneyline"]) if pd.notna(game.get("home_moneyline")) else None
         away_ml = float(game["away_moneyline"]) if pd.notna(game.get("away_moneyline")) else None
@@ -561,9 +564,9 @@ async def main():
         if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
             p_h = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
             p_a = 100.0 / (away_ml + 100.0) if away_ml > 0 else abs(away_ml) / (abs(away_ml) + 100.0)
-            market_home_prob = float(p_h / (p_h + p_a)) if (p_h + p_a) > 0 else 0.50
+            market_home_prob = float(p_h / (p_h + p_a)) if (p_h + p_a) > 0 else raw_market_prob
         else:
-            market_home_prob = float(norm.cdf(-spread_line / 13.45))
+            market_home_prob = raw_market_prob
 
         feature_dict = {
             "net_pass_edge": net_pass_edge,
@@ -587,18 +590,17 @@ async def main():
         else:
             calibrated_home_win_prob = (0.50 * raw_model_prob) + (0.50 * market_home_prob)
 
-        # Projected Margin: positive indicates Home is favored
         sigma = 13.45 * math.sqrt(max(32.0, total_line) / 44.0)
         z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
-        projected_margin = z_win * sigma
+        model_projected_margin = z_win * sigma
 
-        # Project Discrete Scores strictly adhering to directionality
-        pred_home_score, pred_away_score = project_discrete_nfl_scores(projected_margin, total_line)
+        # Discrete Scores (Directionally Locked)
+        pred_home_score, pred_away_score = project_discrete_nfl_scores(model_projected_margin, total_line)
         pred_total_score = pred_home_score + pred_away_score
 
-        # Spread Covering Math (Spread is negative for home favorite, e.g., -9.5)
-        # Home covers if (pred_home - pred_away) > -spread_line (i.e. margin + spread_line > 0)
-        z_cover_home = (projected_margin + spread_line) / sigma
+        # Spread Covering Math (Spread is negative for home favorite, e.g. -9.5)
+        # Home covers if margin + spread_line > 0
+        z_cover_home = (model_projected_margin + spread_line) / sigma
         home_cover = float(norm.cdf(z_cover_home))
         away_cover = 1.0 - home_cover
 
@@ -625,17 +627,15 @@ async def main():
         q = max(0.0, 1.0 - cover_prob)
         kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" else 0.0
 
-        implied_home_total = (total_line / 2.0) - (spread_line / 2.0)
-        implied_away_total = (total_line / 2.0) + (spread_line / 2.0)
-
         home_depth = resolve_active_depth_chart(home_team, week_num)
         away_depth = resolve_active_depth_chart(away_team, week_num)
 
+        # Skill projections with team-specific margin edge (DET: +model_margin, NO: -model_margin)
         home_skills = generate_closed_loop_skill_projections(
-            home_team, implied_home_total, spread_line, net_pass_edge, net_rush_edge, home_depth
+            home_team, implied_home_total, model_projected_margin, net_pass_edge, net_rush_edge, home_depth
         )
         away_skills = generate_closed_loop_skill_projections(
-            away_team, implied_away_total, -spread_line, -net_pass_edge, -net_rush_edge, away_depth
+            away_team, implied_away_total, -model_projected_margin, -net_pass_edge, -net_rush_edge, away_depth
         )
 
         home_roster_summary = {p["role"]: p["player"] for p in home_skills}
