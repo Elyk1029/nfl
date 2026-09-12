@@ -3,8 +3,7 @@ app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
 Features:
 - Self-contained discrete scoring math engine (strictly directionally locked).
 - Live Sportsbook Prop Comparison Engine (Model Median vs. Vegas Prop Line, Delta, Over/Under signal).
-- Eliminates logic paradoxes: Detroit home favorite strictly yields Detroit win and positive margin.
-- Resilient Historical Simulation Module with robust nflreadpy namespace scoping.
+- Scoped nflreadpy import inside load_historical_fixtures, resolving NameError in caching layer.
 - Powered by Gemini 3.8 Flash (gemini-3.8-flash) for Guru Evaluation & Anonymized Simulations.
 """
 import os
