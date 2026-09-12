@@ -1,21 +1,25 @@
 """
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
-- Autonomous live injury polling via autonomous_roster_engine: cascades depth charts
-  when players are marked OUT, IR, PUP, or DOUBTFUL (zero manual player overrides).
-- Opponent-adjusted Net EPA formula synchronized with training:
-  net_edge = (off_home - def_away) - (off_away - def_home).
-- Canonical market spread alignment: spread_line > 0 strictly designates Home Favorite.
-- Dirichlet target tree volume conservation: Sum of Rec Means == Gross Pass Mean.
-- Team-budgeted Poisson TD allocation bound to implied scoring capacity.
-- Full sportsbook benchmark schema serialization to Neon PostgreSQL.
+- Full Multi-Tier Injury Engine: Evaluates QB, OL (LT/RT/C), Secondary (CB1/CB2/FS),
+  Front-7 (EDGE/IDL), and Skill injuries to dynamically adjust spreads, totals, TTP, and shell distributions.
+- Autonomous Roster Cascading: Live ingestion of league injury wires; prunes IR/PUP/OUT scratches.
+- Strict Opponent-Cross EPA Mathematics: (off_home - def_away) - (off_away - def_home).
+- Canonical Spread Alignment: spread_line > 0 strictly designates Home Favorite.
+- Closed-Loop Dirichlet Target Tree Simplex: Sum of Rec Means == Gross Team Pass Mean.
+- Log-Normal Median Conversions: m = mu * exp(-sigma^2 / 2).
+- Team-Budgeted Poisson TD Allocation bound to Implied Total / 7.15.
+- Research Director & Quantitative Architect System Prompt embedded via Gemini 3.8 Flash.
+- Auto-Migrating Neon PostgreSQL Persistence.
 """
 import asyncio
+import difflib
 import json
+import logging
 import math
 import os
 import sys
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from google import genai
 from google.genai import types
@@ -26,10 +30,10 @@ from scipy.stats import norm, poisson
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
-from autonomous_roster_engine import AutonomousNFLRosterEngine
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -------------------------------------------------------------------------
-# 1. Environment & Database Configuration
+# 1. Environment Verification & Client Initialization
 # -------------------------------------------------------------------------
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
@@ -45,7 +49,7 @@ model = xgb.XGBClassifier()
 if os.path.exists(MODEL_FILE):
     model.load_model(MODEL_FILE)
     BOOSTER_FEATURES = model.get_booster().feature_names
-    print(f"XGBoost classifier loaded successfully. Booster features: {BOOSTER_FEATURES}")
+    logging.info(f"XGBoost booster verified. Features: {BOOSTER_FEATURES}")
 else:
     raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
 
@@ -59,16 +63,65 @@ NFL_KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
 COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
 
+INACTIVE_STATUS_DESIGNATIONS: Set[str] = {
+    "OUT", "IR", "INJURED RESERVE", "PUP", "RESERVE/PUP",
+    "NFI", "NON-FOOTBALL INJURY", "DOUBTFUL", "SUSPENDED"
+}
+
+STATUS_PROBABILITY_WEIGHTS: Dict[str, float] = {
+    "OUT": 0.00,
+    "IR": 0.00,
+    "PUP": 0.00,
+    "DOUBTFUL": 0.05,
+    "QUESTIONABLE_DNP": 0.25,
+    "QUESTIONABLE_LP": 0.55,
+    "QUESTIONABLE_FP": 0.85,
+    "QUESTIONABLE": 0.60,
+    "ACTIVE": 1.00,
+    "HEALTHY": 1.00
+}
+
+# Empirical Multi-Tier Positional Valuation Matrix (VORP & Schematic Gradients)
+POSITIONAL_IMPACT_METRICS: Dict[str, Dict[str, float]] = {
+    "QB_ELITE": {"spread_val": 4.5, "total_drop": 4.0, "pass_epa_delta": 0.160, "ttp_delta": 0.00},
+    "QB_STARTER": {"spread_val": 2.5, "total_drop": 2.2, "pass_epa_delta": 0.100, "ttp_delta": 0.00},
+    "LT": {"spread_val": 1.2, "total_drop": 1.0, "pass_epa_delta": 0.065, "ttp_delta": -0.35},
+    "RT": {"spread_val": 0.8, "total_drop": 0.7, "pass_epa_delta": 0.045, "ttp_delta": -0.22},
+    "C":  {"spread_val": 0.6, "total_drop": 0.5, "pass_epa_delta": 0.035, "ttp_delta": -0.15},
+    "EDGE1": {"spread_val": 1.0, "total_drop": -0.8, "pass_epa_delta": -0.055, "ttp_delta": 0.28},
+    "IDL1": {"spread_val": 0.7, "total_drop": -0.5, "rush_epa_delta": -0.060, "box_fit_leak": 0.10},
+    "CB1": {"spread_val": 1.1, "total_drop": -0.9, "pass_epa_delta": -0.060, "mofo_shift": 0.18},
+    "CB2": {"spread_val": 0.6, "total_drop": -0.5, "pass_epa_delta": -0.035, "mofo_shift": 0.08},
+    "FS1": {"spread_val": 0.7, "total_drop": -0.6, "pass_epa_delta": -0.045, "deep_hole_leak": 0.12},
+    "WR1": {"spread_val": 1.3, "total_drop": 1.1, "pass_epa_delta": 0.070, "target_funnel_loss": 0.28},
+    "RB1": {"spread_val": 0.5, "total_drop": 0.4, "rush_epa_delta": 0.030, "target_funnel_loss": 0.12}
+}
+
 def clean_team_abbr(team_str: str) -> str:
     if not isinstance(team_str, str):
         return ""
     c = str(team_str).strip().upper()
     return TEAM_ABBR_MAP.get(c, c)
 
+def normalize_player_name(raw_name: str) -> str:
+    if not isinstance(raw_name, str):
+        return ""
+    name = raw_name.lower().strip()
+    name = name.replace(".", "").replace("'", "").replace("-", " ")
+    for suffix in [" jr", " sr", " ii", " iii", " iv", " v"]:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+    return " ".join(name.split())
+
 # -------------------------------------------------------------------------
 # 2. Canonical Directional Scoring Engine
 # -------------------------------------------------------------------------
 def resolve_directional_market_context(total_line: float, nflfastr_spread_line: float) -> Tuple[float, float, float, float]:
+    """
+    In nflreadpy schedules:
+    spread_line > 0 strictly indicates HOME is favored.
+    spread_line < 0 strictly indicates AWAY is favored.
+    """
     canonical_home_margin = float(nflfastr_spread_line)
     implied_home = (total_line + canonical_home_margin) / 2.0
     implied_away = (total_line - canonical_home_margin) / 2.0
@@ -87,7 +140,7 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> T
     raw_home = (total_line + (selected_discrete_margin if home_favored else -selected_discrete_margin)) / 2.0
     raw_away = (total_line - (selected_discrete_margin if home_favored else -selected_discrete_margin)) / 2.0
 
-    best_pair = (27, 17) if home_favored else (17, 27)
+    best_pair = (27, 20) if home_favored else (20, 27)
     min_loss = float("inf")
 
     candidate_home = [s for s in COMMON_TEAM_SCORES if abs(s - raw_home) <= 6.5] or [int(round(raw_home))]
@@ -166,7 +219,9 @@ def generate_closed_loop_skill_projections(
     pass_edge: float, 
     rush_edge: float, 
     depth_names: Dict[str, str],
-    pbp_df: pd.DataFrame
+    pbp_df: pd.DataFrame,
+    ttp_shift: float = 0.0,
+    mofo_shift: float = 0.0
 ) -> List[Dict[str, Any]]:
     total_plays = 63.5 * (implied_total / 22.0) ** 0.25
     
@@ -175,7 +230,9 @@ def generate_closed_loop_skill_projections(
     pass_rate = max(0.48, min(0.66, 0.575 + script_shift + scheme_shift))
     run_rate = 1.0 - pass_rate
 
-    ypa = max(6.0, min(9.0, 7.35 + (pass_edge * 2.8)))
+    # TTP degradation compresses Yards Per Attempt (YPA)
+    base_ypa = 7.35 + (pass_edge * 2.8) + (ttp_shift * 0.85)
+    ypa = max(5.8, min(9.0, base_ypa))
     ypc = max(3.4, min(5.4, 4.30 + (rush_edge * 2.2)))
 
     gross_pass_mean = total_plays * pass_rate * ypa
@@ -188,6 +245,21 @@ def generate_closed_loop_skill_projections(
 
     target_weights = {"WR1": 0.27, "WR2": 0.18, "WR3": 0.12, "TE1": 0.20, "RB1": 0.12, "RB2": 0.05, "OTHER": 0.06}
     ypt_multipliers = {"WR1": 1.16, "WR2": 1.05, "WR3": 0.95, "TE1": 0.92, "RB1": 0.62, "RB2": 0.55, "OTHER": 0.80}
+
+    # Trench & Secondary Schematic Adaptations:
+    if ttp_shift < -0.20:
+        # Pass protection collapse: checkdown expansion
+        target_weights["RB1"] += 0.04
+        target_weights["TE1"] += 0.03
+        target_weights["WR2"] -= 0.04
+        target_weights["WR3"] -= 0.03
+
+    if mofo_shift > 0.10:
+        # Opponent secondary missing CB1: split safety shade opens boundary target volume
+        target_weights["WR1"] += 0.04
+        target_weights["WR2"] += 0.02
+        target_weights["RB1"] -= 0.03
+        target_weights["OTHER"] -= 0.03
 
     if not pbp_df.empty:
         t_passes = pbp_df[(pbp_df["posteam"] == team_abbr) & (pbp_df["play_type"] == "pass") & (pbp_df["home_wp"].between(0.10, 0.90))]
@@ -263,7 +335,7 @@ def generate_closed_loop_skill_projections(
     ]
 
 # -------------------------------------------------------------------------
-# 4. Multi-Source Ingestion & Franchise-Aligned Aggregation
+# 4. Multi-Source Ingestion & Autonomous Roster Resolution
 # -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
@@ -278,10 +350,20 @@ try:
 except Exception:
     pbp = pd.DataFrame()
 
-for df in [schedules, pbp]:
+try:
+    injuries = nfl.load_injuries(seasons=[CURRENT_SEASON]).to_pandas()
+except Exception:
+    injuries = pd.DataFrame()
+
+try:
+    depth_charts = nfl.load_depth_charts(seasons=[CURRENT_SEASON]).to_pandas()
+except Exception:
+    depth_charts = pd.DataFrame()
+
+for df in [schedules, pbp, injuries, depth_charts]:
     if df.empty:
         continue
-    for col in ["home_team", "away_team", "posteam", "defteam", "recent_team", "team"]:
+    for col in ["home_team", "away_team", "posteam", "defteam", "recent_team", "team", "club_code"]:
         if col in df.columns:
             df[col] = df[col].apply(clean_team_abbr)
 
@@ -332,25 +414,186 @@ def get_latest_team_row(team_abbr: str, target_season: int, target_week: int) ->
     ]
     return t_data.sort_values(["season", "week"], ascending=[False, False]).head(1) if not t_data.empty else pd.DataFrame()
 
-# -------------------------------------------------------------------------
-# 5. Gemini 3.8 Flash Scouting Engine
-# -------------------------------------------------------------------------
-async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
-    system_prompt = """
-# ROLE & IDENTITY
-You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
+def extract_injury_map() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    injury_map: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    if injuries.empty:
+        return injury_map
 
-# OPERATIONAL PROTOCOLS
-* Reference explicit player names from the verified active rosters.
-* Frame pocket integrity strictly as the countdown race between pass protection and release timing (TTP vs TTT).
-* Map Duo/Power as vertical interior displacement and Zone schemes as horizontal sideline stretch.
-* Deliver direct verdicts without conversational setups or labeled conclusions.
-* Output strictly valid JSON without markdown formatting backticks.
-"""
+    team_col = next((c for c in ["team", "club_code", "team_abbr"] if c in injuries.columns), None)
+    status_col = next((c for c in ["report_status", "practice_status", "game_status"] if c in injuries.columns), None)
+    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in injuries.columns), None)
+    pos_col = next((c for c in ["position", "pos", "pos_abb"] if c in injuries.columns), None)
+
+    if not team_col or not status_col or not name_col:
+        return injury_map
+
+    for _, row in injuries.iterrows():
+        t = str(row[team_col]).strip().upper()
+        p_name = str(row[name_col]).strip()
+        status = str(row[status_col]).strip().upper() if pd.notna(row[status_col]) else "ACTIVE"
+        pos = str(row[pos_col]).strip().upper() if pos_col and pd.notna(row[pos_col]) else "SKILL"
+
+        if t not in injury_map:
+            injury_map[t] = {}
+        injury_map[t][p_name] = {
+            "status": status,
+            "position": pos,
+            "is_out": status in INACTIVE_STATUS_DESIGNATIONS
+        }
+
+    return injury_map
+
+LIVE_INJURY_MAP = extract_injury_map()
+
+def resolve_autonomous_depth_chart(team_abbr: str, target_week: int) -> Dict[str, str]:
+    picks = {
+        "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
+        "WR1": f"{team_abbr} WR1", "WR2": f"{team_abbr} WR2", "WR3": f"{team_abbr} WR3", "TE1": f"{team_abbr} TE1"
+    }
+    if depth_charts.empty:
+        return picks
+
+    team_col = next((c for c in ["club_code", "team", "team_abbr"] if c in depth_charts.columns), None)
+    if not team_col:
+        return picks
+
+    t_dc = depth_charts[depth_charts[team_col] == team_abbr].copy()
+    if t_dc.empty:
+        return picks
+
+    if "week" in t_dc.columns:
+        valid_weeks = t_dc[t_dc["week"] == target_week]
+        t_dc = valid_weeks.copy() if not valid_weeks.empty else t_dc[t_dc["week"] == t_dc["week"].max()].copy()
+
+    first_col = next((c for c in ["first_name", "fname"] if c in t_dc.columns), None)
+    last_col = next((c for c in ["last_name", "lname"] if c in t_dc.columns), None)
+    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in t_dc.columns), None)
+    pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in t_dc.columns), None)
+    rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in t_dc.columns), None)
+
+    if not pos_col or not rank_col:
+        return picks
+
+    t_dc["rank_int"] = pd.to_numeric(t_dc[rank_col], errors="coerce").fillna(99).astype(int)
+    t_dc.sort_values(by=["rank_int"], ascending=True, inplace=True)
+
+    team_injuries = LIVE_INJURY_MAP.get(team_abbr, {})
+    slot_configs = [
+        ("QB", ["QB1"]),
+        ("RB", ["RB1", "RB2"]),
+        ("WR", ["WR1", "WR2", "WR3"]),
+        ("TE", ["TE1"])
+    ]
+
+    assigned_players: Set[str] = set()
+
+    for pos, slots in slot_configs:
+        cands = t_dc[t_dc[pos_col] == pos]
+        healthy_candidates: List[str] = []
+
+        for _, row in cands.iterrows():
+            if name_col and pd.notna(row[name_col]) and str(row[name_col]).strip():
+                full_name = str(row[name_col]).strip()
+            elif first_col and last_col and pd.notna(row[first_col]) and pd.notna(row[last_col]):
+                full_name = f"{row[first_col]} {row[last_col]}".strip()
+            else:
+                continue
+
+            if full_name.lower() in assigned_players:
+                continue
+
+            # Autonomous Inactive Cascade: pop scratched starters (IR/PUP/OUT)
+            status_meta = team_injuries.get(full_name, {"status": "ACTIVE", "is_out": False})
+            if status_meta["is_out"]:
+                logging.info(f"SCRATCH PRUNED: {team_abbr} {pos} {full_name} is [{status_meta['status']}]. Cascading depth.")
+                continue
+
+            healthy_candidates.append(full_name)
+            assigned_players.add(full_name.lower())
+
+        for idx, slot_key in enumerate(slots):
+            if idx < len(healthy_candidates):
+                picks[slot_key] = healthy_candidates[idx]
+            else:
+                picks[slot_key] = f"{team_abbr} {slot_key}"
+
+    return picks
+
+def quantify_unit_level_injuries(home_team: str, away_team: str) -> Dict[str, Any]:
+    """
+    Evaluates defensive front-7, secondary, and offensive line scratches
+    to quantify net TTP shifts, box fit leaks, and EPA drift.
+    """
+    net_spread_shift = 0.0
+    net_total_shift = 0.0
+    pass_epa_shift = 0.0
+    rush_epa_shift = 0.0
+    home_ttp_shift = 0.0
+    away_ttp_shift = 0.0
+    home_mofo_shift = 0.0
+    away_mofo_shift = 0.0
+
+    home_inj = LIVE_INJURY_MAP.get(home_team, {})
+    for p_name, meta in home_inj.items():
+        if not meta["is_out"]:
+            continue
+        pos = meta["position"]
+        metric = POSITIONAL_IMPACT_METRICS.get(pos, {})
+        net_spread_shift -= metric.get("spread_val", 0.0)
+        net_total_shift -= metric.get("total_drop", 0.0)
+        pass_epa_shift -= metric.get("pass_epa_delta", 0.0)
+        rush_epa_shift -= metric.get("rush_epa_delta", 0.0)
+        home_ttp_shift += metric.get("ttp_delta", 0.0)
+        home_mofo_shift += metric.get("mofo_shift", 0.0)
+
+    away_inj = LIVE_INJURY_MAP.get(away_team, {})
+    for p_name, meta in away_inj.items():
+        if not meta["is_out"]:
+            continue
+        pos = meta["position"]
+        metric = POSITIONAL_IMPACT_METRICS.get(pos, {})
+        net_spread_shift += metric.get("spread_val", 0.0)
+        net_total_shift -= metric.get("total_drop", 0.0)
+        pass_epa_shift += metric.get("pass_epa_delta", 0.0)
+        rush_epa_shift += metric.get("rush_epa_delta", 0.0)
+        away_ttp_shift += metric.get("ttp_delta", 0.0)
+        away_mofo_shift += metric.get("mofo_shift", 0.0)
+
+    return {
+        "spread_shift": net_spread_shift,
+        "total_shift": net_total_shift,
+        "pass_epa_shift": pass_epa_shift,
+        "rush_epa_shift": rush_epa_shift,
+        "home_ttp_shift": home_ttp_shift,
+        "away_ttp_shift": away_ttp_shift,
+        "home_mofo_shift": home_mofo_shift,
+        "away_mofo_shift": away_mofo_shift
+    }
+
+# -------------------------------------------------------------------------
+# 5. Gemini 3.8 Flash Scouting Engine (Exact Research Director Persona)
+# -------------------------------------------------------------------------
+RESEARCH_DIRECTOR_SYSTEM_PROMPT = """# ROLE & IDENTITY
+You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling. You possess complete domain authority over offensive and defensive playbooks, scheme-on-scheme mechanics, Bayesian calibration, and automated AI evaluation.
+
+Your dual mandate:
+1. Deliver razor-sharp, objective, and analytically grounded NFL football breakdowns.
+2. Serve as an expert AI evaluator: Continuously audit user-submitted AI prompts, analytical frameworks, statistical models, and projection logic to eliminate statistical noise, correct proxy errors, and enforce production-grade quantitative rigor.
+
+## OPERATIONAL INVARIANTS
+* Trench & Pocket Physics: Time-to-Pressure (TTP) vs. Time-to-Throw (TTT) determines pocket degradation. If TTP < TTT, evaluate pocket mobility archetype. Immobile pocket passers collapse under duress (P2S > 20%); dual threats convert pressure into scramble EPA or extended attempts.
+* Run-Fit Geometry:
+  - Gap / Duo / Power creates vertical displacement via double-teams. Exploits light nickel boxes (6-man fronts); neutralized by Odd 3-4 fronts with 0/1-technique two-gapping interior tackles.
+  - Wide / Outside Zone creates horizontal flow to stress edge contain. Neutralized by Wide-9 alignments and disciplined C-gap setters.
+* Coverage Shell Conditioning: Defenses do not play static coverage rates; coverage shell distributions are conditioned on offensive personnel groupings (11 vs. 12/21 personnel).
+  - MOFC (Cover 1 / Cover 3): Single-high safety; leaves perimeter 1-on-1s; vulnerable to intermediate Dagger concepts, crossers, and deep seam shots.
+  - MOFO (Cover 2 / Quarters / Cover 6): Split safeties; caps vertical boundary routes; vulnerable to underneath checkdowns and intermediate hole shots.
+* Output strictly valid JSON matching the target schema without markdown wrappers."""
+
+async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     verdict_str = f"Bet {recommended_line} - {kelly_units:.2f}u" if recommended_team != "PASS" and kelly_units > 0.0 else "PASS - 0.00u"
 
-    prompt = f"""
-Evaluate this NFL advance scouting dossier with verified empirical data:
+    prompt = f"""Evaluate this verified NFL quantitative dossier:
 {json.dumps(payload, indent=2)}
 
 Output strictly valid JSON matching this schema:
@@ -361,8 +604,7 @@ Output strictly valid JSON matching this schema:
     "home_offense_vs_away_defense": "Detailed film breakdown citing specific named players, pass protection, and coverage shells."
   }},
   "actionable_verdict": "{verdict_str}"
-}}
-"""
+}}"""
     async with semaphore:
         for attempt in range(3):
             try:
@@ -373,7 +615,7 @@ Output strictly valid JSON matching this schema:
                         model="gemini-3.8-flash",
                         contents=prompt,
                         config=types.GenerateContentConfig(
-                            system_instruction=system_prompt,
+                            system_instruction=RESEARCH_DIRECTOR_SYSTEM_PROMPT,
                             temperature=0.15,
                             response_mime_type="application/json"
                         )
@@ -424,10 +666,6 @@ async def main():
         sys.exit(0)
 
     print(f"Executing Season {target_season} Week {target_week} Quant Pipeline ({len(upcoming)} matchups)...")
-    
-    roster_engine = AutonomousNFLRosterEngine(season=target_season, week=target_week)
-    roster_engine.sync_live_feeds()
-    
     pre_processed = []
 
     for _, game in upcoming.iterrows():
@@ -445,7 +683,7 @@ async def main():
         def get_stat(df, col, default=0.0):
             return float(df[col].values[0]) if not df.empty and col in df.columns and pd.notna(df[col].values[0]) else float(default)
 
-        # STRICT Opponent-Cross Subtraction (Synchronized with train_model.py)
+        # Base Opponent-Cross Subtraction (Synchronized with train_model.py)
         net_pass_edge = (get_stat(home_row, "roll_off_dropback_epa") - get_stat(away_row, "roll_def_dropback_epa")) - \
                         (get_stat(away_row, "roll_off_dropback_epa") - get_stat(home_row, "roll_def_dropback_epa"))
         net_rush_edge = (get_stat(home_row, "roll_off_rush_epa") - get_stat(away_row, "roll_def_rush_epa")) - \
@@ -455,11 +693,19 @@ async def main():
 
         diff_success = get_stat(home_row, "roll_off_early_down_success", 0.44) - get_stat(away_row, "roll_off_early_down_success", 0.44)
         diff_explosive = get_stat(home_row, "roll_off_explosive", 0.12) - get_stat(away_row, "roll_off_explosive", 0.12)
-
         rest_diff = float(game.get("home_rest", 7.0) or 7.0) - float(game.get("away_rest", 7.0) or 7.0)
         is_divisional = int(game.get("div_game", 0) or 0)
 
-        canonical_spread, implied_home_total, implied_away_total, raw_market_prob = resolve_directional_market_context(raw_total_line, raw_spread_line)
+        # Multi-Tier Holistic Unit Injury Quantification (Trench, Secondary, OL)
+        injury_shifts = quantify_unit_level_injuries(home_team, away_team)
+        
+        # Apply injury adjustments to market lines and EPA
+        adjusted_spread_line = raw_spread_line + injury_shifts["spread_shift"]
+        adjusted_total_line = max(33.0, raw_total_line + injury_shifts["total_shift"])
+        net_pass_edge += injury_shifts["pass_epa_shift"]
+        net_rush_edge += injury_shifts["rush_epa_shift"]
+
+        canonical_spread, implied_home_total, implied_away_total, raw_market_prob = resolve_directional_market_context(adjusted_total_line, adjusted_spread_line)
 
         home_ml = float(game["home_moneyline"]) if pd.notna(game.get("home_moneyline")) else None
         away_ml = float(game["away_moneyline"]) if pd.notna(game.get("away_moneyline")) else None
@@ -499,13 +745,14 @@ async def main():
 
         calibrated_home_win_prob = max(0.02, min(0.98, calibrated_home_win_prob))
 
-        sigma = 13.45 * math.sqrt(max(32.0, raw_total_line) / 44.0)
+        sigma = 13.45 * math.sqrt(max(32.0, adjusted_total_line) / 44.0)
         z_win = norm.ppf(calibrated_home_win_prob)
         model_projected_margin = z_win * sigma
 
-        pred_home_score, pred_away_score = project_discrete_nfl_scores(model_projected_margin, raw_total_line)
+        pred_home_score, pred_away_score = project_discrete_nfl_scores(model_projected_margin, adjusted_total_line)
         pred_total_score = pred_home_score + pred_away_score
 
+        # Spread Cover Math (canonical_spread > 0 indicates Home favored by Vegas)
         z_cover_home = (model_projected_margin - canonical_spread) / sigma
         home_cover = float(norm.cdf(z_cover_home))
         away_cover = 1.0 - home_cover
@@ -533,19 +780,18 @@ async def main():
         q = max(0.0, 1.0 - cover_prob)
         kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" else 0.0
 
-        # Autonomous depth-chart resolution using live injury wire
-        home_core = roster_engine.resolve_active_depth_hierarchy(home_team)
-        away_core = roster_engine.resolve_active_depth_hierarchy(away_team)
+        # Autonomous Active Depth Resolution (Pruning Scratched IR/OUT Players)
+        home_depth = resolve_autonomous_depth_chart(home_team, week_num)
+        away_depth = resolve_autonomous_depth_chart(away_team, week_num)
 
-        home_depth = {role: meta["name"] for role, meta in home_core.items()}
-        away_depth = {role: meta["name"] for role, meta in away_core.items()}
-
-        # Generate Complete Projections with Sportsbook Benchmarks
+        # Generate Complete Projections with Sportsbook Benchmarks and Trench Shifts
         home_skills = generate_closed_loop_skill_projections(
-            home_team, implied_home_total, model_projected_margin, net_pass_edge, net_rush_edge, home_depth, pbp
+            home_team, implied_home_total, model_projected_margin, net_pass_edge, net_rush_edge, 
+            home_depth, pbp, ttp_shift=injury_shifts["home_ttp_shift"], mofo_shift=injury_shifts["away_mofo_shift"]
         )
         away_skills = generate_closed_loop_skill_projections(
-            away_team, implied_away_total, -model_projected_margin, -net_pass_edge, -net_rush_edge, away_depth, pbp
+            away_team, implied_away_total, -model_projected_margin, -net_pass_edge, -net_rush_edge, 
+            away_depth, pbp, ttp_shift=injury_shifts["away_ttp_shift"], mofo_shift=injury_shifts["home_mofo_shift"]
         )
 
         home_roster_summary = {p["role"]: p["player"] for p in home_skills}
@@ -565,7 +811,7 @@ async def main():
             "kelly_units": kelly_units,
             "recommended_team": rec_team,
             "recommended_line": rec_line,
-            "total_line": raw_total_line,
+            "total_line": adjusted_total_line,
             "spread_line": canonical_spread,
             "predicted_home_score": pred_home_score,
             "predicted_away_score": pred_away_score,
