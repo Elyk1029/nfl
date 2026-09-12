@@ -1,9 +1,8 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
 Complete Production UI:
-- Embedded Research Director Persona & 2026 Schematic/Play-Caller Directory.
-- Closed-Loop Skill Prop Stat Lines (Passing, Rushing, Receiving, TDs, Anytime TD %).
 - Reconciled Actionable Verdict Banner with Eighth-Kelly Staking Allocation.
+- Structured Pandas DataFrame Table Renderer with Separated Columns (Eliminating Text Collision).
 - Normalized ATS Spread Evaluation Engine & Blind Historical Simulation Airlock.
 """
 import os
@@ -105,25 +104,11 @@ ai_client = get_genai_client(api_key)
 
 GURU_SYSTEM_INSTRUCTION = """
 # ROLE & IDENTITY
-You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling. You possess complete domain authority over offensive and defensive playbooks, scheme-on-scheme mechanics, Bayesian calibration, and automated AI evaluation.
-
-Your dual mandate:
-1. Deliver razor-sharp, objective, and analytically grounded NFL football breakdowns.
-2. Serve as an expert AI evaluator: Continuously audit user-submitted AI prompts, analytical frameworks, statistical models, and projection logic to eliminate statistical noise, correct proxy errors, and enforce production-grade quantitative rigor.
+You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
 
 ---
 
-## 1. DETERMINISTIC MODE ROUTING & ACTIVATION
-
-Evaluate the input payload and route execution into exactly one operational path:
-
-* **Trigger MODE 1 (Tactical & Tape Breakdown)** if the query asks about game matchups, scheme clashes, player evaluation, roster trends, or football tape analysis without requesting an evaluation of an external prompt/system.
-* **Trigger MODE 2 (AI & Analytical System Evaluation)** if the query contains code, prompts, statistical formulas, betting theses, model outputs, or explicitly asks for an audit, critique, or optimization.
-* **Fallback Rule:** If an input contains elements of both (e.g., "Audit my prompt that analyzes Detroit's run game"), execute **MODE 2** as the primary response, utilizing **MODE 1** analysis as the worked test case.
-
----
-
-## 2. 2026 PLAY-CALLER & TACTICAL CONTINUITY DIRECTORY
+## 1. 2026 PLAY-CALLER & TACTICAL CONTINUITY DIRECTORY
 * Cardinals: HC Mike LaFleur | OC Nathaniel Hackett | DC Nick Rallis (Wide Zone, 12/21 play-action boot)
 * Falcons: HC Kevin Stefanski | OC Tommy Rees | DC Jeff Ulbrich (Under-center wide zone, Duo power)
 * Ravens: HC Jesse Minter | OC Declan Doyle | DC Anthony Weaver (Simulated pressure creeper defense; Doyle heavy option/gap GT counter)
@@ -145,17 +130,18 @@ Evaluate the input payload and route execution into exactly one operational path
 
 ---
 
-## 3. SCHEMATIC TAXONOMY & PHYSICAL INVARIANTS
-* Trench & Pocket Physics: Time-to-Pressure (TTP) vs. Time-to-Throw (TTT) determines pocket degradation. If TTP < TTT, evaluate pocket mobility archetype. Immobile pocket passers collapse under duress (P2S > 20%, steep YPA drop); play-extending dual threats convert pressure into scramble EPA or extended second-reaction attempts.
-* Run-Fit Geometry: Gap/Duo/Power creates vertical displacement via double-teams, exploiting light nickel boxes and split safeties. Wide Zone creates horizontal stretch, exploiting aggressive interior penetrators.
-* Coverage Shell Conditioning: Defenses adjust coverage shells based on offensive personnel groupings (11 vs. 12/21 personnel). MOFC (Cover 1/3) leaves perimeter 1-on-1s; MOFO (Cover 2/Quarters/Cover 6) caps vertical boundary routes.
+## 2. TRANSLATIONAL INVARIANTS
+* Trench Physics: Explain as countdown race between pass protection and QB release timing.
+* Run Schemes: Explain Duo/Power as "vertical bulldozing" and Zone schemes as "sideline-to-sideline stretch".
+* Coverage Shells: Explain MOFC as "Single-High Safety (extra run defender)" and MOFO as "Two-Deep Safeties (umbrella against deep shots)".
 
 ---
 
-## 4. MATHEMATICAL DISCIPLINE & DATA HYGIENE
-* Garbage-Time & Leverage Filtration: Filter all EPA and Success Rate metrics to neutral game states (Win Probability 10%-90%).
-* Log-Normal Median Transformation: Convert expected means to medians using position variance: m = mu * exp(-sigma^2 / 2).
-* Closed-Loop Target Tree Invariants: Sum of skill receiving yards must reconcile to gross passing volume.
+## 3. MATHEMATICAL DISCIPLINE
+* Neutral script leverage (WP 10%-90%).
+* Log-normal median conversion for player props: m = mu * exp(-sigma^2 / 2).
+* Closed-loop target trees: Sum of receiving yards must reconcile to gross passing volume.
+* Discrete scoring margin optimization (zero ties).
 """
 
 def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float, 
@@ -222,7 +208,7 @@ with st.sidebar:
         st.rerun()
 
 st.title("🏈 Institutional NFL Quantitative Terminal")
-st.caption("Discrete Empirical Score Modeling | Closed-Loop Skill Props | 2026 Verified Roster Continuous Engine")
+st.caption("Discrete Empirical Score Modeling | Closed-Loop Skill Props | 2026 Verified Dynamic Depth Charts")
 
 if df.empty:
     st.info("No active slate predictions currently loaded.")
@@ -323,40 +309,55 @@ with tab_slate:
                 with sub_props:
                     player_projs = analysis_data.get('player_projections', {})
                     
-                    def render_player_stat_table(team_key, container_col, label):
+                    def render_player_stat_table(team_key: str, container_col, team_display_name: str):
                         with container_col:
-                            st.markdown(f"##### {label} Skill Player Projections")
-                            projs = player_projs.get(team_key, [])
+                            st.markdown(f"##### {team_display_name} Skill Player Projections")
+                            if isinstance(player_projs, dict):
+                                projs = player_projs.get(team_key, [])
+                            elif isinstance(player_projs, list):
+                                projs = [p for p in player_projs if p.get("team", "").strip().upper() == team_display_name.strip().upper()]
+                            else:
+                                projs = []
+
                             if projs:
-                                rows = []
+                                table_rows = []
                                 for p in projs:
-                                    rows.append({
-                                        "Role": p.get("role"),
-                                        "Player": p.get("player"),
-                                        "Pass Yds": f"{p.get('pass_yards', 0.0):.1f}" if p.get('pass_yards', 0.0) > 0 else "-",
-                                        "Rush Yds": f"{p.get('rush_yards', 0.0):.1f}" if p.get('rush_yards', 0.0) > 0 else "-",
-                                        "Rec Yds": f"{p.get('rec_yards', 0.0):.1f}" if p.get('rec_yards', 0.0) > 0 else "-",
-                                        "Pass TDs": f"{p.get('projected_pass_tds', 0.0):.2f}" if p.get('projected_pass_tds', 0.0) > 0 else "-",
-                                        "Exp. TDs": f"{p.get('total_tds', 0.0):.2f}",
-                                        "Anytime TD%": f"{p.get('anytime_td_prob', 0.0):.1f}%"
+                                    role_label = str(p.get("role", "")).strip()
+                                    player_name = str(p.get("player", "")).strip()
+
+                                    pass_val = max(0.0, float(p.get("pass_yards", 0.0)))
+                                    rush_val = max(0.0, float(p.get("rush_yards", 0.0)))
+                                    rec_val = max(0.0, float(p.get("rec_yards", 0.0)))
+                                    td_val = max(0.0, float(p.get("total_tds", 0.0)))
+                                    prob_val = max(0.0, float(p.get("anytime_td_prob", 0.0)))
+
+                                    table_rows.append({
+                                        "Player": player_name,
+                                        "Pos": role_label,
+                                        "Pass Yds": f"{pass_val:.1f}" if pass_val > 0.0 else "-",
+                                        "Rush Yds": f"{rush_val:.1f}" if rush_val > 0.0 else "-",
+                                        "Rec Yds": f"{rec_val:.1f}" if rec_val > 0.0 else "-",
+                                        "Exp. TD": f"{td_val:.2f}",
+                                        "Anytime TD%": f"{prob_val:.1f}%"
                                     })
+                                
+                                df_display = pd.DataFrame(table_rows)
                                 st.dataframe(
-                                    pd.DataFrame(rows),
+                                    df_display,
                                     column_config={
-                                        "Role": st.column_config.TextColumn("Role", width="small"),
                                         "Player": st.column_config.TextColumn("Player", width="medium"),
+                                        "Pos": st.column_config.TextColumn("Role", width="small"),
                                         "Pass Yds": st.column_config.TextColumn("Pass Med."),
                                         "Rush Yds": st.column_config.TextColumn("Rush Med."),
                                         "Rec Yds": st.column_config.TextColumn("Rec Med."),
-                                        "Pass TDs": st.column_config.TextColumn("Pass TD"),
-                                        "Exp. TDs": st.column_config.TextColumn("Total TD (λ)"),
+                                        "Exp. TD": st.column_config.TextColumn("Total TD (λ)"),
                                         "Anytime TD%": st.column_config.TextColumn("Anytime TD")
                                     },
                                     hide_index=True,
                                     use_container_width=True
                                 )
                             else:
-                                st.caption(f"No structured skill projections available for {label}.")
+                                st.caption(f"No structured skill projections available for {team_display_name}.")
 
                     p_col1, p_col2 = st.columns(2)
                     render_player_stat_table("away", p_col1, away_team)
