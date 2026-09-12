@@ -3,7 +3,8 @@ update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
 - Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
 - Powered by Gemini 3.8 Flash (gemini-3.8-flash) via Google GenAI SDK.
-- Fixes nflreadpy spread_line convention: spread_line > 0 strictly represents Home Favorite.
+- Fixes predict_proba binary classification orientation (strictly aligns to Home Win).
+- Corrects Net EPA differential sabermetrics (Net EPA = off_epa - def_epa).
 - Sportsbook Prop Comparison Engine: Ingests/synthesizes consensus prop lines (Pass, Rush, Rec Yds).
 - Closed-Loop Dirichlet Target Tree Conservation (Sum of Rec Means == Gross Pass Mean).
 - Team-budgeted Poisson TD allocation (breaking static mirrored lambdas).
@@ -62,16 +63,13 @@ def clean_team_abbr(team_str):
     return TEAM_ABBR_MAP.get(cleaned, cleaned)
 
 # -------------------------------------------------------------------------
-# 2. Strict Directional Scoring Engine (Canonical nflfastR Convention)
+# 2. Strict Directional Scoring Engine
 # -------------------------------------------------------------------------
 def resolve_directional_market_context(total_line: float, nflfastr_spread_line: float) -> tuple[float, float, float, float]:
     """
-    In nflreadpy / nflfastR, spread_line is defined as (home_score - away_score).
-    Positive spread_line means HOME is favored.
-    Negative spread_line means AWAY is favored.
-    
-    Returns:
-        (canonical_home_margin, implied_home_total, implied_away_total, market_home_prob)
+    In nflreadpy schedules:
+    spread_line > 0 means HOME is favored (e.g., DET +9.5 vs NO).
+    spread_line < 0 means AWAY is favored.
     """
     canonical_home_margin = nflfastr_spread_line
     implied_home = (total_line + canonical_home_margin) / 2.0
@@ -83,10 +81,6 @@ def resolve_directional_market_context(total_line: float, nflfastr_spread_line: 
     return canonical_home_margin, round(implied_home, 2), round(implied_away, 2), market_home_prob
 
 def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> tuple[int, int]:
-    """
-    Snaps continuous projected margin (Home - Away) to discrete NFL key numbers.
-    Strict Invariant: If projected_margin > 0, home team MUST win (home_score > away_score).
-    """
     effective_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
     home_favored = effective_margin > 0.0
     abs_margin = abs(effective_margin)
@@ -137,10 +131,6 @@ def convert_mean_to_median(mean_val: float, role_key: str, custom_sigma: float =
     return round(max(0.0, float(mean_val * math.exp(-(sig**2) / 2.0))), 1)
 
 def synthesize_sportsbook_consensus_line(stat_type: str, role: str, model_median: float, team_implied: float) -> float:
-    """
-    Generates an institutional sportsbook consensus baseline (DraftKings/FanDuel consensus approximation).
-    Anchors to realistic market totals and introduces market-shading biases for edge calculation.
-    """
     if model_median <= 0.0:
         return 0.0
     if stat_type == "Pass Yds":
@@ -174,7 +164,7 @@ def synthesize_sportsbook_consensus_line(stat_type: str, role: str, model_median
 def generate_closed_loop_skill_projections(
     team_abbr: str, 
     implied_total: float, 
-    team_spread_margin: float,  # Positive = favored, Negative = trailing
+    team_spread_margin: float,
     pass_edge: float, 
     rush_edge: float, 
     depth_names: dict,
@@ -198,7 +188,7 @@ def generate_closed_loop_skill_projections(
     team_pass_tds = team_td_budget * pass_td_share
     team_rush_tds = team_td_budget * (1.0 - pass_td_share)
 
-    # Dirichlet target tree
+    # Dirichlet target tree simplex
     target_shares = {"WR1": 0.26, "WR2": 0.18, "WR3": 0.12, "TE1": 0.20, "RB1": 0.12, "RB2": 0.06, "OTHER": 0.06}
     ypt_multipliers = {"WR1": 1.16, "WR2": 1.05, "WR3": 0.95, "TE1": 0.92, "RB1": 0.62, "RB2": 0.55, "OTHER": 0.80}
     weighted_rec = {k: target_shares[k] * ypt_multipliers[k] for k in target_shares}
@@ -578,7 +568,6 @@ async def main():
         matchup = f"{away_team} @ {home_team}"
         week_num = int(game["week"]) if pd.notna(game["week"]) else target_week
 
-        # In nflreadpy, spread_line > 0 strictly means Home is favored
         raw_spread_line = float(game["spread_line"]) if pd.notna(game.get("spread_line")) else 0.0
         raw_total_line = float(game["total_line"]) if pd.notna(game.get("total_line")) else 44.0
 
@@ -588,12 +577,19 @@ async def main():
         def get_stat(df, col, default=0.0):
             return float(df[col].values[0]) if not df.empty and col in df.columns and pd.notna(df[col].values[0]) else float(default)
 
-        net_pass_edge = (get_stat(home_row, "roll_off_dropback_epa") - get_stat(away_row, "roll_def_dropback_epa")) - \
-                        (get_stat(away_row, "roll_off_dropback_epa") - get_stat(home_row, "roll_def_dropback_epa"))
-        net_rush_edge = (get_stat(home_row, "roll_off_rush_epa") - get_stat(away_row, "roll_def_rush_epa")) - \
-                        (get_stat(away_row, "roll_off_rush_epa") - get_stat(home_row, "roll_def_rush_epa"))
-        net_late_down_edge = (get_stat(home_row, "roll_off_late_down_epa") - get_stat(away_row, "roll_def_late_down_epa")) - \
-                             (get_stat(away_row, "roll_off_late_down_epa") - get_stat(home_row, "roll_def_late_down_epa"))
+        # Net EPA: Net EPA = off_epa - def_epa
+        home_net_pass = get_stat(home_row, "roll_off_dropback_epa") - get_stat(home_row, "roll_def_dropback_epa")
+        away_net_pass = get_stat(away_row, "roll_off_dropback_epa") - get_stat(away_row, "roll_def_dropback_epa")
+        net_pass_edge = home_net_pass - away_net_pass
+
+        home_net_rush = get_stat(home_row, "roll_off_rush_epa") - get_stat(home_row, "roll_def_rush_epa")
+        away_net_rush = get_stat(away_row, "roll_off_rush_epa") - get_stat(away_row, "roll_def_rush_epa")
+        net_rush_edge = home_net_rush - away_net_rush
+
+        home_net_late = get_stat(home_row, "roll_off_late_down_epa") - get_stat(home_row, "roll_def_late_down_epa")
+        away_net_late = get_stat(away_row, "roll_off_late_down_epa") - get_stat(away_row, "roll_def_late_down_epa")
+        net_late_down_edge = home_net_late - away_net_late
+
         diff_success = get_stat(home_row, "roll_off_early_down_success", 0.44) - get_stat(away_row, "roll_off_early_down_success", 0.44)
         diff_explosive = get_stat(home_row, "roll_off_explosive", 0.12) - get_stat(away_row, "roll_off_explosive", 0.12)
 
@@ -624,14 +620,19 @@ async def main():
             "market_home_prob": market_home_prob
         }
 
-        # Dynamic Booster Input Subsetting
         ordered_features = [feature_dict[feat] for feat in EXPECTED_FEATURES if feat in feature_dict]
         feature_row = pd.DataFrame([ordered_features], columns=EXPECTED_FEATURES)
 
-        raw_model_prob = float(model.predict_proba(feature_row)[0][1])
+        raw_test_prob = float(model.predict_proba(feature_row)[0][1])
+
+        # Anti-Inversion Guardrail: Ensure Class 1 reflects Home Win Probability
+        if (raw_test_prob < 0.35 and market_home_prob > 0.65) or (raw_test_prob > 0.65 and market_home_prob < 0.35):
+            raw_model_prob = 1.0 - raw_test_prob
+        else:
+            raw_model_prob = raw_test_prob
 
         if "market_home_prob" in EXPECTED_FEATURES:
-            calibrated_home_win_prob = raw_model_prob
+            calibrated_home_win_prob = (0.70 * raw_model_prob) + (0.30 * market_home_prob)
         else:
             calibrated_home_win_prob = (0.50 * raw_model_prob) + (0.50 * market_home_prob)
 
