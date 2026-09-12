@@ -7,18 +7,13 @@ Features:
 - Empirical Bayesian regression for backup quarterback efficiency metrics.
 - Parameterized execution: zero hardcoded player names or static replacement tables.
 """
-import asyncio
-import datetime
 import difflib
-import json
 import logging
-import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
-from scipy.stats import norm, poisson
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -51,6 +46,9 @@ def clean_team_abbr(team_str: str) -> str:
     return TEAM_ABBR_MAP.get(c, c)
 
 def normalize_player_name(raw_name: str) -> str:
+    """
+    Strips suffixes, punctuation, and casing to achieve uniform entity matching across tables.
+    """
     if not isinstance(raw_name, str):
         return ""
     name = raw_name.lower().strip()
@@ -70,6 +68,10 @@ class AutonomousNFLRosterEngine:
         self.pbp_df: pd.DataFrame = pd.DataFrame()
 
     def sync_live_feeds(self) -> None:
+        """
+        Pulls official league injury feeds, depth charts, and tracking data.
+        Falls back to prior season data when executing early pre-slate runs.
+        """
         logging.info(f"Synchronizing official nflverse feeds for Season {self.season}, Week {self.week}...")
 
         try:
@@ -109,6 +111,9 @@ class AutonomousNFLRosterEngine:
         logging.info("Feeds synced. Active records loaded into memory.")
 
     def match_player_entity(self, target_name: str, candidate_names: List[str]) -> Optional[str]:
+        """
+        Executes robust Jaro-Winkler and initials-based entity resolution.
+        """
         norm_target = normalize_player_name(target_name)
         candidates_clean = {normalize_player_name(c): c for c in candidate_names if isinstance(c, str)}
 
@@ -131,6 +136,9 @@ class AutonomousNFLRosterEngine:
         return None
 
     def get_player_injury_status(self, player_name: str, team_abbr: str) -> Dict[str, Any]:
+        """
+        Evaluates availability based on practice rep vectors and game designations.
+        """
         if self.injuries_df.empty:
             return {"status": "HEALTHY", "p_active": 1.0, "is_inactive": False}
 
@@ -176,6 +184,9 @@ class AutonomousNFLRosterEngine:
         return {"status": raw_status, "p_active": 1.0, "is_inactive": False}
 
     def resolve_active_depth_hierarchy(self, team_abbr: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Dynamically prunes inactive scratches and cascades backup promotions across the skill core.
+        """
         team_clean = clean_team_abbr(team_abbr)
         dc = self.depth_charts_df
 
@@ -241,6 +252,10 @@ class AutonomousNFLRosterEngine:
         return assigned_roles
 
     def extract_qb_empirical_efficiency(self, qb_name: str) -> Dict[str, float]:
+        """
+        Computes rolling neutral-down EPA/play with empirical Bayesian shrinkage
+        against the league backup replacement baseline.
+        """
         prior_epa = -0.110
         prior_cpoe = -2.80
         prior_weight = 40.0
