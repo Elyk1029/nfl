@@ -1,6 +1,7 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Guru Workbench.
 Production UI:
+- Fully self-contained discrete empirical scoring engine (eliminating NameError).
 - Powered by Gemini 3.8 Flash (gemini-3.8-flash) for Guru Evaluation & Anonymized Simulations.
 - Reconciled Actionable Verdict Banner with Eighth-Kelly Staking Allocation.
 - Structured Pandas DataFrame Table Renderer with Separated Columns (Eliminating Text Collision).
@@ -76,6 +77,81 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# -------------------------------------------------------------------------
+# 1. Discrete Scoring Math Engine (Self-Contained)
+# -------------------------------------------------------------------------
+NFL_KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
+COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
+
+def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> tuple[int, int]:
+    """
+    Snaps raw linear projected margins and totals to empirical NFL football key numbers,
+    guaranteeing zero regular-season ties and minimizing joint error.
+    """
+    effective_margin = projected_margin if abs(projected_margin) >= 0.05 else 0.10
+    home_favored = effective_margin > 0.0
+    abs_margin = abs(effective_margin)
+
+    selected_discrete_margin = min(NFL_KEY_MARGINS, key=lambda m: abs(m - abs_margin))
+    raw_home = (total_line + (selected_discrete_margin if home_favored else -selected_discrete_margin)) / 2.0
+    raw_away = (total_line - (selected_discrete_margin if home_favored else -selected_discrete_margin)) / 2.0
+
+    best_pair = (24, 21) if home_favored else (21, 24)
+    min_loss = float("inf")
+
+    candidate_home = [s for s in COMMON_TEAM_SCORES if abs(s - raw_home) <= 6.5] or [int(round(raw_home))]
+    candidate_away = [s for s in COMMON_TEAM_SCORES if abs(s - raw_away) <= 6.5] or [int(round(raw_away))]
+
+    for h in candidate_home:
+        for a in candidate_away:
+            if h == a or (home_favored and h <= a) or (not home_favored and a <= h):
+                continue
+            pair_margin = abs(h - a)
+            pair_total = h + a
+            loss = (abs(pair_total - total_line) * 1.0) + (abs(pair_margin - abs_margin) * 1.5)
+            if pair_margin not in [3, 7, 6, 10, 4]:
+                loss += 3.0
+
+            if loss < min_loss:
+                min_loss = loss
+                best_pair = (h, a)
+
+    return int(best_pair[0]), int(best_pair[1])
+
+def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float, 
+                               actual_home_score: int, actual_away_score: int, 
+                               home_spread_line: float) -> dict:
+    actual_margin = float(actual_home_score - actual_away_score)
+    pred_margin = float(pred_home_score - pred_away_score)
+
+    actual_home_covered = (actual_margin + home_spread_line) > 0.0
+    pred_home_covered = (pred_margin + home_spread_line) > 0.0
+
+    is_actual_push = (actual_margin + home_spread_line) == 0.0
+    if is_actual_push:
+        cover_status = "⏸️ Push"
+    elif actual_home_covered == pred_home_covered:
+        cover_status = "✅ Correct Cover"
+    else:
+        cover_status = "❌ Wrong Side"
+
+    actual_home_won = actual_margin > 0.0
+    pred_home_won = pred_margin > 0.0
+    su_status = "✅ Hit" if (actual_home_won == pred_home_won) else "❌ Miss"
+
+    score_mae = (abs(pred_away_score - actual_away_score) + abs(pred_home_score - actual_home_score)) / 2.0
+    margin_error = abs(pred_margin - actual_margin)
+
+    return {
+        "su_grade": su_status,
+        "ats_grade": cover_status,
+        "score_mae": round(score_mae, 1),
+        "margin_error": round(margin_error, 1)
+    }
+
+# -------------------------------------------------------------------------
+# 2. Client & Environment Initialization
+# -------------------------------------------------------------------------
 def resolve_credential(key_name: str) -> str:
     try:
         if key_name in st.secrets and str(st.secrets[key_name]).strip():
@@ -145,37 +221,6 @@ You are the "NFL Research Director & Quantitative Architect," operating at the n
 * Discrete scoring margin optimization (zero ties).
 """
 
-def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float, 
-                               actual_home_score: int, actual_away_score: int, 
-                               home_spread_line: float) -> dict:
-    actual_margin = float(actual_home_score - actual_away_score)
-    pred_margin = float(pred_home_score - pred_away_score)
-
-    actual_home_covered = (actual_margin + home_spread_line) > 0.0
-    pred_home_covered = (pred_margin + home_spread_line) > 0.0
-
-    is_actual_push = (actual_margin + home_spread_line) == 0.0
-    if is_actual_push:
-        cover_status = "⏸️ Push"
-    elif actual_home_covered == pred_home_covered:
-        cover_status = "✅ Correct Cover"
-    else:
-        cover_status = "❌ Wrong Side"
-
-    actual_home_won = actual_margin > 0.0
-    pred_home_won = pred_margin > 0.0
-    su_status = "✅ Hit" if (actual_home_won == pred_home_won) else "❌ Miss"
-
-    score_mae = (abs(pred_away_score - actual_away_score) + abs(pred_home_score - actual_home_score)) / 2.0
-    margin_error = abs(pred_margin - actual_margin)
-
-    return {
-        "su_grade": su_status,
-        "ats_grade": cover_status,
-        "score_mae": round(score_mae, 1),
-        "margin_error": round(margin_error, 1)
-    }
-
 @st.cache_data(ttl=300)
 def load_predictions():
     query = """
@@ -196,6 +241,9 @@ except Exception as e:
     st.error(f"Database Query Failed: {e}")
     st.stop()
 
+# -------------------------------------------------------------------------
+# 3. Sidebar Configuration
+# -------------------------------------------------------------------------
 with st.sidebar:
     st.title("🏈 Risk Engine")
     show_only_bets = st.checkbox("Show Actionable Bets Only", value=False)
@@ -208,6 +256,9 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+# -------------------------------------------------------------------------
+# 4. Dashboard Header & Global KPI Metrics
+# -------------------------------------------------------------------------
 st.title("🏈 Institutional NFL Quantitative Terminal")
 st.caption("Discrete Empirical Score Modeling | Closed-Loop Skill Props | Powered by Gemini 3.8 Flash")
 
@@ -231,6 +282,9 @@ tab_slate, tab_steam, tab_guru, tab_sim = st.tabs([
     "🧪 Blind Historical Simulation"
 ])
 
+# -------------------------------------------------------------------------
+# 5. Tab 1: Weekly Board
+# -------------------------------------------------------------------------
 with tab_slate:
     displayed = 0
     for _, row in df.iterrows():
@@ -369,6 +423,9 @@ with tab_slate:
     if displayed == 0:
         st.info("No matchups match your edge/stake filter thresholds.")
 
+# -------------------------------------------------------------------------
+# 6. Tab 2: Market Steam
+# -------------------------------------------------------------------------
 with tab_steam:
     st.subheader("⚡ Line Movement & Market Pricing Discrepancies")
     steam_records = []
@@ -388,6 +445,9 @@ with tab_steam:
         })
     st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
 
+# -------------------------------------------------------------------------
+# 7. Tab 3: Guru Workbench
+# -------------------------------------------------------------------------
 with tab_guru:
     st.subheader(f"🧠 {guru_mode}")
     q_title = st.text_input("Evaluation Target / Matchup Headline:")
@@ -409,6 +469,9 @@ with tab_guru:
                 except Exception as e:
                     st.error(f"Inference Failure: {e}")
 
+# -------------------------------------------------------------------------
+# 8. Tab 4: Blind Historical Simulation Engine (Bug-Free & Airlocked)
+# -------------------------------------------------------------------------
 with tab_sim:
     st.subheader("🧪 Blind Past-Game Simulation Engine (Airlocked)")
     st.caption("Validating AI predictive accuracy out-of-sample: Franchise metadata and true scores are strictly masked.")
@@ -441,12 +504,11 @@ with tab_sim:
                 actual_home = int(g["home_score"])
                 actual_away = int(g["away_score"])
 
-                # Deterministic math baseline
-                sigma = 13.45 * math.sqrt(max(32.0, total_line) / 44.0)
+                # Exact call to self-contained mathematical scoring engine
                 projected_margin = -home_spread_line
                 p_home, p_away = project_discrete_nfl_scores(projected_margin, total_line)
 
-                # Strict entity-masking payload
+                # Strict entity-masking payload passed to Gemini 3.8 Flash
                 anonymized_payload = {
                     "entity_alpha": {"role": "Home Front", "spread_target": f"Entity Alpha {home_spread_line:+g}"},
                     "entity_beta": {"role": "Away Front"},
