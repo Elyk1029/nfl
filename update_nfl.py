@@ -2,12 +2,13 @@
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
 - Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
-- Concurrent, dynamic injury-conditioned depth chart cascading (promotes healthy backups).
-- Closed-Loop Skill Player Volume Allocation (QB, RB1/2, WR1/2/3, TE1) with target-tree conservation.
-- Real 2026 Roster Name Resolution across multi-column nflverse schemas.
-- Log-normal median yardage transformations and Poisson anytime-TD modeling.
+- Dynamic Bayesian QB Injury Adjustment & VORP Haircut Engine.
+- Multi-column schema alias resolution (player_name, full_name, first_name + last_name).
+- Set-aware Depth Chart Cascading (guarantees unique player allocation per role).
+- Closed-Loop Skill Player Volume Allocation (QB, RB1/2, WR1/2/3, TE1).
+- Non-negative clamping, log-normal median conversions, and Poisson TD modeling.
 - Discrete empirical score generation (zero regular-season ties).
-- Auto-migrating Neon PostgreSQL upsert.
+- Auto-migrating Neon PostgreSQL persistence.
 """
 import asyncio
 import json
@@ -107,21 +108,121 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
     return int(best_pair[0]), int(best_pair[1])
 
 # -------------------------------------------------------------------------
-# 3. Closed-Loop Skill Volume & Log-Normal Median Allocation
+# 3. Dynamic QB Bayesian Adjustment & VORP Engine
+# -------------------------------------------------------------------------
+QB_VORP_TIERS = {
+    "Patrick Mahomes": 7.0, "Josh Allen": 7.0, "Lamar Jackson": 6.5, "Joe Burrow": 6.5,
+    "C.J. Stroud": 5.0, "Jordan Love": 5.0, "Jalen Hurts": 4.5, "Justin Herbert": 4.5,
+    "Dak Prescott": 4.5, "Brock Purdy": 4.0, "Jared Goff": 4.0, "Matthew Stafford": 4.0,
+    "Kyler Murray": 4.0, "Kirk Cousins": 3.5, "Baker Mayfield": 3.5, "Trevor Lawrence": 3.0,
+    "Tua Tagovailoa": 3.0, "Jayden Daniels": 3.0, "Caleb Williams": 2.5, "Anthony Richardson": 2.5,
+    "Geno Smith": 2.5, "Derek Carr": 2.5, "Bo Nix": 2.0, "Drake Maye": 2.0, "Will Levis": 2.0,
+    "Bryce Young": 1.5, "Daniel Jones": 1.5, "Deshaun Watson": 1.5, "Gardner Minshew": 1.0
+}
+DEFAULT_QB_VORP = 2.0
+BACKUP_QB_VORP = 0.0
+
+INJURY_PROBABILITY_WEIGHTS = {
+    "OUT": 0.00, "IR": 0.00, "INJURED RESERVE": 0.00, "PUP": 0.00,
+    "DOUBTFUL": 0.08, "QUESTIONABLE": 0.62, "ACTIVE": 1.00, "HEALTHY": 1.00
+}
+
+INACTIVE_DESIGNATIONS = {"OUT", "IR", "INJURED RESERVE", "DOUBTFUL", "DNR", "PUP", "NFI", "SUSPENDED"}
+
+def resolve_qb_depth_and_adjustment(
+    team_abbr: str,
+    depth_charts_df: pd.DataFrame,
+    injury_map: dict,
+    base_spread: float,
+    base_total: float,
+    base_pass_edge: float
+):
+    team_injuries = injury_map.get(team_abbr, {})
+    qb1_name = f"{team_abbr} Starting QB"
+    qb2_name = f"{team_abbr} Backup QB"
+
+    if not depth_charts_df.empty:
+        team_col = next((c for c in ["team", "club_code", "team_abbr"] if c in depth_charts_df.columns), None)
+        pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in depth_charts_df.columns), None)
+        rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in depth_charts_df.columns), None)
+        name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in depth_charts_df.columns), None)
+        first_col = next((c for c in ["first_name", "fname"] if c in depth_charts_df.columns), None)
+        last_col = next((c for c in ["last_name", "lname"] if c in depth_charts_df.columns), None)
+
+        if team_col and pos_col and rank_col:
+            t_qbs = depth_charts_df[(depth_charts_df[team_col] == team_abbr) & (depth_charts_df[pos_col] == "QB")].copy()
+            if not t_qbs.empty:
+                t_qbs["rank_int"] = pd.to_numeric(t_qbs[rank_col], errors="coerce").fillna(99).astype(int)
+                t_qbs.sort_values(by=["rank_int"], inplace=True)
+
+                def get_row_name(row):
+                    if name_col and pd.notna(row[name_col]) and str(row[name_col]).strip():
+                        return str(row[name_col]).strip()
+                    if first_col and last_col and pd.notna(row[first_col]) and pd.notna(row[last_col]):
+                        return f"{row[first_col]} {row[last_col]}".strip()
+                    return None
+
+                qbs_found = [get_row_name(r) for _, r in t_qbs.iterrows() if get_row_name(r)]
+                if len(qbs_found) > 0:
+                    qb1_name = qbs_found[0]
+                if len(qbs_found) > 1:
+                    qb2_name = qbs_found[1]
+
+    qb1_status = team_injuries.get(qb1_name, "HEALTHY").upper()
+    p_start = INJURY_PROBABILITY_WEIGHTS.get(qb1_status, 1.0)
+    vorp_qb1 = QB_VORP_TIERS.get(qb1_name, DEFAULT_QB_VORP)
+    vorp_qb2 = QB_VORP_TIERS.get(qb2_name, BACKUP_QB_VORP)
+
+    if p_start <= 0.20:
+        active_qb = qb2_name
+        injury_label = f"Starter {qb1_name} OUT ({qb1_status})"
+        point_haircut = vorp_qb1 - vorp_qb2
+        pass_epa_haircut = 0.16
+        qb_variance_sigma = 0.42
+    else:
+        active_qb = qb1_name
+        injury_label = qb1_status if qb1_status != "HEALTHY" else "Healthy"
+        expected_absence = 1.0 - p_start
+        point_haircut = (vorp_qb1 - vorp_qb2) * expected_absence
+        pass_epa_haircut = 0.16 * expected_absence
+        qb_variance_sigma = 0.32 + (0.08 * expected_absence)
+
+    adjusted_spread = base_spread - point_haircut
+    adjusted_total = max(33.0, base_total - (point_haircut * 0.85))
+    adjusted_pass_edge = base_pass_edge - pass_epa_haircut
+
+    return (
+        active_qb,
+        injury_label,
+        round(adjusted_spread, 1),
+        round(adjusted_total, 1),
+        round(adjusted_pass_edge, 3),
+        round(qb_variance_sigma, 2)
+    )
+
+# -------------------------------------------------------------------------
+# 4. Closed-Loop Skill Volume & Log-Normal Median Allocation
 # -------------------------------------------------------------------------
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
     "RB_Rec": 0.55, "WR_Rec": 0.58, "TE_Rec": 0.54
 }
 
-def convert_mean_to_median(mean_val: float, role_key: str) -> float:
+def convert_mean_to_median(mean_val: float, role_key: str, custom_sigma: float = None) -> float:
     if mean_val <= 0.0:
         return 0.0
-    sig = LOG_SIGMA.get(role_key, 0.50)
+    sig = custom_sigma if custom_sigma is not None else LOG_SIGMA.get(role_key, 0.50)
     return round(max(0.0, float(mean_val * math.exp(-(sig**2) / 2.0))), 1)
 
-def generate_closed_loop_skill_projections(team_abbr: str, implied_total: float, spread_line: float,
-                                           pass_edge: float, rush_edge: float, depth_names: dict) -> list[dict]:
+def generate_closed_loop_skill_projections(
+    team_abbr: str, 
+    implied_total: float, 
+    spread_line: float,
+    pass_edge: float, 
+    rush_edge: float, 
+    depth_names: dict,
+    qb_sigma: float = 0.32
+) -> list:
     total_plays = 63.0 * (implied_total / 22.0) ** 0.30
     script_shift = -0.012 * spread_line
     scheme_shift = 0.04 * (pass_edge - rush_edge)
@@ -174,7 +275,7 @@ def generate_closed_loop_skill_projections(team_abbr: str, implied_total: float,
     return [
         {
             "role": "QB1", "player": depth_names.get("QB1", f"{team_abbr} QB"),
-            "pass_yards": convert_mean_to_median(team_gross_pass, "QB_Pass"),
+            "pass_yards": convert_mean_to_median(team_gross_pass, "QB_Pass", custom_sigma=qb_sigma),
             "rush_yards": convert_mean_to_median(qb_mean_rush, "QB_Rush"),
             "rec_yards": 0.0, "projected_pass_tds": round(team_pass_tds, 2),
             "total_tds": round(qb_rush_td, 2), "anytime_td_prob": calc_anytime_td_prob(qb_rush_td)
@@ -220,7 +321,7 @@ def generate_closed_loop_skill_projections(team_abbr: str, implied_total: float,
     ]
 
 # -------------------------------------------------------------------------
-# 4. Multi-Source Ingestion & Dynamic Roster Resolution
+# 5. Multi-Source Ingestion & Dynamic Roster Resolution
 # -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
@@ -299,48 +400,11 @@ def get_latest_team_row(team_abbr, target_season, target_week):
     ]
     return t_data.sort_values(["season", "week"], ascending=[False, False]).head(1) if not t_data.empty else pd.DataFrame()
 
-VORP_PENALTIES = {"QB1": 0.22, "LT1": 0.05, "EDGE1": 0.04}
-def calculate_roster_vorp(team_abbr):
-    if injuries.empty or depth_charts.empty:
-        return 0.0
-    t_inj = injuries[(injuries["team"] == team_abbr) & (injuries["report_status"].isin(["Out", "Doubtful", "IR"]))]
-    if t_inj.empty:
-        return 0.0
-    
-    # Parse injuries using multi-column schema aliases
-    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in t_inj.columns), None)
-    if name_col:
-        inj_names = t_inj[name_col].dropna().tolist()
-    elif "first_name" in t_inj.columns and "last_name" in t_inj.columns:
-        inj_names = (t_inj["first_name"].fillna("") + " " + t_inj["last_name"].fillna("")).str.strip().tolist()
-    else:
-        inj_names = []
-
-    t_dc = depth_charts[depth_charts["club_code"] == team_abbr] if "club_code" in depth_charts else pd.DataFrame()
-    penalty = 0.0
-    if not t_dc.empty:
-        dc_name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in t_dc.columns), None)
-        pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in t_dc.columns), None)
-        rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in t_dc.columns), None)
-
-        if pos_col and rank_col:
-            for role, pen in VORP_PENALTIES.items():
-                pos_match = t_dc[(t_dc[pos_col] == role[:2]) & (t_dc[rank_col].astype(str).str.strip() == "1")]
-                if not pos_match.empty:
-                    row = pos_match.iloc[0]
-                    p_name = row[dc_name_col] if dc_name_col else f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
-                    if p_name in inj_names:
-                        penalty += pen
-    return penalty
-
-# Dynamic Inactive Extraction
-INACTIVE_DESIGNATIONS = {"OUT", "IR", "INJURED RESERVE", "DOUBTFUL", "DNR", "PUP", "NFI", "SUSPENDED"}
-
 def extract_injury_map():
     injury_map = {}
     if injuries.empty:
         return injury_map
-    
+
     team_col = next((c for c in ["team", "club_code", "team_abbr"] if c in injuries.columns), None)
     status_col = next((c for c in ["report_status", "practice_status", "game_status"] if c in injuries.columns), None)
     name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in injuries.columns), None)
@@ -370,7 +434,8 @@ LIVE_INJURY_MAP = extract_injury_map()
 
 def resolve_active_depth_chart(team_abbr: str) -> dict:
     """
-    Traverses depth charts and dynamically promotes backups when primary starters are designated Out/IR.
+    Traverses depth charts, dynamically promotes backups when primary starters are Out/IR,
+    and enforces strict entity uniqueness across all positional depth tiers.
     """
     picks = {
         "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
@@ -397,7 +462,7 @@ def resolve_active_depth_chart(team_abbr: str) -> dict:
         return picks
 
     t_dc["rank_int"] = pd.to_numeric(t_dc[rank_col], errors="coerce").fillna(99).astype(int)
-    t_dc.sort_values(by=["rank_int"], inplace=True)
+    t_dc.sort_values(by=["rank_int"], ascending=True, inplace=True)
 
     team_injuries = LIVE_INJURY_MAP.get(team_abbr, {})
     slot_configs = [
@@ -407,9 +472,11 @@ def resolve_active_depth_chart(team_abbr: str) -> dict:
         ("TE", ["TE1"])
     ]
 
+    assigned_players = set()
+
     for pos, slots in slot_configs:
         cands = t_dc[t_dc[pos_col] == pos]
-        healthy_players = []
+        healthy_unique_players = []
 
         for _, row in cands.iterrows():
             if name_col and pd.notna(row[name_col]) and str(row[name_col]).strip():
@@ -419,41 +486,45 @@ def resolve_active_depth_chart(team_abbr: str) -> dict:
             else:
                 continue
 
-            # Check injury status
+            if full_name in assigned_players:
+                continue
+
             status = team_injuries.get(full_name, "ACTIVE")
             if status in INACTIVE_DESIGNATIONS:
                 continue
-            healthy_players.append(full_name)
+
+            healthy_unique_players.append(full_name)
 
         for idx, slot_key in enumerate(slots):
-            if idx < len(healthy_players):
-                picks[slot_key] = healthy_players[idx]
+            if idx < len(healthy_unique_players):
+                assigned_name = healthy_unique_players[idx]
+                picks[slot_key] = assigned_name
+                assigned_players.add(assigned_name)
             else:
                 picks[slot_key] = f"{team_abbr} {slot_key}"
 
     return picks
 
 # -------------------------------------------------------------------------
-# 5. LLM Scouting Engine (With Explicit Roster Context Injection)
+# 6. LLM Scouting Engine (With Dual-Mandate Persona)
 # -------------------------------------------------------------------------
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     system_prompt = """
 # ROLE & IDENTITY
-You are the NFL Research Director & Quantitative Architect operating with full domain authority over coaching tape breakdown and Next Gen Stats.
+You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
 
-# 2026 PLAY-CALLER & SCHEME CONTINUITY
-* Cardinals: HC Mike LaFleur | Falcons: HC Kevin Stefanski | Ravens: HC Jesse Minter | Bills: HC Joe Brady | Browns: HC Todd Monken | Broncos: HC Sean Payton | Lions: HC Dan Campbell | Packers: HC Matt LaFleur | Raiders: HC Klint Kubiak | Chargers: HC Jim Harbaugh | Rams: HC Sean McVay | Dolphins: HC Jeff Hafley | Giants: HC John Harbaugh | Jets: HC Aaron Glenn | Steelers: HC Mike McCarthy | 49ers: HC Kyle Shanahan | Titans: HC Robert Saleh | Commanders: HC Dan Quinn
-
-# INVARIANTS
-* You MUST reference explicit player names from the provided team rosters (e.g., Lamar Jackson, Derrick Henry, Jonathan Taylor) rather than generic placeholders like RB1 or WR1.
+# OPERATIONAL PROTOCOLS
+* You MUST reference explicit player names from the provided active rosters rather than generic placeholders like RB1 or WR1.
+* Explain pocket physics as a countdown race between pass protection and release timing (TTP vs TTT).
+* Map Duo/Power as vertical displacement and Zone schemes as sideline-to-sideline stretch.
 * Deliver actionable verdicts and deep film breakdowns.
-* Output strictly valid JSON without markdown fences.
+* Output strictly valid JSON without markdown backticks.
 """
 
     verdict_str = f"Bet {recommended_line} - {kelly_units:.2f}u" if recommended_team != "PASS" and kelly_units > 0.0 else "PASS - 0.00u"
 
     prompt = f"""
-Evaluate this NFL advance scouting dossier with explicit roster data:
+Evaluate this NFL advance scouting dossier with explicit active roster data:
 {json.dumps(payload, indent=2)}
 
 Output strictly valid JSON matching this schema:
@@ -510,7 +581,7 @@ Output strictly valid JSON matching this schema:
         return json.dumps(fallback)
 
 # -------------------------------------------------------------------------
-# 6. Master Execution Pipeline
+# 7. Master Execution Pipeline Loop
 # -------------------------------------------------------------------------
 async def main():
     target_week = 1
@@ -537,17 +608,8 @@ async def main():
         matchup = f"{away_team} @ {home_team}"
         week_num = int(game["week"]) if pd.notna(game["week"]) else target_week
 
-        spread_line = float(game["spread_line"]) if pd.notna(game.get("spread_line")) else 0.0
-        total_line = float(game["total_line"]) if pd.notna(game.get("total_line")) else 44.0
-        home_ml = float(game["home_moneyline"]) if pd.notna(game.get("home_moneyline")) else None
-        away_ml = float(game["away_moneyline"]) if pd.notna(game.get("away_moneyline")) else None
-
-        if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
-            p_h = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
-            p_a = 100.0 / (away_ml + 100.0) if away_ml > 0 else abs(away_ml) / (abs(away_ml) + 100.0)
-            market_home_prob = float(p_h / (p_h + p_a)) if (p_h + p_a) > 0 else 0.50
-        else:
-            market_home_prob = float(norm.cdf(spread_line / 13.5))
+        raw_spread_line = float(game["spread_line"]) if pd.notna(game.get("spread_line")) else 0.0
+        raw_total_line = float(game["total_line"]) if pd.notna(game.get("total_line")) else 44.0
 
         home_row = get_latest_team_row(home_team, target_season, week_num)
         away_row = get_latest_team_row(away_team, target_season, week_num)
@@ -564,9 +626,41 @@ async def main():
         diff_success = get_stat(home_row, "roll_off_early_down_success", 0.44) - get_stat(away_row, "roll_off_early_down_success", 0.44)
         diff_explosive = get_stat(home_row, "roll_off_explosive", 0.12) - get_stat(away_row, "roll_off_explosive", 0.12)
 
-        net_pass_edge += (calculate_roster_vorp(away_team) - calculate_roster_vorp(home_team))
         rest_diff = float(game.get("home_rest", 7.0) or 7.0) - float(game.get("away_rest", 7.0) or 7.0)
         is_divisional = int(game.get("div_game", 0) or 0)
+
+        # Dynamic QB Adjustment & Line Haircut
+        home_qb, home_qb_status, adj_spread, adj_total, adj_pass_edge, home_qb_sigma = resolve_qb_depth_and_adjustment(
+            team_abbr=home_team,
+            depth_charts_df=depth_charts,
+            injury_map=LIVE_INJURY_MAP,
+            base_spread=raw_spread_line,
+            base_total=raw_total_line,
+            base_pass_edge=net_pass_edge
+        )
+
+        away_qb, away_qb_status, _, _, _, away_qb_sigma = resolve_qb_depth_and_adjustment(
+            team_abbr=away_team,
+            depth_charts_df=depth_charts,
+            injury_map=LIVE_INJURY_MAP,
+            base_spread=-raw_spread_line,
+            base_total=adj_total,
+            base_pass_edge=-adj_pass_edge
+        )
+
+        spread_line = adj_spread
+        total_line = adj_total
+        net_pass_edge = adj_pass_edge
+
+        home_ml = float(game["home_moneyline"]) if pd.notna(game.get("home_moneyline")) else None
+        away_ml = float(game["away_moneyline"]) if pd.notna(game.get("away_moneyline")) else None
+
+        if home_ml is not None and away_ml is not None and not math.isnan(home_ml) and not math.isnan(away_ml):
+            p_h = 100.0 / (home_ml + 100.0) if home_ml > 0 else abs(home_ml) / (abs(home_ml) + 100.0)
+            p_a = 100.0 / (away_ml + 100.0) if away_ml > 0 else abs(away_ml) / (abs(away_ml) + 100.0)
+            market_home_prob = float(p_h / (p_h + p_a)) if (p_h + p_a) > 0 else 0.50
+        else:
+            market_home_prob = float(norm.cdf(spread_line / 13.5))
 
         feature_row = pd.DataFrame([[
             net_pass_edge, net_rush_edge, net_late_down_edge, diff_success,
@@ -623,15 +717,16 @@ async def main():
         implied_home_total = (total_line / 2.0) + (spread_line / 2.0)
         implied_away_total = (total_line / 2.0) - (spread_line / 2.0)
 
-        # Dynamic cascading depth chart resolution
         home_depth = resolve_active_depth_chart(home_team)
         away_depth = resolve_active_depth_chart(away_team)
+        home_depth["QB1"] = home_qb
+        away_depth["QB1"] = away_qb
 
         home_skills = generate_closed_loop_skill_projections(
-            home_team, implied_home_total, -spread_line, net_pass_edge, net_rush_edge, home_depth
+            home_team, implied_home_total, -spread_line, net_pass_edge, net_rush_edge, home_depth, qb_sigma=home_qb_sigma
         )
         away_skills = generate_closed_loop_skill_projections(
-            away_team, implied_away_total, spread_line, -net_pass_edge, -net_rush_edge, away_depth
+            away_team, implied_away_total, spread_line, -net_pass_edge, -net_rush_edge, away_depth, qb_sigma=away_qb_sigma
         )
 
         home_roster_summary = {p["role"]: p["player"] for p in home_skills}
