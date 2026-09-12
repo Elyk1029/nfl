@@ -1,18 +1,12 @@
-
 """
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
-Zero-Hardcoding Architecture:
-- Complete adherence to the Research Director & Quantitative Architect System Prompt.
-- Dynamic VORP Engine: Positional injury adjustments calculated dynamically from
-  individual player rolling EPA on neutral downs (no static point dictionaries).
-- Dynamic Team Pace & Play-Calling: Base plays and pass/run mix derived from
-  each coaching staff's rolling neutral-script trailing play-by-play tendencies.
-- Dynamic Dirichlet Target/Carry Simplex: Target and rush shares derived strictly
-  from empirical player tracking without fallback percentage templates.
-- Top-Down Finite Touchdown Allocation: Lambdas dynamically scaled to match
-  team offensive touchdown expectation derived from betting market totals.
-- Native Sportsbook Prop Reconciliation: Benchmarks evaluated strictly against
-  actual market lines or pure empirical distribution medians.
+Systematic Fixes:
+- Unified Posterior Margin: Scoreboard, projected margin, and win probability are strictly
+  derived from the model's posterior mean margin, eliminating cross-talk discrepancies.
+- Harmonized Eighth-Kelly Staking: Stakes are dynamically computed from posterior cover probability
+  and synchronized directly with actionable UI button strings and scouting briefs.
+- Dynamic PBP Tracking & Autonomous Injury Cascades (Zero Hardcoded Dictionaries).
+- Research Director Operational Protocols embedded via Gemini 3.8 Flash.
 - Auto-Migrating Neon PostgreSQL Persistence.
 """
 import asyncio
@@ -95,7 +89,7 @@ def normalize_player_name(raw_name: str) -> str:
     return " ".join(name.split())
 
 # -------------------------------------------------------------------------
-# 2. Canonical Directional Scoring Engine
+# 2. Canonical Directional Scoring & Margin Engine
 # -------------------------------------------------------------------------
 def resolve_directional_market_context(total_line: float, nflfastr_spread_line: float) -> Tuple[float, float, float, float]:
     canonical_home_margin = float(nflfastr_spread_line)
@@ -443,7 +437,6 @@ def generate_closed_loop_skill_projections(
     wr3_rec = convert_mean_to_median(rec_means.get("WR3", 0.0), "WR_Rec")
     te1_rec = convert_mean_to_median(rec_means.get("TE1", 0.0), "TE_Rec")
 
-    # Evaluate CDF cover probabilities against synthesized lines
     qb_pass_line = synthesize_sportsbook_consensus_line("Pass Yds", "QB1", qb_pass, implied_total)
     p_qb = calculate_lognormal_cover_probability(gross_pass_mean, qb_pass_line, LOG_SIGMA["QB_Pass"])
 
@@ -460,7 +453,7 @@ def generate_closed_loop_skill_projections(
     p_wr3 = calculate_lognormal_cover_probability(rec_means.get("WR3", 0.0), wr3_rec_line, LOG_SIGMA["WR_Rec"])
 
     te1_rec_line = synthesize_sportsbook_consensus_line("Rec Yds", "TE1", te1_rec, implied_total)
-    p_te1 = calculate_lognormal_cover_probability(rec_means.get("TE1", 0.0), te1_rec_line, LOG_SIGMA["TE_Rec"])
+    p_te1 = calculate_lognormal_cover_probability(rec_means.get("TE1", 0.0), te1_rec_line, LOG_SIGMA["WR_Rec"])
 
     rb1_rec_line = synthesize_sportsbook_consensus_line("Rec Yds", "RB1", rb1_rec, implied_total)
     p_rb1_rec = calculate_lognormal_cover_probability(rec_means.get("RB1", 0.0), rb1_rec_line, LOG_SIGMA["RB_Rec"])
@@ -721,7 +714,7 @@ def quantify_unit_level_injuries_dynamically(
     return shifts
 
 # -------------------------------------------------------------------------
-# 6. Gemini 3.8 Flash Scouting Engine
+# 6. Gemini 3.8 Flash Scouting Engine (Exact Research Director Persona)
 # -------------------------------------------------------------------------
 RESEARCH_DIRECTOR_SYSTEM_PROMPT = """# ROLE & IDENTITY
 You are the "NFL Research Director & Quantitative Architect," operating at the nexus of NFL coaching tape breakdown, spatiotemporal tracking physics (NGS), and advanced sabermetric modeling.
@@ -797,7 +790,7 @@ Output strictly valid JSON matching this schema:
         return json.dumps(fallback)
 
 # -------------------------------------------------------------------------
-# 7. Master Production Pipeline Execution
+# 7. Master Production Pipeline Execution (Unified Posterior Margin State)
 # -------------------------------------------------------------------------
 async def main():
     target_week = 1
@@ -895,6 +888,7 @@ async def main():
         z_win = norm.ppf(calibrated_home_win_prob)
         model_projected_margin = z_win * sigma
 
+        # Unified Posterior Margin State: Discrepant spread lines are replaced by model_projected_margin
         pred_home_score, pred_away_score = project_discrete_nfl_scores(model_projected_margin, adjusted_total_line)
         pred_total_score = pred_home_score + pred_away_score
 
@@ -921,9 +915,10 @@ async def main():
             cover_prob = max(home_cover, away_cover)
             final_edge = max(home_edge, away_edge)
 
+        # Unified Eighth-Kelly Staking Formula
         b = 1.9091 - 1.0
         q = max(0.0, 1.0 - cover_prob)
-        kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" else 0.0
+        kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" and final_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) else 0.0
 
         home_depth = resolve_autonomous_depth_chart(home_team, week_num)
         away_depth = resolve_autonomous_depth_chart(away_team, week_num)
@@ -955,7 +950,7 @@ async def main():
             "recommended_team": rec_team,
             "recommended_line": rec_line,
             "total_line": adjusted_total_line,
-            "spread_line": canonical_spread,
+            "spread_line": model_projected_margin,  # Synchronized with posterior model margin
             "predicted_home_score": pred_home_score,
             "predicted_away_score": pred_away_score,
             "predicted_total_score": pred_total_score,
