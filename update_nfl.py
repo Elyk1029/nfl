@@ -1,16 +1,21 @@
 """
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
-Fixes:
-- Synchronizes net EPA feature formula strictly to match train_model.py: (off_h - def_a) - (off_a - def_h).
-- Ensures model Class 1 represents Home Win Probability.
-- Serializes complete sportsbook benchmark lines, deltas, and recommendations to DB.
-- Resolves depth charts with strict franchise membership validation.
+Features:
+- Powered by Gemini 3.8 Flash (gemini-3.8-flash) via Google GenAI SDK.
+- Canonically aligns nflreadpy spread_line: spread_line > 0 strictly designates Home Favorite.
+- Opponent-adjusted Net EPA formula synchronized with train_model.py.
+- Closed-Loop Dirichlet Target Tree Conservation (Sum of Rec Means == Gross Pass Mean).
+- Team-budgeted Poisson TD allocation (breaking static mirrored lambdas).
+- Live Sportsbook Prop Comparison Engine (Passing, Rushing, Receiving).
+- Auto-migrating Neon PostgreSQL persistence.
 """
 import asyncio
 import json
 import math
 import os
 import sys
+from typing import Any, Dict, List, Tuple
+
 from google import genai
 from google.genai import types
 import nflreadpy as nfl
@@ -37,6 +42,7 @@ model = xgb.XGBClassifier()
 if os.path.exists(MODEL_FILE):
     model.load_model(MODEL_FILE)
     BOOSTER_FEATURES = model.get_booster().feature_names
+    print(f"XGBoost classifier loaded successfully. Booster features: {BOOSTER_FEATURES}")
 else:
     raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found in root directory.")
 
@@ -59,9 +65,11 @@ def clean_team_abbr(team_str: str) -> str:
 # -------------------------------------------------------------------------
 # 2. Canonical Directional Scoring Engine
 # -------------------------------------------------------------------------
-def resolve_directional_market_context(total_line: float, nflfastr_spread_line: float) -> tuple[float, float, float, float]:
+def resolve_directional_market_context(total_line: float, nflfastr_spread_line: float) -> Tuple[float, float, float, float]:
     """
-    In nflreadpy schedules, spread_line > 0 strictly means HOME is favored (e.g. DET +7 vs NO).
+    In nflreadpy schedules:
+    spread_line > 0 strictly indicates HOME is favored (e.g., DET +7.0 vs NO).
+    spread_line < 0 strictly indicates AWAY is favored.
     """
     canonical_home_margin = float(nflfastr_spread_line)
     implied_home = (total_line + canonical_home_margin) / 2.0
@@ -72,7 +80,11 @@ def resolve_directional_market_context(total_line: float, nflfastr_spread_line: 
 
     return canonical_home_margin, round(implied_home, 2), round(implied_away, 2), market_home_prob
 
-def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> tuple[int, int]:
+def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> Tuple[int, int]:
+    """
+    Snaps continuous projected margin to discrete NFL key numbers.
+    Strict Invariant: If projected_margin > 0, home team MUST win.
+    """
     effective_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
     home_favored = effective_margin > 0.0
     abs_margin = abs(effective_margin)
@@ -109,7 +121,7 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
     return int(best_pair[0]), int(best_pair[1])
 
 # -------------------------------------------------------------------------
-# 3. Closed-Loop Skill Engine with Explicit Sportsbook Benchmarks
+# 3. Closed-Loop Skill Engine & Sportsbook Benchmarks
 # -------------------------------------------------------------------------
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
@@ -120,7 +132,7 @@ def convert_mean_to_median(mean_val: float, role_key: str) -> float:
     if mean_val <= 0.0:
         return 0.0
     sig = LOG_SIGMA.get(role_key, 0.50)
-    return round(max(0.0, float(mean_val * math.exp(-(sig**2) / 2.0))), 1)
+    return round(max(0.0, float(mean_val * math.exp(-(sig ** 2) / 2.0))), 1)
 
 def synthesize_sportsbook_consensus_line(stat_type: str, role: str, model_median: float, team_implied: float) -> float:
     if model_median <= 0.0:
@@ -159,8 +171,8 @@ def generate_closed_loop_skill_projections(
     team_spread_margin: float,
     pass_edge: float, 
     rush_edge: float, 
-    depth_names: dict
-) -> list:
+    depth_names: Dict[str, str]
+) -> List[Dict[str, Any]]:
     total_plays = 63.5 * (implied_total / 22.0) ** 0.25
     
     script_shift = -0.007 * team_spread_margin
@@ -244,7 +256,7 @@ def generate_closed_loop_skill_projections(
     ]
 
 # -------------------------------------------------------------------------
-# 4. Ingestion & Roster Resolution
+# 4. Multi-Source Ingestion & Franchise-Aligned Depth Resolution
 # -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
@@ -325,7 +337,7 @@ def get_latest_team_row(team_abbr: str, target_season: int, target_week: int) ->
 
 INACTIVE_DESIGNATIONS = {"OUT", "IR", "INJURED RESERVE", "DOUBTFUL", "DNR", "PUP", "NFI", "SUSPENDED"}
 
-def extract_injury_map() -> dict:
+def extract_injury_map() -> Dict[str, Dict[str, str]]:
     injury_map = {}
     if injuries.empty:
         return injury_map
@@ -357,7 +369,7 @@ def extract_injury_map() -> dict:
 
 LIVE_INJURY_MAP = extract_injury_map()
 
-def resolve_active_depth_chart(team_abbr: str, target_week: int) -> dict:
+def resolve_active_depth_chart(team_abbr: str, target_week: int) -> Dict[str, str]:
     picks = {
         "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
         "WR1": f"{team_abbr} WR1", "WR2": f"{team_abbr} WR2", "WR3": f"{team_abbr} WR3", "TE1": f"{team_abbr} TE1"
@@ -446,7 +458,7 @@ You are the "NFL Research Director & Quantitative Architect," operating at the n
 * Frame pocket integrity strictly as the countdown race between pass protection and release timing (TTP vs TTT).
 * Map Duo/Power as vertical interior displacement and Zone schemes as horizontal sideline stretch.
 * Deliver direct verdicts without conversational setups or labeled conclusions.
-* Output strictly valid JSON without markdown backticks.
+* Output strictly valid JSON without markdown formatting backticks.
 """
     verdict_str = f"Bet {recommended_line} - {kelly_units:.2f}u" if recommended_team != "PASS" and kelly_units > 0.0 else "PASS - 0.00u"
 
@@ -506,7 +518,7 @@ Output strictly valid JSON matching this schema:
         return json.dumps(fallback)
 
 # -------------------------------------------------------------------------
-# 6. Master Production Pipeline
+# 6. Master Production Pipeline Loop
 # -------------------------------------------------------------------------
 async def main():
     target_week = 1
@@ -542,8 +554,7 @@ async def main():
         def get_stat(df, col, default=0.0):
             return float(df[col].values[0]) if not df.empty and col in df.columns and pd.notna(df[col].values[0]) else float(default)
 
-        # STRICT SYNCHRONIZATION WITH train_model.py
-        # net_edge = (off_home - def_away) - (off_away - def_home)
+        # STRICT Opponent-Cross Subtraction (Synchronized with train_model.py)
         net_pass_edge = (get_stat(home_row, "roll_off_dropback_epa") - get_stat(away_row, "roll_def_dropback_epa")) - \
                         (get_stat(away_row, "roll_off_dropback_epa") - get_stat(home_row, "roll_def_dropback_epa"))
         net_rush_edge = (get_stat(home_row, "roll_off_rush_epa") - get_stat(away_row, "roll_def_rush_epa")) - \
@@ -585,14 +596,20 @@ async def main():
 
         raw_model_prob = float(model.predict_proba(feature_row)[0][1])
 
-        # Bayesian blending
-        if "market_home_prob" in EXPECTED_FEATURES:
-            calibrated_home_win_prob = (0.50 * raw_model_prob) + (0.50 * market_home_prob)
+        # Directionally Stable Bayesian Prior Weighting
+        if canonical_spread >= 3.0:
+            market_weight = 0.70 if abs(raw_model_prob - market_home_prob) > 0.25 else 0.50
+            calibrated_home_win_prob = (1.0 - market_weight) * max(raw_model_prob, 1.0 - raw_model_prob) + (market_weight * market_home_prob)
+        elif canonical_spread <= -3.0:
+            market_weight = 0.70 if abs(raw_model_prob - market_home_prob) > 0.25 else 0.50
+            calibrated_home_win_prob = (1.0 - market_weight) * min(raw_model_prob, 1.0 - raw_model_prob) + (market_weight * market_home_prob)
         else:
             calibrated_home_win_prob = (0.50 * raw_model_prob) + (0.50 * market_home_prob)
 
+        calibrated_home_win_prob = max(0.02, min(0.98, calibrated_home_win_prob))
+
         sigma = 13.45 * math.sqrt(max(32.0, raw_total_line) / 44.0)
-        z_win = norm.ppf(max(0.01, min(0.99, calibrated_home_win_prob)))
+        z_win = norm.ppf(calibrated_home_win_prob)
         model_projected_margin = z_win * sigma
 
         pred_home_score, pred_away_score = project_discrete_nfl_scores(model_projected_margin, raw_total_line)
@@ -629,7 +646,7 @@ async def main():
         home_depth = resolve_active_depth_chart(home_team, week_num)
         away_depth = resolve_active_depth_chart(away_team, week_num)
 
-        # Generate Complete Projections with Vegas Prop Benchmarks
+        # Generate Complete Projections with Sportsbook Benchmarks
         home_skills = generate_closed_loop_skill_projections(
             home_team, implied_home_total, model_projected_margin, net_pass_edge, net_rush_edge, home_depth
         )
