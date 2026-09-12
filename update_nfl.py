@@ -1,11 +1,10 @@
 """
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
 Features:
-- Multi-source nflreadpy ingestion (schedules, pbp, injuries, depth_charts).
-- Cross-season temporal lookbacks and opponent-adjusted Ridge EPA rolling metrics.
-- Roster injury haircuts via VORP penalties.
+- Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
+- Concurrent, dynamic injury-conditioned depth chart cascading (promotes healthy backups).
 - Closed-Loop Skill Player Volume Allocation (QB, RB1/2, WR1/2/3, TE1) with target-tree conservation.
-- Real 2026 Roster Name Resolution (combining first_name and last_name from depth charts).
+- Real 2026 Roster Name Resolution across multi-column nflverse schemas.
 - Log-normal median yardage transformations and Poisson anytime-TD modeling.
 - Discrete empirical score generation (zero regular-season ties).
 - Auto-migrating Neon PostgreSQL upsert.
@@ -221,7 +220,7 @@ def generate_closed_loop_skill_projections(team_abbr: str, implied_total: float,
     ]
 
 # -------------------------------------------------------------------------
-# 4. Multi-Source Ingestion & Opponent-Adjusted EPA
+# 4. Multi-Source Ingestion & Dynamic Roster Resolution
 # -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
@@ -307,17 +306,72 @@ def calculate_roster_vorp(team_abbr):
     t_inj = injuries[(injuries["team"] == team_abbr) & (injuries["report_status"].isin(["Out", "Doubtful", "IR"]))]
     if t_inj.empty:
         return 0.0
-    inj_names = t_inj["player_name"].dropna().tolist() if "player_name" in t_inj else []
+    
+    # Parse injuries using multi-column schema aliases
+    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in t_inj.columns), None)
+    if name_col:
+        inj_names = t_inj[name_col].dropna().tolist()
+    elif "first_name" in t_inj.columns and "last_name" in t_inj.columns:
+        inj_names = (t_inj["first_name"].fillna("") + " " + t_inj["last_name"].fillna("")).str.strip().tolist()
+    else:
+        inj_names = []
+
     t_dc = depth_charts[depth_charts["club_code"] == team_abbr] if "club_code" in depth_charts else pd.DataFrame()
     penalty = 0.0
-    if not t_dc.empty and "player_name" in t_dc:
-        for role, pen in VORP_PENALTIES.items():
-            pos_match = t_dc[(t_dc["pos_abb"] == role[:2]) & (t_dc["pos_rank"].astype(str) == "1")]
-            if not pos_match.empty and pos_match.iloc[0]["player_name"] in inj_names:
-                penalty += pen
+    if not t_dc.empty:
+        dc_name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in t_dc.columns), None)
+        pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in t_dc.columns), None)
+        rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in t_dc.columns), None)
+
+        if pos_col and rank_col:
+            for role, pen in VORP_PENALTIES.items():
+                pos_match = t_dc[(t_dc[pos_col] == role[:2]) & (t_dc[rank_col].astype(str).str.strip() == "1")]
+                if not pos_match.empty:
+                    row = pos_match.iloc[0]
+                    p_name = row[dc_name_col] if dc_name_col else f"{row.get('first_name', '')} {row.get('last_name', '')}".strip()
+                    if p_name in inj_names:
+                        penalty += pen
     return penalty
 
-def extract_depth_chart_names(team_abbr: str) -> dict:
+# Dynamic Inactive Extraction
+INACTIVE_DESIGNATIONS = {"OUT", "IR", "INJURED RESERVE", "DOUBTFUL", "DNR", "PUP", "NFI", "SUSPENDED"}
+
+def extract_injury_map():
+    injury_map = {}
+    if injuries.empty:
+        return injury_map
+    
+    team_col = next((c for c in ["team", "club_code", "team_abbr"] if c in injuries.columns), None)
+    status_col = next((c for c in ["report_status", "practice_status", "game_status"] if c in injuries.columns), None)
+    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in injuries.columns), None)
+    first_col = next((c for c in ["first_name", "fname"] if c in injuries.columns), None)
+    last_col = next((c for c in ["last_name", "lname"] if c in injuries.columns), None)
+
+    if not team_col or not status_col:
+        return injury_map
+
+    for _, row in injuries.iterrows():
+        t = str(row[team_col]).strip().upper()
+        if name_col and pd.notna(row[name_col]):
+            p_name = str(row[name_col]).strip()
+        elif first_col and last_col and pd.notna(row[first_col]) and pd.notna(row[last_col]):
+            p_name = f"{row[first_col]} {row[last_col]}".strip()
+        else:
+            continue
+
+        status = str(row[status_col]).strip().upper() if pd.notna(row[status_col]) else "ACTIVE"
+        if t not in injury_map:
+            injury_map[t] = {}
+        injury_map[t][p_name] = status
+
+    return injury_map
+
+LIVE_INJURY_MAP = extract_injury_map()
+
+def resolve_active_depth_chart(team_abbr: str) -> dict:
+    """
+    Traverses depth charts and dynamically promotes backups when primary starters are designated Out/IR.
+    """
     picks = {
         "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
         "WR1": f"{team_abbr} WR1", "WR2": f"{team_abbr} WR2", "WR3": f"{team_abbr} WR3", "TE1": f"{team_abbr} TE1"
@@ -325,32 +379,62 @@ def extract_depth_chart_names(team_abbr: str) -> dict:
     if depth_charts.empty:
         return picks
 
-    t_dc = depth_charts[depth_charts["club_code"] == team_abbr] if "club_code" in depth_charts else pd.DataFrame()
+    team_col = next((c for c in ["club_code", "team", "team_abbr"] if c in depth_charts.columns), None)
+    if not team_col:
+        return picks
+
+    t_dc = depth_charts[depth_charts[team_col] == team_abbr].copy()
     if t_dc.empty:
         return picks
 
-    # Check for first_name and last_name columns in nflreadpy depth charts
     first_col = next((c for c in ["first_name", "fname"] if c in t_dc.columns), None)
     last_col = next((c for c in ["last_name", "lname"] if c in t_dc.columns), None)
-    name_col = next((c for c in ["player_name", "full_name", "player"] if c in t_dc.columns), None)
+    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in t_dc.columns), None)
     pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in t_dc.columns), None)
     rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in t_dc.columns), None)
 
-    if pos_col and rank_col:
-        mapping = [("QB", "1", "QB1"), ("RB", "1", "RB1"), ("RB", "2", "RB2"), 
-                   ("WR", "1", "WR1"), ("WR", "2", "WR2"), ("WR", "3", "WR3"), ("TE", "1", "TE1")]
-        for pos, rank, key in mapping:
-            matched = t_dc[(t_dc[pos_col] == pos) & (t_dc[rank_col].astype(str).str.strip() == rank)]
-            if not matched.empty:
-                row = matched.iloc[0]
-                if first_col and last_col and pd.notna(row[first_col]) and pd.notna(row[last_col]):
-                    picks[key] = f"{row[first_col]} {row[last_col]}"
-                elif name_col and pd.notna(row[name_col]):
-                    picks[key] = row[name_col]
+    if not pos_col or not rank_col:
+        return picks
+
+    t_dc["rank_int"] = pd.to_numeric(t_dc[rank_col], errors="coerce").fillna(99).astype(int)
+    t_dc.sort_values(by=["rank_int"], inplace=True)
+
+    team_injuries = LIVE_INJURY_MAP.get(team_abbr, {})
+    slot_configs = [
+        ("QB", ["QB1"]),
+        ("RB", ["RB1", "RB2"]),
+        ("WR", ["WR1", "WR2", "WR3"]),
+        ("TE", ["TE1"])
+    ]
+
+    for pos, slots in slot_configs:
+        cands = t_dc[t_dc[pos_col] == pos]
+        healthy_players = []
+
+        for _, row in cands.iterrows():
+            if name_col and pd.notna(row[name_col]) and str(row[name_col]).strip():
+                full_name = str(row[name_col]).strip()
+            elif first_col and last_col and pd.notna(row[first_col]) and pd.notna(row[last_col]):
+                full_name = f"{row[first_col]} {row[last_col]}".strip()
+            else:
+                continue
+
+            # Check injury status
+            status = team_injuries.get(full_name, "ACTIVE")
+            if status in INACTIVE_DESIGNATIONS:
+                continue
+            healthy_players.append(full_name)
+
+        for idx, slot_key in enumerate(slots):
+            if idx < len(healthy_players):
+                picks[slot_key] = healthy_players[idx]
+            else:
+                picks[slot_key] = f"{team_abbr} {slot_key}"
+
     return picks
 
 # -------------------------------------------------------------------------
-# 5. LLM Scouting Engine
+# 5. LLM Scouting Engine (With Explicit Roster Context Injection)
 # -------------------------------------------------------------------------
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     system_prompt = """
@@ -539,8 +623,9 @@ async def main():
         implied_home_total = (total_line / 2.0) + (spread_line / 2.0)
         implied_away_total = (total_line / 2.0) - (spread_line / 2.0)
 
-        home_depth = extract_depth_chart_names(home_team)
-        away_depth = extract_depth_chart_names(away_team)
+        # Dynamic cascading depth chart resolution
+        home_depth = resolve_active_depth_chart(home_team)
+        away_depth = resolve_active_depth_chart(away_team)
 
         home_skills = generate_closed_loop_skill_projections(
             home_team, implied_home_total, -spread_line, net_pass_edge, net_rush_edge, home_depth
