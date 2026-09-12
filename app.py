@@ -86,9 +86,9 @@ COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21
 def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> tuple[int, int]:
     """
     Snaps raw linear projected margins and totals to empirical NFL football key numbers,
-    guaranteeing zero regular-season ties and minimizing joint error.
+    guaranteeing zero regular-season ties and preserving favorite directionality.
     """
-    effective_margin = projected_margin if abs(projected_margin) >= 0.05 else 0.10
+    effective_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
     home_favored = effective_margin > 0.0
     abs_margin = abs(effective_margin)
 
@@ -99,13 +99,18 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
     best_pair = (24, 21) if home_favored else (21, 24)
     min_loss = float("inf")
 
-    candidate_home = [s for s in COMMON_TEAM_SCORES if abs(s - raw_home) <= 6.5] or [int(round(raw_home))]
-    candidate_away = [s for s in COMMON_TEAM_SCORES if abs(s - raw_away) <= 6.5] or [int(round(raw_away))]
+    candidate_home = [s for s in COMMON_TEAM_SCORES if abs(s - raw_home) <= 7.0] or [int(round(raw_home))]
+    candidate_away = [s for s in COMMON_TEAM_SCORES if abs(s - raw_away) <= 7.0] or [int(round(raw_away))]
 
     for h in candidate_home:
         for a in candidate_away:
-            if h == a or (home_favored and h <= a) or (not home_favored and a <= h):
+            if h == a:
                 continue
+            if home_favored and h <= a:
+                continue
+            if not home_favored and a <= h:
+                continue
+
             pair_margin = abs(h - a)
             pair_total = h + a
             loss = (abs(pair_total - total_line) * 1.0) + (abs(pair_margin - abs_margin) * 1.5)
@@ -124,6 +129,7 @@ def normalize_and_grade_spread(pred_home_score: float, pred_away_score: float,
     actual_margin = float(actual_home_score - actual_away_score)
     pred_margin = float(pred_home_score - pred_away_score)
 
+    # Home covers if margin + spread_line > 0 (where spread_line is negative for home favorite)
     actual_home_covered = (actual_margin + home_spread_line) > 0.0
     pred_home_covered = (pred_margin + home_spread_line) > 0.0
 
@@ -257,7 +263,7 @@ with st.sidebar:
         st.rerun()
 
 # -------------------------------------------------------------------------
-# 4. Dashboard Header & Global KPI Metrics
+# 4. Global KPIs
 # -------------------------------------------------------------------------
 st.title("🏈 Institutional NFL Quantitative Terminal")
 st.caption("Discrete Empirical Score Modeling | Closed-Loop Skill Props | Powered by Gemini 3.8 Flash")
@@ -283,7 +289,7 @@ tab_slate, tab_steam, tab_guru, tab_sim = st.tabs([
 ])
 
 # -------------------------------------------------------------------------
-# 5. Tab 1: Weekly Board
+# 5. Weekly Board Tab
 # -------------------------------------------------------------------------
 with tab_slate:
     displayed = 0
@@ -314,6 +320,10 @@ with tab_slate:
         p_home = int(row.get('predicted_home_score') or 24)
         p_away = int(row.get('predicted_away_score') or 21)
         p_total = int(row.get('predicted_total_score') or (p_home + p_away))
+
+        # Reconciled Directional Margin Metric
+        margin_delta = p_home - p_away
+        margin_label = f"{home_team} {margin_delta:+d}"
 
         if stake > 0.0 and edge_pct > 0.0:
             verdict_str = analysis_data.get('actionable_verdict', f"BET - {stake:.2f}u")
@@ -348,7 +358,7 @@ with tab_slate:
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Model Win Prob", f"{home_win_pct:.1f}%")
             m2.metric("Market Consensus", f"{market_win_pct:.1f}%", f"{home_win_pct - market_win_pct:+.1f}% vs Book")
-            m3.metric("Projected Margin", f"{home_team} {p_home - p_away:+d}")
+            m3.metric("Projected Margin", margin_label)
             m4.metric("Eighth-Kelly Stake", f"{stake:.2f}u")
 
             with st.expander("Tactical Matchup Dossier & Skill Player Stat Lines", expanded=is_bet):
@@ -424,7 +434,7 @@ with tab_slate:
         st.info("No matchups match your edge/stake filter thresholds.")
 
 # -------------------------------------------------------------------------
-# 6. Tab 2: Market Steam
+# 6. Market Steam Tab
 # -------------------------------------------------------------------------
 with tab_steam:
     st.subheader("⚡ Line Movement & Market Pricing Discrepancies")
@@ -446,7 +456,7 @@ with tab_steam:
     st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
 
 # -------------------------------------------------------------------------
-# 7. Tab 3: Guru Workbench
+# 7. Guru Workbench Tab
 # -------------------------------------------------------------------------
 with tab_guru:
     st.subheader(f"🧠 {guru_mode}")
@@ -470,7 +480,7 @@ with tab_guru:
                     st.error(f"Inference Failure: {e}")
 
 # -------------------------------------------------------------------------
-# 8. Tab 4: Blind Historical Simulation Engine (Bug-Free & Airlocked)
+# 8. Historical Simulation Airlock Tab
 # -------------------------------------------------------------------------
 with tab_sim:
     st.subheader("🧪 Blind Past-Game Simulation Engine (Airlocked)")
@@ -498,7 +508,7 @@ with tab_sim:
                 home = str(g["home_team"])
                 away = str(g["away_team"])
                 raw_spread = float(g.get("spread_line", 0.0) or 0.0)
-                home_spread_line = -raw_spread
+                home_spread_line = raw_spread  # Retain standard home spread convention
                 total_line = float(g.get("total_line", 44.0) or 44.0)
 
                 actual_home = int(g["home_score"])
