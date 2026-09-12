@@ -1,9 +1,12 @@
 """
 update_nfl.py - Institutional NFL Quantitative Terminal Pipeline Orchestrator.
-Fixed:
-- Strict weekly filtering on depth charts to eliminate multi-week duplicate entries.
-- Distinct player allocation per role (no player duplicated across RB1/RB2 or WR1/WR2/WR3).
+Features:
+- Multi-source nflreadpy ingestion (schedules, pbp, player_stats, injuries, depth_charts).
+- Dynamic Bayesian QB Injury Adjustment & VORP Haircut Engine.
+- Multi-column schema alias resolution (player_name, full_name, first_name + last_name).
+- Set-aware Depth Chart Cascading (guarantees unique player allocation per role).
 - Closed-Loop Skill Player Volume Allocation (QB, RB1/2, WR1/2/3, TE1).
+- Non-negative clamping, log-normal median conversions, and Poisson TD modeling.
 - Discrete empirical score generation (zero regular-season ties).
 - Auto-migrating Neon PostgreSQL persistence.
 """
@@ -23,12 +26,14 @@ import xgboost as xgb
 
 from verifier import NFLDataVerifier
 
+# -------------------------------------------------------------------------
 # 1. Environment Verification & Client Initialization
+# -------------------------------------------------------------------------
 db_url = os.environ.get("DATABASE_URL")
 gemini_key = os.environ.get("GEMINI_API_KEY")
 
 if not db_url or not gemini_key:
-    raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured.")
+    raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured in environment or secrets.")
 
 engine = create_engine(db_url, pool_size=5, pool_pre_ping=True)
 client = genai.Client(api_key=gemini_key)
@@ -60,7 +65,9 @@ def clean_team_abbr(team_str):
     cleaned = team_str.strip().upper()
     return TEAM_ABBR_MAP.get(cleaned, cleaned)
 
-# 2. Discrete Empirical Score Engine
+# -------------------------------------------------------------------------
+# 2. Discrete Empirical Score Engine (Zero Regular-Season Ties)
+# -------------------------------------------------------------------------
 NFL_KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
 COMMON_TEAM_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 
@@ -95,7 +102,9 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> t
 
     return int(best_pair[0]), int(best_pair[1])
 
+# -------------------------------------------------------------------------
 # 3. Dynamic QB Bayesian Adjustment & VORP Engine
+# -------------------------------------------------------------------------
 QB_VORP_TIERS = {
     "Patrick Mahomes": 7.0, "Josh Allen": 7.0, "Lamar Jackson": 6.5, "Joe Burrow": 6.5,
     "C.J. Stroud": 5.0, "Jordan Love": 5.0, "Jalen Hurts": 4.5, "Justin Herbert": 4.5,
@@ -192,7 +201,9 @@ def resolve_qb_depth_and_adjustment(
         round(qb_variance_sigma, 2)
     )
 
+# -------------------------------------------------------------------------
 # 4. Closed-Loop Skill Volume & Log-Normal Median Allocation
+# -------------------------------------------------------------------------
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48, 
     "RB_Rec": 0.55, "WR_Rec": 0.58, "TE_Rec": 0.54
@@ -310,7 +321,9 @@ def generate_closed_loop_skill_projections(
         },
     ]
 
+# -------------------------------------------------------------------------
 # 5. Multi-Source Ingestion & Dynamic Roster Resolution
+# -------------------------------------------------------------------------
 CURRENT_SEASON = 2026
 DATA_SEASON = 2025
 
@@ -421,10 +434,6 @@ def extract_injury_map():
 LIVE_INJURY_MAP = extract_injury_map()
 
 def resolve_active_depth_chart(team_abbr: str, target_week: int) -> dict:
-    """
-    Traverses weekly depth charts, isolates the active week, promotes healthy backups,
-    and guarantees that no athlete is mapped to more than one slot.
-    """
     picks = {
         "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
         "WR1": f"{team_abbr} WR1", "WR2": f"{team_abbr} WR2", "WR3": f"{team_abbr} WR3", "TE1": f"{team_abbr} TE1"
@@ -440,7 +449,6 @@ def resolve_active_depth_chart(team_abbr: str, target_week: int) -> dict:
     if t_dc.empty:
         return picks
 
-    # Restrict to active week to prevent multi-week starter collisions
     if "week" in t_dc.columns:
         valid_weeks = t_dc[t_dc["week"] == target_week]
         if not valid_weeks.empty:
@@ -483,7 +491,6 @@ def resolve_active_depth_chart(team_abbr: str, target_week: int) -> dict:
             else:
                 continue
 
-            # Skip duplicate name representations
             if full_name.lower() in assigned_players:
                 continue
 
@@ -502,7 +509,9 @@ def resolve_active_depth_chart(team_abbr: str, target_week: int) -> dict:
 
     return picks
 
+# -------------------------------------------------------------------------
 # 6. LLM Scouting Engine (With Dual-Mandate Persona)
+# -------------------------------------------------------------------------
 async def generate_matchup_analysis(semaphore, payload, recommended_team, recommended_line, kelly_units):
     system_prompt = """
 # ROLE & IDENTITY
@@ -575,7 +584,9 @@ Output strictly valid JSON matching this schema:
         }
         return json.dumps(fallback)
 
+# -------------------------------------------------------------------------
 # 7. Master Execution Pipeline Loop
+# -------------------------------------------------------------------------
 async def main():
     target_week = 1
     target_season = CURRENT_SEASON
