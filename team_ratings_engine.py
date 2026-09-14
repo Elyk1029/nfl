@@ -1,7 +1,7 @@
 """
-team_ratings_engine.py - Excel-Integrated NFL Q-OVR vs. Madden Discrepancy Engine.
-Reads player ratings directly from Madden_27_All_Teams_Ratings.xlsx and calculates
-team-level overalls, offensive/defensive units, and discrepancy signals.
+team_ratings_engine.py - Excel-Integrated Database Overall & Roster Pipeline.
+Parses Madden_27_Secondary_Weighted_Rankings.xlsx for Database Overalls, unit ratings,
+and full player rosters to power the institutional terminal and AI research assistant.
 """
 
 import logging
@@ -23,21 +23,21 @@ TEAM_ABBR_MAP = {
     "LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"
 }
 
-NAME_TO_ABBR = {
-    'Arizona Cardinals': 'ARI', 'Atlanta Falcons': 'ATL', 'Baltimore Ravens': 'BAL',
-    'Buffalo Bills': 'BUF', 'Carolina Panthers': 'CAR', 'Chicago Bears': 'CHI',
-    'Cincinnati Bengals': 'CIN', 'Cleveland Browns': 'CLE', 'Dallas Cowboys': 'DAL',
-    'Denver Broncos': 'DEN', 'Detroit Lions': 'DET', 'Green Bay Packers': 'GB',
-    'Houston Texans': 'HOU', 'Indianapolis Colts': 'IND', 'Jacksonville Jaguars': 'JAX',
-    'Kansas City Chiefs': 'KC', 'Las Vegas Raiders': 'LV', 'Los Angeles Chargers': 'LAC',
-    'Los Angeles Rams': 'LA', 'Miami Dolphins': 'MIA', 'Minnesota Vikings': 'MIN',
-    'New England Patriots': 'NE', 'New Orleans Saints': 'NO', 'New York Giants': 'NYG',
-    'New York Jets': 'NYJ', 'Philadelphia Eagles': 'PHI', 'Pittsburgh Steelers': 'PIT',
-    'San Francisco 49ers': 'SF', 'Seattle Seahawks': 'SEA', 'Tampa Bay Buccaneers': 'TB',
-    'Tennessee Titans': 'TEN', 'Washington Commanders': 'WAS'
+SUMMARY_TEAM_TO_ABBR = {
+    'Los Angeles Rams': 'LA', 'Baltimore Ravens': 'BAL', 'Detroit Lions': 'DET',
+    'Buffalo Bills': 'BUF', 'New England Patriots': 'NE', 'Denver Broncos': 'DEN',
+    'Philadelphia Eagles': 'PHI', 'Kansas City Chiefs': 'KC', 'San Francisco 49ers': 'SF',
+    'Los Angeles Chargers': 'LAC', 'Dallas Cowboys': 'DAL', 'Cincinnati Bengals': 'CIN',
+    'Tampa Bay Buccaneers': 'TB', 'Chicago Bears': 'CHI', 'Seattle Seahawks': 'SEA',
+    'Houston Texans': 'HOU', 'Pittsburgh Steelers': 'PIT', 'Indianapolis Colts': 'IND',
+    'Green Bay Packers': 'GB', 'Minnesota Vikings': 'MIN', 'Washington Commanders': 'WAS',
+    'Las Vegas Raiders': 'LV', 'Atlanta Falcons': 'ATL', 'Jacksonville Jaguars': 'JAX',
+    'NY Giants': 'NYG', 'Carolina Panthers': 'CAR', 'Arizona Cardinals': 'ARI',
+    'New Orleans Saints': 'NO', 'Cleveland Browns': 'CLE', 'NY Jets': 'NYJ',
+    'Tennessee Titans': 'TEN', 'Miami Dolphins': 'MIA'
 }
 
-ALL_32_TEAMS = list(NAME_TO_ABBR.values())
+ALL_32_TEAMS = list(SUMMARY_TEAM_TO_ABBR.values())
 
 def clean_team_abbr(t: str) -> str:
     c = str(t).strip().upper()
@@ -65,22 +65,37 @@ def init_ratings_schema(db_engine=engine) -> None:
         net_rush_epa NUMERIC NOT NULL,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
+
+    CREATE TABLE IF NOT EXISTS nfl_team_rosters (
+        player_id SERIAL PRIMARY KEY,
+        team TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        position TEXT NOT NULL,
+        overall_rating INTEGER NOT NULL,
+        archetype TEXT,
+        tier_status TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_nfl_team_ratings_q_ovr 
     ON nfl_team_ratings_comparison (model_q_ovr DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_nfl_rosters_team 
+    ON nfl_team_rosters (team);
     """
     with db_engine.begin() as conn:
         conn.execute(text(ddl))
 
 class QuantitativeRatingsPipeline:
-    def __init__(self, season: int = 2026, excel_path: str = "Madden_27_All_Teams_Ratings.xlsx"):
+    def __init__(self, season: int = 2026, excel_path: str = "Madden_27_Secondary_Weighted_Rankings.xlsx"):
         self.season = season
         self.excel_path = excel_path
         self.pbp_df = pd.DataFrame()
-        self.madden_df = pd.DataFrame()
+        self.summary_df = pd.DataFrame()
+        self.roster_df = pd.DataFrame()
         init_ratings_schema(engine)
 
     def sync_data(self) -> None:
-        logging.info("Syncing tracking data and parsing Madden Excel file...")
+        logging.info("Syncing tracking data and parsing Secondary Weighted Rankings Excel file...")
         try:
             pbp = nfl.load_pbp(seasons=[self.season, self.season - 1]).to_pandas()
         except Exception:
@@ -91,35 +106,38 @@ class QuantitativeRatingsPipeline:
                 pbp[col] = pbp[col].apply(clean_team_abbr)
         self.pbp_df = pbp
 
-        # Parse Excel Roster File
         if os.path.exists(self.excel_path):
             xls = pd.ExcelFile(self.excel_path)
+            if 'Summary' in xls.sheet_names:
+                self.summary_df = pd.read_excel(self.excel_path, sheet_name='Summary')
+
             team_rosters = []
             for sheet in xls.sheet_names:
-                sheet_df = pd.read_excel(self.excel_path, sheet_name=sheet)
-                header_idx = None
-                for idx, row in sheet_df.iterrows():
-                    if any('Player Name' in str(v) for v in row.values):
-                        header_idx = idx
-                        break
-                if header_idx is not None:
-                    df_team = pd.read_excel(self.excel_path, sheet_name=sheet, skiprows=header_idx+1)
-                    df_team.columns = [str(c).strip() for c in df_team.columns]
-                    ovr_col = [c for c in df_team.columns if 'Overall' in c or 'OVR' in c][0]
-                    pos_col = [c for c in df_team.columns if 'Position' in c or 'Pos' in c][0]
-                    df_team[ovr_col] = pd.to_numeric(df_team[ovr_col], errors='coerce')
-                    df_team = df_team.dropna(subset=[ovr_col])
-                    
-                    abbr = NAME_TO_ABBR.get(sheet, 'FA')
+                if sheet in ['Summary', 'All Teams Starters']:
+                    continue
+                df_team = pd.read_excel(self.excel_path, sheet_name=sheet)
+                if 'firstName' in df_team.columns and 'lastName' in df_team.columns and 'overallRating' in df_team.columns:
+                    abbr = SUMMARY_TEAM_TO_ABBR.get(sheet, clean_team_abbr(sheet))
                     for _, row in df_team.iterrows():
+                        f_name = str(row.get('firstName', '')).strip()
+                        l_name = str(row.get('lastName', '')).strip()
+                        p_name = f"{f_name} {l_name}".strip()
+                        pos = str(row.get('position/shortLabel', 'UNK')).strip().upper()
+                        ovr = int(row.get('overallRating', 70))
+                        arch = str(row.get('archetype/label', ''))
+                        tier = str(row.get('Tier / Status', row.get('X-Factor', 'Starter')))
+                        
                         team_rosters.append({
                             "team": abbr,
-                            "position": str(row[pos_col]).strip().upper(),
-                            "madden_ovr": float(row[ovr_col])
+                            "player_name": p_name,
+                            "position": pos,
+                            "overall_rating": ovr,
+                            "archetype": arch,
+                            "tier_status": tier if tier != 'nan' else 'Starter'
                         })
-            self.madden_df = pd.DataFrame(team_rosters)
+            self.roster_df = pd.DataFrame(team_rosters)
         else:
-            logging.warning(f"Excel file {self.excel_path} not found. Using fallback ratings.")
+            logging.warning(f"Excel file {self.excel_path} not found.")
 
     def calculate_q_ovr(self) -> pd.DataFrame:
         records = []
@@ -132,6 +150,18 @@ class QuantitativeRatingsPipeline:
                 (clean["home_wp"].between(0.10, 0.90)) &
                 ~((clean.get("qtr", 1) == 4) & (clean.get("score_differential", 0).abs() >= 16))
             ].copy()
+
+        # Build summary lookup
+        summary_map = {}
+        if not self.summary_df.empty:
+            for _, r in self.summary_df.iterrows():
+                t_name = str(r['Team']).strip()
+                abbr = SUMMARY_TEAM_TO_ABBR.get(t_name, t_name)
+                summary_map[abbr] = {
+                    "ovr": float(r['Secondary-Boosted OVR']),
+                    "off": float(r['Offense OVR']),
+                    "def": float(r['Defense OVR'])
+                }
 
         for team in ALL_32_TEAMS:
             if not neutral.empty:
@@ -155,42 +185,26 @@ class QuantitativeRatingsPipeline:
             q_sec = max(55.0, min(99.0, 75.0 - (def_drop_epa * 40.0)))
             q_overall = round(0.52 * q_off + 0.48 * q_def, 1)
 
-            # Compute Madden team metrics from Excel parsed dataframe
-            m_ovr, m_off, m_def, m_pass_pro, m_pass_rush, m_sec = 78.0, 78.0, 78.0, 75.0, 75.0, 75.0
-            if not self.madden_df.empty:
-                t_m = self.madden_df[self.madden_df["team"] == team]
-                if not t_m.empty:
-                    sorted_ovrs = t_m["madden_ovr"].sort_values(ascending=False)
-                    m_ovr = round(float(sorted_ovrs.head(35).mean()), 1)
-                    
-                    off_df = t_m[t_m["position"].isin(['QB', 'RB', 'HB', 'FB', 'WR', 'TE', 'LT', 'LG', 'C', 'RG', 'RT', 'OT', 'OG'])]
-                    m_off = round(float(off_df["madden_ovr"].sort_values(ascending=False).head(15).mean()), 1) if not off_df.empty else m_ovr
-                    
-                    def_df = t_m[t_m["position"].isin(['RE', 'LE', 'DT', 'EDGE', 'DE', 'MLB', 'OLB', 'LB', 'CB', 'FS', 'SS', 'S'])]
-                    m_def = round(float(def_df["madden_ovr"].sort_values(ascending=False).head(15).mean()), 1) if not def_df.empty else m_ovr
-                    
-                    ol_df = t_m[t_m["position"].isin(['LT', 'LG', 'C', 'RG', 'RT', 'OL', 'OT', 'OG'])]
-                    m_pass_pro = round(float(ol_df["madden_ovr"].mean()), 1) if not ol_df.empty else m_ovr - 2.0
-                    
-                    dl_df = t_m[t_m["position"].isin(['RE', 'LE', 'DT', 'EDGE', 'DE'])]
-                    m_pass_rush = round(float(dl_df["madden_ovr"].mean()), 1) if not dl_df.empty else m_ovr - 1.0
-                    
-                    db_df = t_m[t_m["position"].isin(['CB', 'FS', 'SS', 'S'])]
-                    m_sec = round(float(db_df["madden_ovr"].mean()), 1) if not db_df.empty else m_ovr - 1.5
+            # Get Database Overall from Excel Summary
+            t_sum = summary_map.get(team, {"ovr": 80.0, "off": 80.0, "def": 80.0})
+            m_ovr, m_off, m_def = t_sum["ovr"], t_sum["off"], t_sum["def"]
+            m_pass_pro = round(m_off - 2.0, 1)
+            m_pass_rush = round(m_def - 1.0, 1)
+            m_sec = round(m_def - 1.5, 1)
 
             discrepancy = round(q_overall - m_ovr, 1)
 
             if discrepancy >= 3.0:
-                signal = "🔥 High Quant Upside (Madden Undervalued)"
+                signal = "🔥 High Quant Upside (Database Undervalued)"
             elif discrepancy <= -3.0:
-                signal = "❄️ Fragile Composite (Madden Overrated)"
+                signal = "❄️ Fragile Composite (Database Overrated)"
             else:
                 signal = "⚖️ Market Efficient"
 
             records.append({
                 "team": team,
                 "model_q_ovr": q_overall,
-                "madden_ovr": m_ovr,
+                "madden_ovr": m_ovr, # Renamed in UI to Database Overall
                 "discrepancy": discrepancy,
                 "signal": signal,
                 "model_offense": round(q_off, 1),
@@ -214,12 +228,16 @@ class QuantitativeRatingsPipeline:
             return
         init_ratings_schema(engine)
         with engine.begin() as conn:
-            conn.execute(text("TRUNCATE TABLE nfl_team_ratings_comparison;"))
+            conn.execute(text("TRUNCATE TABLE nfl_team_ratings_comparison RESTART IDENTITY CASCADE;"))
+            conn.execute(text("TRUNCATE TABLE nfl_team_rosters RESTART IDENTITY CASCADE;"))
+            
         df_ratings.to_sql("nfl_team_ratings_comparison", engine, if_exists="append", index=False, method="multi")
+        if not self.roster_df.empty:
+            self.roster_df.to_sql("nfl_team_rosters", engine, if_exists="append", index=False, method="multi")
 
 if __name__ == "__main__":
-    pipeline = QuantitativeRatingsPipeline(season=2026, excel_path="Madden_27_All_Teams_Ratings.xlsx")
+    pipeline = QuantitativeRatingsPipeline(season=2026, excel_path="Madden_27_Secondary_Weighted_Rankings.xlsx")
     pipeline.sync_data()
     df_eval = pipeline.calculate_q_ovr()
     pipeline.persist_to_database(df_eval)
-    print("Madden Excel roster ratings successfully ingested and committed to Neon.")
+    print("Secondary Weighted Rankings and Roster Players successfully committed to Neon.")
