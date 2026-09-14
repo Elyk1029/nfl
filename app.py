@@ -6,7 +6,7 @@ Production UI Architecture:
 - Tab 2: Market Steam & Sharp Line Movement Monitoring.
 - Tab 3: Strategic Research Director AI Workbench (Gemini 3.8 Flash via nfl_guru.py).
 - Tab 4: Airlocked Out-of-Sample Historical Simulation Engine.
-- Tab 5: 32-Team Q-OVR vs. EA Madden Ratings Comparison Lab (Idempotent schema verification).
+- Tab 5: 32-Team Q-OVR vs. EA Madden Ratings Comparison Lab (Self-Hydrating Cloud Layer).
 """
 
 import json
@@ -23,7 +23,7 @@ from sqlalchemy import create_engine, text
 import streamlit as st
 
 from nfl_guru import NFL_GURU_FULL_SYSTEM_PROMPT
-from team_ratings_engine import init_ratings_schema
+from team_ratings_engine import QuantitativeRatingsPipeline, init_ratings_schema
 
 # -------------------------------------------------------------------------
 # Page Configuration & UI Scaffolding
@@ -179,7 +179,6 @@ def load_predictions_data() -> pd.DataFrame:
 def load_ratings_data() -> pd.DataFrame:
     """
     Queries ratings comparisons with guaranteed idempotent DDL verification.
-    Prevents UndefinedTable crashes when reading unpopulated ledgers.
     """
     init_ratings_schema(engine)
     query = text("""
@@ -219,7 +218,7 @@ st.title("🏈 Institutional NFL Quantitative Terminal")
 st.caption("Spatiotemporal Film Breakdown | Discrete Key-Margin Snapping | Closed Dirichlet Simplex Props")
 
 if df_predictions.empty:
-    st.info("No active slate records found in database. Run `python update_nfl.py` to compile upcoming fixtures.")
+    st.info("No active slate records found in database. Run pipeline to compile upcoming fixtures.")
     st.stop()
 
 # Metric Summary Bar
@@ -274,7 +273,6 @@ with tab_slate:
         pred_away = int(fixture.get("predicted_away_score") or 21)
         pred_total = int(fixture.get("predicted_total_score") or (pred_home + pred_away))
 
-        # Enforce unified coordinate sign alignment
         model_margin = pred_home - pred_away
         margin_badge_label = f"{home_abbr} {model_margin:+d}"
 
@@ -502,7 +500,7 @@ with tab_sim:
             r2.metric("Spread Cover Accuracy (ATS)", f"{ats_acc:.1f}%")
 
 # -------------------------------------------------------------------------
-# Tab 5: Model Q-OVR vs. Madden Ratings Lab
+# Tab 5: Model Q-OVR vs. Madden Ratings Lab (Self-Hydrating Cloud Layer)
 # -------------------------------------------------------------------------
 with tab_ratings:
     st.subheader("🎮 Model Q-OVR vs. EA Madden Ratings Comparison Lab")
@@ -517,8 +515,21 @@ with tab_ratings:
         st.error(f"Ratings ledger query failure: {e}")
         df_team_ratings = pd.DataFrame()
 
+    # Self-Hydrating In-App Trigger
     if df_team_ratings.empty:
-        st.info("Ratings table unpopulated. Run `python team_ratings_engine.py` to compile initial ledger.")
+        st.warning("Ratings comparison ledger is currently empty in Neon PostgreSQL.")
+        if st.button("⚡ Compile & Hydrate 32-Team Ratings Ledger Now", type="primary", use_container_width=True):
+            with st.spinner("Ingesting play-by-play metrics, pulling Madden API, and calculating Q-OVR..."):
+                try:
+                    pipeline = QuantitativeRatingsPipeline(season=2026)
+                    pipeline.sync_data()
+                    df_calculated = pipeline.calculate_q_ovr()
+                    pipeline.persist_to_database(df_calculated)
+                    st.cache_data.clear()
+                    st.success("Ratings ledger compiled and committed to database.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Hydration failed: {ex}")
     else:
         with st.expander("📋 View League-Wide 32-Team Ratings Ledger", expanded=False):
             st.dataframe(
@@ -609,9 +620,9 @@ with tab_ratings:
                     "net_dropback_epa": float(team_row["net_dropback_epa"]),
                     "net_rush_epa": float(team_row["net_rush_epa"]),
                     "units": {
-                        "pass_protection_delta": round(float(team_row["model_pass_protection"] - team_row["madden_pass_protection"]), 1),
-                        "pass_rush_delta": round(float(team_row["model_pass_rush"] - team_row["madden_pass_rush"]), 1),
-                        "secondary_coverage_delta": round(float(team_row["model_secondary"] - team_row["madden_secondary"]), 1)
+                        "pass_protection_delta": round(float(team_row["model_pass_protection"]) - float(team_row["madden_pass_protection"]), 1),
+                        "pass_rush_delta": round(float(team_row["model_pass_rush"]) - float(team_row["madden_pass_rush"]), 1),
+                        "secondary_coverage_delta": round(float(team_row["model_secondary"]) - float(team_row["madden_secondary"]), 1)
                     }
                 }
 
