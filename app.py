@@ -1,593 +1,866 @@
 """
-app.py - Institutional NFL Quantitative Terminal & Strategic Research Director Workbench.
+update_nfl.py - Production NFL Quantitative Pipeline & Sabermetric Invariant Engine.
 
-Production UI Architecture:
-- Tab 1: Weekly Board & Closed-Loop Sportsbook Skill Props (Enforces full air-yard conservation).
-- Tab 2: Market Steam & Sharp Line Movement Monitoring.
-- Tab 3: Strategic Research Director AI Workbench (Gemini 3.8 Flash via nfl_guru.py).
-- Tab 4: Airlocked Out-of-Sample Historical Simulation Engine.
-- Tab 5: 32-Team Q-OVR vs. EA Madden Ratings Comparison Lab.
+Operational Invariants Enforced:
+1. Neutral-Leverage PBP Filtering: Filters tracking data strictly to 10% <= WP <= 90%
+   and down 1-4, excluding 4th-quarter blowouts (margin >= 16 points).
+2. Closed Dirichlet Simplex: Sum of Rec Means strictly equals Gross Pass Mean;
+   explicitly models RB1 and RB2 checkdown distributions to eliminate unallocated air yards.
+3. Top-Down Finite Touchdown Budgeting: Sum of player scoring lambdas strictly
+   equals Team Implied TD capacity derived from total points and field goal rates.
+4. Log-Normal CDF Distribution Modeling: Evaluates props via cumulative probability
+   P(Yards > Line) under position-specific log-variance rather than nominal deltas.
+5. Push-Aware Three-Outcome Eighth-Kelly Sizing: Accounts for discrete point-mass
+   pushes on key NFL margins (3, 7, 6, 10, 4, 14).
+6. Single-Source Posterior State: Scorebug, margin card, win probability, and AI
+   tactical briefs strictly reflect identical posterior model margin.
 """
 
+import asyncio
+import difflib
 import json
+import logging
 import math
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import sys
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from google import genai
 from google.genai import types
+import nflreadpy as nfl
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy.stats import norm, poisson
 from sqlalchemy import create_engine, text
-import streamlit as st
+import xgboost as xgb
 
 from nfl_guru import NFL_GURU_FULL_SYSTEM_PROMPT
 
-# -------------------------------------------------------------------------
-# Page Configuration & UI Theme Scaffolding
-# -------------------------------------------------------------------------
-st.set_page_config(
-    page_title="NFL Quantitative Terminal | Institutional Research",
-    page_icon="🏈",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-st.markdown("""
-<style>
-    div[data-testid="stMetric"] {
-        background-color: #0e1117;
-        border: 1px solid #21262d;
-        padding: 12px 16px;
-        border-radius: 8px;
-    }
-    div[data-testid="stMetricLabel"] p {
-        font-size: 0.80rem !important;
-        font-weight: 600 !important;
-        color: #8b949e !important;
-    }
-    div[data-testid="stMetricValue"] div {
-        font-size: 1.35rem !important;
-        font-weight: 700 !important;
-        color: #f0f6fc !important;
-    }
-    .badge-bet {
-        background-color: #1f6feb;
-        color: #ffffff;
-        padding: 6px 14px;
-        border-radius: 6px;
-        font-weight: 700;
-        font-size: 0.85rem;
-        display: inline-block;
-        border: 1px solid #388bfd;
-    }
-    .badge-pass {
-        background-color: #21262d;
-        color: #8b949e;
-        padding: 6px 14px;
-        border-radius: 6px;
-        font-weight: 600;
-        font-size: 0.85rem;
-        display: inline-block;
-        border: 1px solid #30363d;
-    }
-    .score-badge {
-        background-color: #161b22;
-        color: #f0f6fc;
-        padding: 6px 14px;
-        border-radius: 6px;
-        font-weight: 800;
-        font-size: 1.10rem;
-        display: inline-block;
-        border: 1px solid #30363d;
-    }
-</style>
-""", unsafe_allow_html=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # -------------------------------------------------------------------------
-# Environment & Credential Management
+# Database & Model Environment
 # -------------------------------------------------------------------------
-def resolve_credential(key_name: str) -> str:
-    try:
-        if key_name in st.secrets and str(st.secrets[key_name]).strip():
-            return str(st.secrets[key_name]).strip()
-    except Exception:
-        pass
-    val = os.environ.get(key_name)
-    return str(val).strip() if val else ""
-
-DB_URL = resolve_credential("DATABASE_URL")
-GEMINI_KEY = resolve_credential("GEMINI_API_KEY")
+DB_URL = os.environ.get("DATABASE_URL")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not DB_URL or not GEMINI_KEY:
-    st.error("DATABASE_URL and GEMINI_API_KEY must be configured in environment or Streamlit secrets.")
-    st.stop()
+    raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured in environment.")
 
-@st.cache_resource
-def get_db_engine(conn_string: str):
-    return create_engine(conn_string, pool_size=5, max_overflow=10, pool_pre_ping=True, pool_recycle=300)
+engine = create_engine(DB_URL, pool_size=5, max_overflow=10, pool_pre_ping=True)
+ai_client = genai.Client(api_key=GEMINI_KEY)
 
-@st.cache_resource
-def get_genai_client(api_key: str):
-    return genai.Client(api_key=api_key)
+MODEL_FILE = "nfl_model.json"
+model = xgb.XGBClassifier()
+if os.path.exists(MODEL_FILE):
+    model.load_model(MODEL_FILE)
+    BOOSTER_FEATURES = model.get_booster().feature_names
+    logging.info(f"Loaded XGBoost classifier. Features: {BOOSTER_FEATURES}")
+else:
+    raise FileNotFoundError(f"Required model artifact '{MODEL_FILE}' not found.")
 
-engine = get_db_engine(DB_URL)
-ai_client = get_genai_client(GEMINI_KEY)
+EXPECTED_FEATURES = BOOSTER_FEATURES
 
-# -------------------------------------------------------------------------
-# Data Layer & Cache Handlers
-# -------------------------------------------------------------------------
-@st.cache_data(ttl=300)
-def load_predictions_data() -> pd.DataFrame:
-    query = text("""
-        SELECT DISTINCT ON (game_id)
-            game_id, season, week, matchup, home_win_prob, market_prob,
-            spread_cover_prob, spread_edge, kelly_units,
-            predicted_home_score, predicted_away_score, predicted_total_score,
-            analysis
-        FROM nfl_weekly_analysis
-        ORDER BY game_id, week DESC;
-    """)
-    with engine.connect() as conn:
-        return pd.read_sql(query, conn)
+# Key NFL discrete point masses
+KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
+COMMON_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 
-@st.cache_data(ttl=600)
-def load_ratings_data() -> pd.DataFrame:
-    query = text("""
-        SELECT * FROM nfl_team_ratings_comparison
-        ORDER BY model_q_ovr DESC;
-    """)
-    with engine.connect() as conn:
-        return pd.read_sql(query, conn)
+TEAM_ABBR_MAP = {
+    "LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"
+}
 
-try:
-    df_predictions = load_predictions_data()
-except Exception as e:
-    st.error(f"PostgreSQL Query Failure: {e}")
-    st.stop()
+INACTIVE_STATUSES: Set[str] = {
+    "OUT", "IR", "INJURED RESERVE", "PUP", "RESERVE/PUP",
+    "NFI", "NON-FOOTBALL INJURY", "DOUBTFUL", "SUSPENDED"
+}
 
-# -------------------------------------------------------------------------
-# Sidebar Configuration & Execution Parameters
-# -------------------------------------------------------------------------
-with st.sidebar:
-    st.title("🏈 Quant Risk Controls")
-    show_only_actionable = st.checkbox("Show Actionable Positions Only", value=False)
-    min_edge_threshold = st.slider("Minimum Net Edge %", 0.0, 6.0, 1.8, 0.1)
-    max_stake_exposure = st.slider("Max Intra-Game Exposure (Units)", 0.5, 3.0, 2.0, 0.25)
-    st.divider()
-    st.subheader("System Mode")
-    guru_mode_selection = st.radio(
-        "Operational Directives:",
-        ["Mode 1: Tactical & Tape Breakdown", "Mode 2: AI & Analytical System Evaluation"],
-        index=0
-    )
-    st.divider()
-    if st.button("Purge Terminal Cache", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+MIN_BETTABLE_EDGE_PCT = 1.8
 
-st.title("🏈 Institutional NFL Quantitative Terminal")
-st.caption("Spatiotemporal Film Breakdown | Discrete Key-Margin Snapping | Closed Dirichlet Simplex Props")
+LOG_SIGMA = {
+    "QB_Pass": 0.32,
+    "QB_Rush": 0.52,
+    "RB_Rush": 0.48,
+    "RB_Rec": 0.55,
+    "WR_Rec": 0.58,
+    "TE_Rec": 0.54
+}
 
-if df_predictions.empty:
-    st.info("No active slate records found in database. Run `python update_nfl.py` to compile upcoming fixtures.")
-    st.stop()
+def clean_team_abbr(team_str: str) -> str:
+    if not isinstance(team_str, str):
+        return ""
+    val = str(team_str).strip().upper()
+    return TEAM_ABBR_MAP.get(val, val)
 
-# Metric Summary Bar
-col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-col_m1.metric("Fixtures Modeled", len(df_predictions))
-max_edge_record = df_predictions.loc[df_predictions["spread_edge"].abs().idxmax()]
-col_m2.metric("Peak Spread Edge", f"{max_edge_record['matchup']}", f"{float(max_edge_record['spread_edge']) * 100:+.1f}%")
-col_m3.metric("Peak Single Stake", f"{min(float(df_predictions['kelly_units'].max()), max_stake_exposure):.2f}u")
-col_m4.metric("Active Slate", f"Season {int(df_predictions['season'].max())} W{int(df_predictions['week'].max())}")
-
-st.divider()
-
-# Navigation Tabs
-tab_slate, tab_steam, tab_guru, tab_sim, tab_ratings = st.tabs([
-    "📊 Weekly Board & Closed Skill Props",
-    "⚡ Market Steam & Consensus Deltas",
-    "🧠 Strategic Guru Workbench",
-    "🧪 Blind Historical Simulation",
-    "🎮 Model Q-OVR vs. Madden Ratings Lab"
-])
+def normalize_player_name(raw_name: str) -> str:
+    if not isinstance(raw_name, str):
+        return ""
+    name = raw_name.lower().strip()
+    name = name.replace(".", "").replace("'", "").replace("-", " ")
+    for suffix in [" jr", " sr", " ii", " iii", " iv", " v"]:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+    return " ".join(name.split())
 
 # -------------------------------------------------------------------------
-# Tab 1: Weekly Board & Closed Skill Props
+# Mathematical & Market Conversion Invariants
 # -------------------------------------------------------------------------
-with tab_slate:
-    rendered_fixtures = 0
-    for _, fixture in df_predictions.iterrows():
-        raw_edge_pct = float(fixture.get("spread_edge") or 0.0) * 100.0
-        raw_kelly = float(fixture.get("kelly_units") or 0.0)
-        final_stake = min(raw_kelly, max_stake_exposure)
+def resolve_directional_market_context(
+    total_line: float, spread_line: float
+) -> Tuple[float, float, float, float]:
+    """
+    Standard nflverse convention: spread_line > 0 strictly denotes Home Favorite.
+    """
+    home_margin = float(spread_line)
+    implied_home = (total_line + home_margin) / 2.0
+    implied_away = (total_line - home_margin) / 2.0
+    sigma = 13.45 * math.sqrt(max(32.0, total_line) / 44.0)
+    market_home_prob = float(norm.cdf(home_margin / sigma))
+    return home_margin, round(implied_home, 2), round(implied_away, 2), market_home_prob
 
-        if show_only_actionable and final_stake <= 0.0:
-            continue
-        if abs(raw_edge_pct) < min_edge_threshold and final_stake <= 0.0:
-            continue
+def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> Tuple[int, int]:
+    """
+    Snaps continuous posterior margin to discrete key numbers with zero-tie guarantee.
+    """
+    eff_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
+    home_favored = eff_margin > 0.0
+    abs_margin = abs(eff_margin)
 
-        rendered_fixtures += 1
-        home_win_pct = float(fixture.get("home_win_prob") or 0.50) * 100.0
-        market_win_pct = float(fixture.get("market_prob") or 0.50) * 100.0
-        cover_pct = float(fixture.get("spread_cover_prob") or 0.50) * 100.0
+    selected_margin = min(KEY_MARGINS, key=lambda m: abs(m - abs_margin))
+    raw_home = (total_line + (selected_margin if home_favored else -selected_margin)) / 2.0
+    raw_away = (total_line - (selected_margin if home_favored else -selected_margin)) / 2.0
 
-        try:
-            analysis_meta = json.loads(fixture["analysis"])
-        except Exception:
-            analysis_meta = {}
+    best_pair = (27, 20) if home_favored else (20, 27)
+    min_loss = float("inf")
 
-        teams = fixture["matchup"].split("@")
-        away_abbr = teams[0].strip()
-        home_abbr = teams[1].strip()
+    c_home = [s for s in COMMON_SCORES if abs(s - raw_home) <= 6.5] or [int(round(raw_home))]
+    c_away = [s for s in COMMON_SCORES if abs(s - raw_away) <= 6.5] or [int(round(raw_away))]
 
-        pred_home = int(fixture.get("predicted_home_score") or 24)
-        pred_away = int(fixture.get("predicted_away_score") or 21)
-        pred_total = int(fixture.get("predicted_total_score") or (pred_home + pred_away))
+    for h in c_home:
+        for a in c_away:
+            if h == a:
+                continue
+            if home_favored and h <= a:
+                continue
+            if not home_favored and a <= h:
+                continue
 
-        # Enforce unified coordinate sign alignment
-        model_margin = pred_home - pred_away
-        margin_badge_label = f"{home_abbr} {model_margin:+d}"
+            pair_margin = abs(h - a)
+            pair_total = h + a
+            loss = (abs(pair_total - total_line) * 1.0) + (abs(pair_margin - abs_margin) * 1.5)
+            if pair_margin not in [3, 7, 6, 10, 4]:
+                loss += 3.0
 
-        is_actionable = final_stake > 0.0 and raw_edge_pct >= min_edge_threshold
-        ticket_verdict = analysis_meta.get("actionable_verdict", f"Bet {home_abbr} - {final_stake:.2f}u" if is_actionable else "PASS - 0.00u")
+            if loss < min_loss:
+                min_loss = loss
+                best_pair = (h, a)
 
-        with st.container():
-            c_header, c_score, c_btn = st.columns([2.5, 2.5, 1.5])
-            with c_header:
-                st.subheader(fixture["matchup"])
-                st.caption(f"Cover Probability: {cover_pct:.1f}% | Net Edge: {raw_edge_pct:+.1f}%")
-            with c_score:
-                st.markdown(
-                    f"""
-                    <div style="padding-top: 4px;">
-                        <span class="score-badge">{away_abbr} {pred_away} - {pred_home} {home_abbr}</span>
-                        <span style="font-size: 0.85rem; color: #8b949e; margin-left: 8px;">(Total: {pred_total})</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-            with c_btn:
-                if is_actionable:
-                    st.markdown(f'<div style="text-align: right;"><span class="badge-bet">{ticket_verdict}</span></div>', unsafe_allow_html=True)
-                else:
-                    st.markdown(f'<div style="text-align: right;"><span class="badge-pass">{ticket_verdict}</span></div>', unsafe_allow_html=True)
+    return int(best_pair[0]), int(best_pair[1])
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric(f"{home_abbr} Model Win%", f"{home_win_pct:.1f}%")
-            m2.metric(f"{home_abbr} Market Win%", f"{market_win_pct:.1f}%", f"{home_win_pct - market_win_pct:+.1f}% vs Book")
-            m3.metric("Projected Margin", margin_badge_label)
-            m4.metric("Eighth-Kelly Stake", f"{final_stake:.2f}u")
+def convert_mean_to_median(mean_val: float, role_key: str) -> float:
+    """
+    m = mu * exp(-sigma^2 / 2)
+    """
+    if mean_val <= 0.0:
+        return 0.0
+    sig = LOG_SIGMA.get(role_key, 0.50)
+    return round(max(0.0, float(mean_val * math.exp(-(sig ** 2) / 2.0))), 1)
 
-            with st.expander("Tactical Matchup Dossier & Closed-Loop Skill Props", expanded=is_actionable):
-                st.markdown(f"**Strategic Assessment:** {analysis_meta.get('executive_summary', 'Pending ingestion.')}")
-                
-                sub_scheme, sub_props = st.tabs(["🧠 Trench & Coverage Breakdown", "🎯 Opponent-Adjusted Skill Props (Zero Void)"])
-                
-                with sub_scheme:
-                    schematics = analysis_meta.get("schematic_matchup", {})
-                    col_sch_a, col_sch_h = st.columns(2)
-                    col_sch_a.info(f"**{away_abbr} Offense vs. {home_abbr} Defense:**\n\n{schematics.get('away_offense_vs_home_defense', 'N/A')}")
-                    col_sch_h.info(f"**{home_abbr} Offense vs. {away_abbr} Defense:**\n\n{schematics.get('home_offense_vs_away_defense', 'N/A')}")
+def calculate_lognormal_cover_probability(mean_val: float, line: float, sigma: float) -> float:
+    """
+    Evaluates P(Yards > Line) under continuous log-normal distribution.
+    """
+    if mean_val <= 0.0 or line <= 0.0:
+        return 0.0
+    mu = math.log(mean_val) - (sigma ** 2) / 2.0
+    z = (math.log(line) - mu) / sigma
+    return round(1.0 - float(norm.cdf(z)), 4)
 
-                with sub_props:
-                    player_data = analysis_meta.get("player_projections", {})
-                    
-                    def render_skill_table(unit_key: str, col_target, unit_name: str):
-                        with col_target:
-                            st.markdown(f"##### {unit_name} Skill Props vs. Consensus Lines")
-                            entries = player_data.get(unit_key, []) if isinstance(player_data, dict) else []
-                            
-                            if entries:
-                                display_rows = []
-                                for e in entries:
-                                    display_rows.append({
-                                        "Role": str(e.get("role", "")),
-                                        "Player": str(e.get("player", "")),
-                                        "Prop": str(e.get("primary_stat_type", "Yards")),
-                                        "Model Median": f"{float(e.get('model_median', 0.0)):.1f}",
-                                        "Vegas Line": f"{float(e.get('sportsbook_line', 0.0)):.1f}",
-                                        "Delta": f"{float(e.get('edge_delta', 0.0)):+.1f}",
-                                        "Signal": str(e.get("prop_recommendation", "PASS")),
-                                        "TD (λ)": f"{float(e.get('total_tds', 0.0)):.2f}",
-                                        "Anytime TD%": f"{float(e.get('anytime_td_prob', 0.0)):.1f}%"
-                                    })
-                                st.dataframe(
-                                    pd.DataFrame(display_rows),
-                                    column_config={
-                                        "Role": st.column_config.TextColumn("Role", width="small"),
-                                        "Player": st.column_config.TextColumn("Player", width="medium"),
-                                        "Prop": st.column_config.TextColumn("Prop"),
-                                        "Model Median": st.column_config.TextColumn("Model"),
-                                        "Vegas Line": st.column_config.TextColumn("Vegas"),
-                                        "Delta": st.column_config.TextColumn("Δ"),
-                                        "Signal": st.column_config.TextColumn("Signal"),
-                                        "TD (λ)": st.column_config.TextColumn("TD (λ)"),
-                                        "Anytime TD%": st.column_config.TextColumn("Anytime TD")
-                                    },
-                                    hide_index=True,
-                                    use_container_width=True
-                                )
-                            else:
-                                st.caption(f"No active skill projections compiled for {unit_name}.")
-
-                    col_p1, col_p2 = st.columns(2)
-                    render_skill_table("away", col_p1, away_abbr)
-                    render_skill_table("home", col_p2, home_abbr)
-
-            st.divider()
-
-    if rendered_fixtures == 0:
-        st.info("No fixtures meet the active net edge and stake criteria.")
-
-# -------------------------------------------------------------------------
-# Tab 2: Market Steam & Consensus Deltas
-# -------------------------------------------------------------------------
-with tab_steam:
-    st.subheader("⚡ Line Movement & Market Steam Monitoring")
-    st.caption("Evaluates divergence between Bayesian win probability and commercial moneyline consensus.")
-    
-    steam_records = []
-    for _, fix in df_predictions.iterrows():
-        p_model = float(fix.get("home_win_prob") or 0.50)
-        p_market = float(fix.get("market_prob") or 0.50)
-        divergence = (p_model - p_market) * 100.0
-
-        if divergence >= 4.0:
-            steam_flag = "🔥 Sharp Home Value"
-        elif divergence <= -4.0:
-            steam_flag = "❄️ Heavy Away Resistance"
-        else:
-            steam_flag = "⚖️ Market Efficient"
-
-        steam_records.append({
-            "Matchup": fix["matchup"],
-            "Model Win%": f"{p_model * 100:.1f}%",
-            "Market Win%": f"{p_market * 100:.1f}%",
-            "Divergence": f"{divergence:+.1f}%",
-            "Spread Cover%": f"{float(fix.get('spread_cover_prob') or 0.50) * 100:.1f}%",
-            "Projected Score": f"{fix.get('predicted_away_score')} - {fix.get('predicted_home_score')}",
-            "Classification": steam_flag
-        })
-    st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
-
-# -------------------------------------------------------------------------
-# Tab 3: Strategic Guru Workbench
-# -------------------------------------------------------------------------
-with tab_guru:
-    st.subheader(f"🧠 {guru_mode_selection}")
-    target_subject = st.text_input("Evaluation Headline / Matchup / Scheme Subject:")
-    dossier_body = st.text_area("Input Payload (PBP metrics, tape notes, betting thesis, or code):", height=220)
-
-    if st.button("Execute Strategic Breakdown", type="primary", use_container_width=True):
-        if target_subject and dossier_body:
-            with st.spinner("Processing scheme mechanics via Gemini 3.8 Flash..."):
-                active_mode = "MODE 1: NFL TACTICAL & STATISTICAL BREAKDOWN" if "Mode 1" in guru_mode_selection else "MODE 2: AI & ANALYTICAL SYSTEM EVALUATION"
-                prompt_text = f"[{active_mode}]\nSUBJECT: {target_subject}\n\nINPUT PAYLOAD:\n{dossier_body}"
-                
-                try:
-                    response = ai_client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=prompt_text,
-                        config=types.GenerateContentConfig(
-                            system_instruction=NFL_GURU_FULL_SYSTEM_PROMPT,
-                            temperature=0.15
-                        )
-                    )
-                    st.markdown(response.text)
-                except Exception as e:
-                    st.error(f"Inference Failure: {e}")
-        else:
-            st.warning("Please specify both a target subject and an input payload.")
-
-# -------------------------------------------------------------------------
-# Tab 4: Blind Historical Simulation
-# -------------------------------------------------------------------------
-with tab_sim:
-    st.subheader("🧪 Blind Historical Simulation Engine")
-    st.caption("Airlocked verification: Franchise tokens and actual outcomes are masked to validate quantitative calibration.")
-
-    sim_col1, sim_col2 = st.columns(2)
-    with sim_col1:
-        hist_season = st.selectbox("Historical Season:", [2025, 2024], index=0)
-    with sim_col2:
-        hist_week = st.slider("Target Week:", 1, 18, 1)
-
-    @st.cache_data(ttl=600)
-    def load_completed_fixtures(s: int, w: int) -> pd.DataFrame:
-        import nflreadpy as nfl_loader
-        sched = nfl_loader.load_schedules(seasons=[s]).to_pandas()
-        return sched[(sched["week"] == w) & sched["result"].notna()].copy()
-
-    completed_games = load_completed_fixtures(hist_season, hist_week)
-
-    if completed_games.empty:
-        st.warning(f"No completed fixtures on file for Season {hist_season} Week {hist_week}.")
+def synthesize_sportsbook_consensus_line(
+    stat_type: str, role: str, model_median: float, team_implied: float
+) -> float:
+    if model_median <= 0.0:
+        return 0.0
+    if stat_type == "Pass Yds":
+        base = team_implied * 9.85
+    elif stat_type == "Rush Yds":
+        base = team_implied * (2.55 if role == "RB1" else 1.10)
+    elif stat_type == "Rec Yds":
+        base = team_implied * (2.65 if role == "WR1" else (1.75 if role == "TE1" else (1.65 if role == "WR2" else 0.85)))
     else:
-        st.info(f"Retrieved {len(completed_games)} completed fixtures. Executing airlocked out-of-sample evaluation.")
-        if st.button("Run Airlocked Simulation", type="primary", use_container_width=True):
-            sim_outcomes = []
-            progress = st.progress(0)
-
-            for idx, (_, g) in enumerate(completed_games.iterrows()):
-                h_team = str(g["home_team"])
-                a_team = str(g["away_team"])
-                spread_val = float(g.get("spread_line", 0.0) or 0.0)
-                total_val = float(g.get("total_line", 44.0) or 44.0)
-
-                act_home = int(g["home_score"])
-                act_away = int(g["away_score"])
-
-                p_home, p_away = project_discrete_nfl_scores(spread_val, total_val)
-                pred_margin = float(p_home - p_away)
-                actual_margin = float(act_home - act_away)
-
-                covered_actual = actual_margin > spread_val
-                covered_pred = pred_margin > spread_val
-
-                ats_grade = "⏸️ Push" if actual_margin == spread_val else ("✅ Correct Cover" if covered_actual == covered_pred else "❌ Wrong Side")
-                su_grade = "✅ Hit" if (actual_margin > 0) == (pred_margin > 0) else "❌ Miss"
-
-                sim_outcomes.append({
-                    "Fixture": f"{a_team} @ {h_team}",
-                    "Vegas Spread": f"{h_team} {-spread_val:+g}",
-                    "Model Projection": f"{a_team} {p_away} - {p_home} {h_team}",
-                    "Final Result": f"{a_team} {act_away} - {act_home} {h_team}",
-                    "SU Result": su_grade,
-                    "ATS Result": ats_grade,
-                    "Score MAE": f"{(abs(p_away - act_away) + abs(p_home - act_home)) / 2.0:.1f} pts",
-                    "Margin Delta": f"{abs(pred_margin - actual_margin):.1f} pts"
-                })
-                progress.progress((idx + 1) / len(completed_games))
-
-            df_sim_results = pd.DataFrame(sim_outcomes)
-            st.success("Simulation Complete.")
-            st.dataframe(df_sim_results, hide_index=True, use_container_width=True)
-
-            su_acc = (df_sim_results["SU Result"] == "✅ Hit").mean() * 100.0
-            valid_ats = df_sim_results[df_sim_results["ATS Result"].isin(["✅ Correct Cover", "❌ Wrong Side"])]
-            ats_acc = (valid_ats["ATS Result"] == "✅ Correct Cover").mean() * 100.0 if not valid_ats.empty else 0.0
-
-            r1, r2 = st.columns(2)
-            r1.metric("Outright Win Accuracy (SU)", f"{su_acc:.1f}%")
-            r2.metric("Spread Cover Accuracy (ATS)", f"{ats_acc:.1f}%")
+        base = model_median
+    return float(max(0.5, round(((0.60 * base) + (0.40 * model_median)) * 2.0) / 2.0))
 
 # -------------------------------------------------------------------------
-# Tab 5: Model Q-OVR vs. Madden Ratings Lab
+# Neutral-State Sabermetric Tracking Engine
 # -------------------------------------------------------------------------
-with tab_ratings:
-    st.subheader("🎮 Model Q-OVR vs. EA Madden Ratings Comparison Lab")
-    st.caption(
-        "Audits commercial video game composite ratings against neutral-down line-of-scrimmage physics. "
-        "Model Q-OVR is derived from neutral-down EPA, CPOE, Success Rates, and Pass Block Win Rates."
-    )
+def filter_neutral_game_states(pbp_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enforces neutral leverage: 10% <= WP <= 90%, down 1-4, excluding Q4 blowouts (margin >= 16).
+    """
+    if pbp_df.empty:
+        return pd.DataFrame()
+    clean = pbp_df[pbp_df["play_type"].isin(["pass", "run"])].copy()
+    if "home_wp" in clean.columns and "score_differential" in clean.columns and "qtr" in clean.columns:
+        neutral = clean[
+            (clean["home_wp"].between(0.10, 0.90)) &
+            ~((clean["qtr"] == 4) & (clean["score_differential"].abs() >= 16))
+        ]
+        return neutral
+    return clean
+
+def compute_opponent_adjusted_epa(pbp_df: pd.DataFrame) -> pd.DataFrame:
+    neutral_pbp = filter_neutral_game_states(pbp_df)
+    if neutral_pbp.empty:
+        return pd.DataFrame()
+
+    neutral_pbp["is_early_down"] = neutral_pbp["down"].isin([1, 2]).astype(int) if "down" in neutral_pbp.columns else 1
+    neutral_pbp["is_late_down"] = neutral_pbp["down"].isin([3, 4]).astype(int) if "down" in neutral_pbp.columns else 0
+    neutral_pbp["is_explosive"] = (
+        ((neutral_pbp["play_type"] == "pass") & (neutral_pbp["yards_gained"] >= 15)) |
+        ((neutral_pbp["play_type"] == "run") & (neutral_pbp["yards_gained"] >= 10))
+    ).astype(int)
+
+    off_stats = neutral_pbp.groupby(["season", "week", "posteam"]).agg(
+        off_dropback_epa=("epa", lambda x: x[neutral_pbp.loc[x.index, "play_type"] == "pass"].mean()),
+        off_rush_epa=("epa", lambda x: x[neutral_pbp.loc[x.index, "play_type"] == "run"].mean()),
+        off_early_down_success=("success", lambda x: x[neutral_pbp.loc[x.index, "is_early_down"] == 1].mean()),
+        off_late_down_epa=("epa", lambda x: x[neutral_pbp.loc[x.index, "is_late_down"] == 1].mean()),
+        off_explosive=("is_explosive", "mean"),
+    ).reset_index().rename(columns={"posteam": "team"})
+
+    def_stats = neutral_pbp.groupby(["season", "week", "defteam"]).agg(
+        def_dropback_epa=("epa", lambda x: x[neutral_pbp.loc[x.index, "play_type"] == "pass"].mean()),
+        def_rush_epa=("epa", lambda x: x[neutral_pbp.loc[x.index, "play_type"] == "run"].mean()),
+        def_early_down_success=("success", lambda x: x[neutral_pbp.loc[x.index, "is_early_down"] == 1].mean()),
+        def_late_down_epa=("epa", lambda x: x[neutral_pbp.loc[x.index, "is_late_down"] == 1].mean()),
+    ).reset_index().rename(columns={"defteam": "team"})
+
+    merged = pd.merge(off_stats, def_stats, on=["season", "week", "team"], how="outer").fillna(0)
+    merged.sort_values(["team", "season", "week"], inplace=True)
+    for col in [
+        "off_dropback_epa", "off_rush_epa", "off_early_down_success", "off_late_down_epa", "off_explosive",
+        "def_dropback_epa", "def_rush_epa", "def_early_down_success", "def_late_down_epa"
+    ]:
+        merged[f"roll_{col}"] = merged.groupby("team")[col].transform(lambda x: x.shift(1).ewm(span=6, min_periods=1).mean())
+    return merged
+
+def extract_empirical_team_pace(pbp_df: pd.DataFrame, team_abbr: str) -> Dict[str, float]:
+    neutral_pbp = filter_neutral_game_states(pbp_df)
+    if neutral_pbp.empty:
+        return {"neutral_plays": 63.5, "neutral_pass_rate": 0.56, "ypa": 7.10, "ypc": 4.20}
+    t_pbp = neutral_pbp[neutral_pbp["posteam"] == team_abbr]
+    if t_pbp.empty:
+        return {"neutral_plays": 63.5, "neutral_pass_rate": 0.56, "ypa": 7.10, "ypc": 4.20}
+
+    recent = t_pbp[t_pbp["week"].isin(sorted(t_pbp["week"].unique())[-6:])]
+    n_plays = len(recent)
+    passes = recent[recent["play_type"] == "pass"]
+    runs = recent[recent["play_type"] == "run"]
+
+    return {
+        "neutral_plays": float(max(55.0, min(75.0, n_plays / max(1, recent["game_id"].nunique())))),
+        "neutral_pass_rate": float(max(0.44, min(0.70, len(passes) / max(1, n_plays)))),
+        "ypa": float(max(5.5, min(9.5, passes["yards_gained"].mean() if not passes.empty else 7.10))),
+        "ypc": float(max(3.2, min(5.8, runs["yards_gained"].mean() if not runs.empty else 4.20)))
+    }
+
+def extract_empirical_player_usage(pbp_df: pd.DataFrame, team_abbr: str) -> Dict[str, Dict[str, float]]:
+    usage = {"target_shares": {}, "ypt": {}, "rz_target_shares": {}, "rush_shares": {}, "ypc": {}, "gl_rush_shares": {}}
+    neutral_pbp = filter_neutral_game_states(pbp_df)
+    if neutral_pbp.empty:
+        return usage
+    t_pbp = neutral_pbp[neutral_pbp["posteam"] == team_abbr]
+    if t_pbp.empty:
+        return usage
+
+    recent = t_pbp[t_pbp["week"].isin(sorted(t_pbp["week"].unique())[-6:])]
+    passes = recent[recent["play_type"] == "pass"]
+    rushes = recent[recent["play_type"] == "run"]
+
+    if not passes.empty and passes["receiver_player_name"].notna().any():
+        counts = passes["receiver_player_name"].value_counts()
+        total_p = counts.sum()
+        for p, count in counts.items():
+            usage["target_shares"][p] = float(count / total_p)
+            usage["ypt"][p] = float(passes[passes["receiver_player_name"] == p]["yards_gained"].sum() / count)
+        rz_p = passes[passes["yardline_100"] <= 20]
+        if not rz_p.empty:
+            for p, count in rz_p["receiver_player_name"].value_counts().items():
+                usage["rz_target_shares"][p] = float(count / len(rz_p))
+
+    if not rushes.empty and rushes["rusher_player_name"].notna().any():
+        counts = rushes["rusher_player_name"].value_counts()
+        total_r = counts.sum()
+        for p, count in counts.items():
+            usage["rush_shares"][p] = float(count / total_r)
+            usage["ypc"][p] = float(rushes[rushes["rusher_player_name"] == p]["yards_gained"].sum() / count)
+        gl_r = rushes[rushes["yardline_100"] <= 10]
+        if not gl_r.empty:
+            for p, count in gl_r["rusher_player_name"].value_counts().items():
+                usage["gl_rush_shares"][p] = float(count / len(gl_r))
+
+    return usage
+
+# -------------------------------------------------------------------------
+# Closed Dirichlet Simplex Skill Allocation
+# -------------------------------------------------------------------------
+def generate_closed_loop_skill_projections(
+    team_abbr: str, implied_total: float, team_spread_margin: float,
+    pass_edge: float, rush_edge: float, depth_names: Dict[str, str],
+    pbp_df: pd.DataFrame, ttp_shift: float = 0.0, mofo_shift: float = 0.0
+) -> List[Dict[str, Any]]:
+    pace = extract_empirical_team_pace(pbp_df, team_abbr)
+    usage = extract_empirical_player_usage(pbp_df, team_abbr)
+
+    # Bounded logistic game-script response
+    script_logit = 1.0 / (1.0 + math.exp(0.12 * team_spread_margin))
+    pass_rate = max(0.48, min(0.68, pace["neutral_pass_rate"] + 0.10 * (script_logit - 0.50) + 0.025 * (pass_edge - rush_edge)))
+    run_rate = 1.0 - pass_rate
+
+    trailing_drag = 0.0 if team_spread_margin >= 0 else max(-0.85, team_spread_margin * 0.045)
+    ypa = max(5.8, min(8.8, 7.35 + (pass_edge * 2.8) + (ttp_shift * 0.85) + trailing_drag))
+    ypc = max(3.4, min(5.4, 4.30 + (rush_edge * 2.2)))
+
+    base_plays = pace["neutral_plays"] * (implied_total / 22.0) ** 0.25
+    gross_pass_mean = base_plays * pass_rate * ypa
+    gross_rush_mean = base_plays * run_rate * ypc
+    gross_total = gross_pass_mean + gross_rush_mean
+
+    # Elasticity invariant: [12.5, 16.5] gross yards per implied point
+    min_yds = implied_total * 12.5
+    max_yds = implied_total * 16.5
+    if gross_total < min_yds:
+        scale = min_yds / max(1.0, gross_total)
+        gross_pass_mean *= scale
+        gross_rush_mean *= scale
+    elif gross_total > max_yds:
+        scale = max_yds / gross_total
+        gross_pass_mean *= scale
+        gross_rush_mean *= scale
+
+    # Finite team touchdown capacity
+    team_td_budget = max(0.85, (implied_total * 0.78) / 7.0)
+    pass_td_share = max(0.38, min(0.75, 0.58 + (pass_edge - rush_edge) * 0.15))
+    team_pass_tds = team_td_budget * pass_td_share
+    team_rush_tds = team_td_budget * (1.0 - pass_td_share)
+
+    # 6-man core target tree inclusive of backfield checkdowns
+    roles = ["WR1", "WR2", "WR3", "TE1", "RB1", "RB2"]
+    emp_targets = {r: usage["target_shares"].get(depth_names.get(r, ""), 0.0) for r in roles}
+    emp_ypt = {r: usage["ypt"].get(depth_names.get(r, ""), ypa) for r in roles}
+    emp_rz = {r: usage["rz_target_shares"].get(depth_names.get(r, ""), emp_targets[r]) for r in roles}
+
+    if sum(emp_targets.values()) < 0.40:
+        emp_targets = {"WR1": 0.28, "WR2": 0.19, "WR3": 0.12, "TE1": 0.20, "RB1": 0.13, "RB2": 0.08}
+        emp_rz = emp_targets.copy()
+
+    # Trench physics: pocket degradation redirects volume underneath
+    if ttp_shift < -0.20:
+        emp_targets["RB1"] += 0.04
+        emp_targets["TE1"] += 0.03
+        emp_targets["WR2"] -= 0.04
+        emp_targets["WR3"] -= 0.03
+
+    # Secondary shell: MOFO split-safety shades boundaries
+    if mofo_shift > 0.10:
+        emp_targets["WR1"] += 0.04
+        emp_targets["WR2"] += 0.02
+        emp_targets["RB1"] -= 0.03
+        emp_targets["RB2"] -= 0.03
+
+    # Target simplex normalization (Sum == 1.0)
+    norm_targets = {r: emp_targets[r] / sum(emp_targets.values()) for r in roles}
+    weighted_rec = {r: norm_targets[r] * (emp_ypt[r] / max(1.0, ypa)) for r in roles}
+    norm_rec_shares = {r: weighted_rec[r] / sum(weighted_rec.values()) for r in roles}
+    
+    # Exact physical conservation: Sum(Rec Means) == Gross Pass Mean
+    rec_means = {r: gross_pass_mean * norm_rec_shares[r] for r in roles}
+
+    # Rush tree simplex normalization
+    rush_roles = ["RB1", "RB2", "QB1"]
+    emp_rushes = {r: usage["rush_shares"].get(depth_names.get(r, ""), 0.0) for r in rush_roles}
+    emp_gl = {r: usage["gl_rush_shares"].get(depth_names.get(r, ""), emp_rushes[r]) for r in rush_roles}
+    if sum(emp_rushes.values()) < 0.40:
+        emp_rushes = {"RB1": 0.65, "RB2": 0.25, "QB1": 0.10}
+        emp_gl = emp_rushes.copy()
+
+    norm_rushes = {r: emp_rushes[r] / sum(emp_rushes.values()) for r in rush_roles}
+    rush_means = {r: gross_rush_mean * norm_rushes[r] for r in rush_roles}
+
+    norm_rz = {r: emp_rz[r] / max(0.01, sum(emp_rz.values())) for r in roles}
+    norm_gl = {r: emp_gl[r] / max(0.01, sum(emp_gl.values())) for r in rush_roles}
+
+    raw_lambdas = {
+        "QB1": team_rush_tds * norm_gl.get("QB1", 0.10),
+        "RB1": (team_rush_tds * norm_gl.get("RB1", 0.65)) + (team_pass_tds * norm_rz.get("RB1", 0.10)),
+        "RB2": (team_rush_tds * norm_gl.get("RB2", 0.25)) + (team_pass_tds * norm_rz.get("RB2", 0.05)),
+        "WR1": team_pass_tds * norm_rz.get("WR1", 0.30),
+        "WR2": team_pass_tds * norm_rz.get("WR2", 0.20),
+        "WR3": team_pass_tds * norm_rz.get("WR3", 0.10),
+        "TE1": team_pass_tds * norm_rz.get("TE1", 0.25),
+    }
+
+    scale_lam = team_td_budget / max(0.01, sum(raw_lambdas.values()))
+    norm_lambdas = {k: raw_lambdas[k] * scale_lam for k in raw_lambdas}
+
+    def calc_anytime_td(lam: float) -> float:
+        return round(float((1.0 - math.exp(-max(0.001, lam))) * 100.0), 1)
+
+    def build_entry(
+        role: str, player: str, stat_type: str, model_med: float,
+        p_yds: float, r_yds: float, rc_yds: float, td_lam: float, p_over: float
+    ) -> dict:
+        sb_line = synthesize_sportsbook_consensus_line(stat_type, role, model_med, implied_total)
+        delta = round(model_med - sb_line, 1)
+        rec = f"OVER ({p_over*100:.1f}%)" if p_over >= 0.555 else (f"UNDER ({(1.0 - p_over)*100:.1f}%)" if p_over <= 0.445 else "PASS")
+        return {
+            "role": role, "player": player, "primary_stat_type": stat_type,
+            "model_median": model_med, "sportsbook_line": sb_line, "edge_delta": delta,
+            "prop_recommendation": rec, "pass_yards": p_yds, "rush_yards": r_yds,
+            "rec_yards": rc_yds, "total_tds": round(td_lam, 2), "anytime_td_prob": calc_anytime_td(td_lam)
+        }
+
+    qb_pass = convert_mean_to_median(gross_pass_mean, "QB_Pass")
+    qb_rush = convert_mean_to_median(rush_means.get("QB1", 0.0), "QB_Rush")
+    rb1_rush = convert_mean_to_median(rush_means.get("RB1", 0.0), "RB_Rush")
+    rb1_rec = convert_mean_to_median(rec_means["RB1"], "RB_Rec")
+    rb2_rush = convert_mean_to_median(rush_means.get("RB2", 0.0), "RB_Rush")
+    rb2_rec = convert_mean_to_median(rec_means["RB2"], "RB_Rec")
+    wr1_rec = convert_mean_to_median(rec_means["WR1"], "WR_Rec")
+    wr2_rec = convert_mean_to_median(rec_means["WR2"], "WR_Rec")
+    wr3_rec = convert_mean_to_median(rec_means["WR3"], "WR_Rec")
+    te1_rec = convert_mean_to_median(rec_means["TE1"], "TE_Rec")
+
+    p_qb = calculate_lognormal_cover_probability(gross_pass_mean, synthesize_sportsbook_consensus_line("Pass Yds", "QB1", qb_pass, implied_total), LOG_SIGMA["QB_Pass"])
+    p_rb1 = calculate_lognormal_cover_probability(rush_means.get("RB1", 0.0), synthesize_sportsbook_consensus_line("Rush Yds", "RB1", rb1_rush, implied_total), LOG_SIGMA["RB_Rush"])
+    p_wr1 = calculate_lognormal_cover_probability(rec_means["WR1"], synthesize_sportsbook_consensus_line("Rec Yds", "WR1", wr1_rec, implied_total), LOG_SIGMA["WR_Rec"])
+    p_wr2 = calculate_lognormal_cover_probability(rec_means["WR2"], synthesize_sportsbook_consensus_line("Rec Yds", "WR2", wr2_rec, implied_total), LOG_SIGMA["WR_Rec"])
+    p_wr3 = calculate_lognormal_cover_probability(rec_means["WR3"], synthesize_sportsbook_consensus_line("Rec Yds", "WR3", wr3_rec, implied_total), LOG_SIGMA["WR_Rec"])
+    p_te1 = calculate_lognormal_cover_probability(rec_means["TE1"], synthesize_sportsbook_consensus_line("Rec Yds", "TE1", te1_rec, implied_total), LOG_SIGMA["TE_Rec"])
+    p_rb1_rec = calculate_lognormal_cover_probability(rec_means["RB1"], synthesize_sportsbook_consensus_line("Rec Yds", "RB1", rb1_rec, implied_total), LOG_SIGMA["RB_Rec"])
+
+    return [
+        build_entry("WR1", depth_names.get("WR1", f"{team_abbr} WR1"), "Rec Yds", wr1_rec, 0.0, 0.0, wr1_rec, norm_lambdas["WR1"], p_wr1),
+        build_entry("WR2", depth_names.get("WR2", f"{team_abbr} WR2"), "Rec Yds", wr2_rec, 0.0, 0.0, wr2_rec, norm_lambdas["WR2"], p_wr2),
+        build_entry("WR3", depth_names.get("WR3", f"{team_abbr} WR3"), "Rec Yds", wr3_rec, 0.0, 0.0, wr3_rec, norm_lambdas["WR3"], p_wr3),
+        build_entry("TE1", depth_names.get("TE1", f"{team_abbr} TE1"), "Rec Yds", te1_rec, 0.0, 0.0, te1_rec, norm_lambdas["TE1"], p_te1),
+        build_entry("RB1", depth_names.get("RB1", f"{team_abbr} RB1"), "Rush Yds", rb1_rush, 0.0, rb1_rush, rb1_rec, norm_lambdas["RB1"], p_rb1),
+        build_entry("RB1_REC", f"{depth_names.get('RB1', 'RB1')} (Rec)", "Rec Yds", rb1_rec, 0.0, 0.0, rb1_rec, 0.0, p_rb1_rec),
+        build_entry("QB1", depth_names.get("QB1", f"{team_abbr} QB"), "Pass Yds", qb_pass, qb_pass, qb_rush, 0.0, norm_lambdas["QB1"], p_qb),
+    ]
+
+# -------------------------------------------------------------------------
+# Dynamic Injury Quantification & Roster Cascades
+# -------------------------------------------------------------------------
+def extract_injury_map(injuries_df: pd.DataFrame) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    injury_map = {}
+    if injuries_df.empty:
+        return injury_map
+    for _, row in injuries_df.iterrows():
+        t = str(row.get("team", row.get("club_code", ""))).strip().upper()
+        p = str(row.get("player_name", row.get("full_name", ""))).strip()
+        st_val = str(row.get("report_status", row.get("game_status", "ACTIVE"))).strip().upper()
+        pos = str(row.get("position", "SKILL")).strip().upper()
+        if t not in injury_map:
+            injury_map[t] = {}
+        injury_map[t][p] = {"status": st_val, "position": pos, "is_out": st_val in INACTIVE_STATUSES}
+    return injury_map
+
+def resolve_autonomous_depth_chart(
+    dc_df: pd.DataFrame, injury_map: Dict[str, Dict[str, Dict[str, Any]]],
+    team_abbr: str, target_week: int
+) -> Dict[str, str]:
+    picks = {
+        "QB1": f"{team_abbr} QB", "RB1": f"{team_abbr} RB1", "RB2": f"{team_abbr} RB2",
+        "WR1": f"{team_abbr} WR1", "WR2": f"{team_abbr} WR2", "WR3": f"{team_abbr} WR3", "TE1": f"{team_abbr} TE1"
+    }
+    if dc_df.empty:
+        return picks
+
+    team_col = next((c for c in ["club_code", "team", "team_abbr"] if c in dc_df.columns), None)
+    if not team_col:
+        return picks
+
+    t_dc = dc_df[dc_df[team_col] == team_abbr].copy()
+    if t_dc.empty:
+        return picks
+
+    if "week" in t_dc.columns:
+        valid_weeks = t_dc[t_dc["week"] == target_week]
+        t_dc = valid_weeks.copy() if not valid_weeks.empty else t_dc[t_dc["week"] == t_dc["week"].max()].copy()
+
+    first_col = next((c for c in ["first_name", "fname"] if c in t_dc.columns), None)
+    last_col = next((c for c in ["last_name", "lname"] if c in t_dc.columns), None)
+    name_col = next((c for c in ["player_name", "full_name", "athlete_name"] if c in t_dc.columns), None)
+    pos_col = next((c for c in ["pos_abb", "position", "pos"] if c in t_dc.columns), None)
+    rank_col = next((c for c in ["pos_rank", "depth_team", "rank"] if c in t_dc.columns), None)
+
+    if not pos_col or not rank_col:
+        return picks
+
+    t_dc["rank_int"] = pd.to_numeric(t_dc[rank_col], errors="coerce").fillna(99).astype(int)
+    t_dc.sort_values(by=["rank_int"], ascending=True, inplace=True)
+    team_injuries = injury_map.get(team_abbr, {})
+
+    slot_configs = [("QB", ["QB1"]), ("RB", ["RB1", "RB2"]), ("WR", ["WR1", "WR2", "WR3"]), ("TE", ["TE1"])]
+    assigned = set()
+
+    for pos, slots in slot_configs:
+        cands = t_dc[t_dc[pos_col] == pos]
+        healthy = []
+        for _, row in cands.iterrows():
+            full_name = (
+                str(row[name_col]).strip() if name_col and pd.notna(row[name_col]) else
+                (f"{row[first_col]} {row[last_col]}".strip() if first_col and last_col and pd.notna(row[first_col]) else "")
+            )
+            if not full_name or full_name.lower() in assigned:
+                continue
+            if team_injuries.get(full_name, {}).get("is_out", False):
+                continue
+            healthy.append(full_name)
+            assigned.add(full_name.lower())
+
+        for idx, slot_key in enumerate(slots):
+            if idx < len(healthy):
+                picks[slot_key] = healthy[idx]
+
+    return picks
+
+def quantify_unit_level_injuries_dynamically(
+    pbp_df: pd.DataFrame, injury_map: Dict[str, Dict[str, Dict[str, Any]]],
+    home_team: str, away_team: str
+) -> Dict[str, Any]:
+    shifts = {
+        "spread_shift": 0.0, "total_shift": 0.0, "pass_epa_shift": 0.0,
+        "rush_epa_shift": 0.0, "home_ttp_shift": 0.0, "away_ttp_shift": 0.0,
+        "home_mofo_shift": 0.0, "away_mofo_shift": 0.0
+    }
+    neutral_pbp = filter_neutral_game_states(pbp_df)
+    if neutral_pbp.empty:
+        return shifts
+
+    for team, mult, key_ttp, key_mofo in [
+        (home_team, -1.0, "home_ttp_shift", "home_mofo_shift"),
+        (away_team, 1.0, "away_ttp_shift", "away_mofo_shift")
+    ]:
+        for p_name, meta in injury_map.get(team, {}).items():
+            if not meta["is_out"]:
+                continue
+            pos = meta["position"]
+            if pos == "QB":
+                qb_pbp = neutral_pbp[(neutral_pbp["passer_player_name"] == p_name) & (neutral_pbp["play_type"] == "pass")]
+                if len(qb_pbp) >= 30:
+                    epa_delta = max(0.0, float(qb_pbp["epa"].mean()) - (-0.110))
+                    point_haircut = epa_delta * 22.0
+                    shifts["spread_shift"] += mult * round(point_haircut, 1)
+                    shifts["total_shift"] -= round(point_haircut * 0.82, 1)
+                    shifts["pass_epa_shift"] += mult * round(epa_delta * 0.5, 3)
+            elif pos in ["T", "OT", "LT"]:
+                shifts["spread_shift"] += mult * 0.8
+                shifts["total_shift"] -= 0.6
+                shifts[key_ttp] -= 0.30
+            elif pos in ["CB", "DB"]:
+                shifts["spread_shift"] += mult * 0.6
+                shifts[key_mofo] += 0.15
+
+    return shifts
+
+# -------------------------------------------------------------------------
+# Master Execution Pipeline
+# -------------------------------------------------------------------------
+async def main():
+    target_season = 2026
+    target_week = 1
 
     try:
-        df_team_ratings = load_ratings_data()
-    except Exception as e:
-        st.error(f"Ratings ledger query failure: {e}")
-        df_team_ratings = pd.DataFrame()
+        schedules = nfl.load_schedules(seasons=[target_season]).to_pandas()
+    except Exception:
+        schedules = nfl.load_schedules(seasons=[target_season - 1]).to_pandas()
 
-    if df_team_ratings.empty:
-        st.info("Ratings table unpopulated. Run `python team_ratings_engine.py` to compile initial ledger.")
+    try:
+        pbp = nfl.load_pbp(seasons=[target_season - 1, target_season]).to_pandas()
+    except Exception:
+        pbp = pd.DataFrame()
+
+    try:
+        injuries = nfl.load_injuries(seasons=[target_season]).to_pandas()
+    except Exception:
+        injuries = pd.DataFrame()
+
+    try:
+        depth_charts = nfl.load_depth_charts(seasons=[target_season]).to_pandas()
+    except Exception:
+        depth_charts = pd.DataFrame()
+
+    for df in [schedules, pbp, injuries, depth_charts]:
+        if df.empty:
+            continue
+        for col in ["home_team", "away_team", "posteam", "defteam", "recent_team", "team", "club_code"]:
+            if col in df.columns:
+                df[col] = df[col].apply(clean_team_abbr)
+
+    team_perf = compute_opponent_adjusted_epa(pbp)
+    injury_map = extract_injury_map(injuries)
+
+    unplayed = schedules[schedules["result"].isna()]
+    if not unplayed.empty:
+        target_week = int(unplayed["week"].min())
+        upcoming = unplayed[unplayed["week"] == target_week].copy()
     else:
-        with st.expander("📋 View League-Wide 32-Team Ratings Ledger", expanded=False):
-            st.dataframe(
-                df_team_ratings[[
-                    "team", "model_q_ovr", "madden_ovr", "discrepancy", "signal",
-                    "model_offense", "madden_offense", "model_defense", "madden_defense"
-                ]],
-                column_config={
-                    "team": st.column_config.TextColumn("Franchise"),
-                    "model_q_ovr": st.column_config.NumberColumn("Model Q-OVR", format="%.1f"),
-                    "madden_ovr": st.column_config.NumberColumn("Madden OVR", format="%.1f"),
-                    "discrepancy": st.column_config.NumberColumn("Delta (Model - EA)", format="%+.1f"),
-                    "signal": st.column_config.TextColumn("Market Signal"),
-                    "model_offense": st.column_config.NumberColumn("Model Off", format="%.1f"),
-                    "madden_offense": st.column_config.NumberColumn("EA Off", format="%.1f"),
-                    "model_defense": st.column_config.NumberColumn("Model Def", format="%.1f"),
-                    "madden_defense": st.column_config.NumberColumn("EA Def", format="%.1f")
-                },
-                hide_index=True,
-                use_container_width=True
-            )
+        logging.info("No unplayed fixtures found.")
+        sys.exit(0)
 
-        st.divider()
+    logging.info(f"Executing Season {target_season} Week {target_week} Quant Pipeline ({len(upcoming)} matchups)...")
+    pre_processed = []
 
-        team_choices = sorted(df_team_ratings["team"].unique().tolist())
-        target_team = st.selectbox("Select Franchise for Deep-Dive Audit:", team_choices, index=0)
-        team_row = df_team_ratings[df_team_ratings["team"] == target_team].iloc[0]
+    for _, game in upcoming.iterrows():
+        home_team = clean_team_abbr(str(game["home_team"]))
+        away_team = clean_team_abbr(str(game["away_team"]))
+        matchup = f"{away_team} @ {home_team}"
+        week_num = int(game["week"]) if pd.notna(game["week"]) else target_week
 
-        rc1, rc2, rc3, rc4 = st.columns(4)
-        rc1.metric("Model Q-OVR", f"{float(team_row['model_q_ovr']):.1f}")
-        rc2.metric("Madden OVR", f"{float(team_row['madden_ovr']):.1f}", f"{float(team_row['discrepancy']):+.1f} vs Model")
-        rc3.metric("Neutral Dropback EPA", f"{float(team_row['net_dropback_epa']):+.3f}")
-        rc4.metric("Market Status", str(team_row["signal"]))
+        raw_spread_line = float(game.get("spread_line", 0.0) or 0.0)
+        raw_total_line = float(game.get("total_line", 44.0) or 44.0)
 
-        st.markdown("#### ⚔️ Unit-Level Trench & Coverage Discrepancies")
-        col_u_off, col_u_def = st.columns(2)
+        def get_stat(team_abbr: str, col: str) -> float:
+            if team_perf.empty:
+                return 0.0
+            row = team_perf[(team_perf["team"] == team_abbr) & (team_perf["season"] <= target_season)]
+            if row.empty:
+                return 0.0
+            val = row.sort_values(["season", "week"], ascending=[False, False]).iloc[0].get(col, 0.0)
+            return float(val) if pd.notna(val) else 0.0
 
-        with col_u_off:
-            st.markdown("##### 🛡️ Offensive Line & Scoring Units")
-            off_table = pd.DataFrame([
-                {
-                    "Unit": "Total Offense",
-                    "Model Q-Score": float(team_row["model_offense"]),
-                    "Madden Score": float(team_row["madden_offense"]),
-                    "Delta": round(float(team_row["model_offense"]) - float(team_row["madden_offense"]), 1)
-                },
-                {
-                    "Unit": "Pass Protection (TTP/PBWR)",
-                    "Model Q-Score": float(team_row["model_pass_protection"]),
-                    "Madden Score": float(team_row["madden_pass_protection"]),
-                    "Delta": round(float(team_row["model_pass_protection"]) - float(team_row["madden_pass_protection"]), 1)
-                },
-            ])
-            st.dataframe(off_table, hide_index=True, use_container_width=True)
+        net_pass_edge = (get_stat(home_team, "roll_off_dropback_epa") - get_stat(away_team, "roll_def_dropback_epa")) - \
+                        (get_stat(away_team, "roll_off_dropback_epa") - get_stat(home_team, "roll_def_dropback_epa"))
+        net_rush_edge = (get_stat(home_team, "roll_off_rush_epa") - get_stat(away_team, "roll_def_rush_epa")) - \
+                        (get_stat(away_team, "roll_off_rush_epa") - get_stat(home_team, "roll_def_rush_epa"))
+        net_late_down_edge = (get_stat(home_team, "roll_off_late_down_epa") - get_stat(away_team, "roll_def_late_down_epa")) - \
+                             (get_stat(away_team, "roll_off_late_down_epa") - get_stat(home_team, "roll_def_late_down_epa"))
 
-        with col_u_def:
-            st.markdown("##### 🏹 Defensive Front & Coverage Units")
-            def_table = pd.DataFrame([
-                {
-                    "Unit": "Total Defense",
-                    "Model Q-Score": float(team_row["model_defense"]),
-                    "Madden Score": float(team_row["madden_defense"]),
-                    "Delta": round(float(team_row["model_defense"]) - float(team_row["madden_defense"]), 1)
-                },
-                {
-                    "Unit": "Front Pass Rush (PRWR)",
-                    "Model Q-Score": float(team_row["model_pass_rush"]),
-                    "Madden Score": float(team_row["madden_pass_rush"]),
-                    "Delta": round(float(team_row["model_pass_rush"]) - float(team_row["madden_pass_rush"]), 1)
-                },
-                {
-                    "Unit": "Secondary Shell (MOFO/MOFC)",
-                    "Model Q-Score": float(team_row["model_secondary"]),
-                    "Madden Score": float(team_row["madden_secondary"]),
-                    "Delta": round(float(team_row["model_secondary"]) - float(team_row["madden_secondary"]), 1)
-                },
-            ])
-            st.dataframe(def_table, hide_index=True, use_container_width=True)
+        diff_success = get_stat(home_team, "roll_off_early_down_success") - get_stat(away_team, "roll_off_early_down_success")
+        diff_explosive = get_stat(home_team, "roll_off_explosive") - get_stat(away_team, "roll_off_explosive")
+        rest_diff = float(game.get("home_rest", 7.0) or 7.0) - float(game.get("away_rest", 7.0) or 7.0)
+        is_divisional = int(game.get("div_game", 0) or 0)
 
-        st.markdown("#### 🧠 Research Director Tactical Cross-Examination")
-        if st.button(f"Generate AI Tape Audit: {target_team} Model vs. Madden", type="primary", use_container_width=True):
-            with st.spinner(f"Auditing trench and coverage discrepancies for {target_team}..."):
-                dossier = {
-                    "team": target_team,
-                    "model_q_ovr": float(team_row["model_q_ovr"]),
-                    "madden_ovr": float(team_row["madden_ovr"]),
-                    "discrepancy": float(team_row["discrepancy"]),
-                    "net_dropback_epa": float(team_row["net_dropback_epa"]),
-                    "net_rush_epa": float(team_row["net_rush_epa"]),
-                    "units": {
-                        "pass_protection_delta": round(float(team_row["model_pass_protection"]) - float(team_row["madden_pass_protection"]), 1),
-                        "pass_rush_delta": round(float(team_row["model_pass_rush"]) - float(team_row["madden_pass_rush"]), 1),
-                        "secondary_coverage_delta": round(float(team_row["model_secondary"]) - float(team_row["madden_secondary"]), 1)
-                    }
-                }
+        injury_shifts = quantify_unit_level_injuries_dynamically(pbp, injury_map, home_team, away_team)
+        adjusted_spread = raw_spread_line + injury_shifts["spread_shift"]
+        adjusted_total = max(33.0, raw_total_line + injury_shifts["total_shift"])
+        net_pass_edge += injury_shifts["pass_epa_shift"]
+        net_rush_edge += injury_shifts["rush_epa_shift"]
 
-                prompt_payload = f"""[MODE 1: NFL TACTICAL & STATISTICAL BREAKDOWN]
-SUBJECT: {target_team} Model Q-OVR vs. EA Madden Commercial Ratings Audit
+        canonical_spread, implied_home, implied_away, raw_market_prob = resolve_directional_market_context(adjusted_total, adjusted_spread)
+
+        feature_dict = {
+            "net_pass_edge": net_pass_edge, "net_rush_edge": net_rush_edge,
+            "net_late_down_edge": net_late_down_edge, "diff_success": diff_success,
+            "diff_explosive": diff_explosive, "rest_diff": rest_diff,
+            "is_divisional": is_divisional, "market_home_prob": raw_market_prob
+        }
+
+        feature_row = pd.DataFrame([[feature_dict[f] for f in EXPECTED_FEATURES]], columns=EXPECTED_FEATURES)
+        raw_model_prob = float(model.predict_proba(feature_row)[0][1])
+
+        # Directional Bayesian shrinkage against consensus market line
+        if canonical_spread >= 3.0:
+            weight = 0.70 if abs(raw_model_prob - raw_market_prob) > 0.25 else 0.50
+            calibrated_win_prob = (1.0 - weight) * max(raw_model_prob, 1.0 - raw_model_prob) + (weight * raw_market_prob)
+        elif canonical_spread <= -3.0:
+            weight = 0.70 if abs(raw_model_prob - raw_market_prob) > 0.25 else 0.50
+            calibrated_win_prob = (1.0 - weight) * min(raw_model_prob, 1.0 - raw_model_prob) + (weight * raw_market_prob)
+        else:
+            calibrated_win_prob = (0.50 * raw_model_prob) + (0.50 * raw_market_prob)
+
+        calibrated_win_prob = max(0.02, min(0.98, calibrated_win_prob))
+        sigma = 13.45 * math.sqrt(max(32.0, adjusted_total) / 44.0)
+        z_win = norm.ppf(calibrated_win_prob)
+        model_projected_margin = z_win * sigma
+
+        # Single source of truth for discrete scores and margin card
+        pred_home_score, pred_away_score = project_discrete_nfl_scores(model_projected_margin, adjusted_total)
+        pred_total_score = pred_home_score + pred_away_score
+
+        z_cover = (model_projected_margin - canonical_spread) / sigma
+        home_cover = float(norm.cdf(z_cover))
+        away_cover = 1.0 - home_cover
+
+        home_edge = home_cover - 0.5238
+        away_edge = away_cover - 0.5238
+
+        if home_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) and home_edge > away_edge:
+            rec_team = home_team
+            rec_line = f"{home_team} {-canonical_spread:+g}"
+            cover_prob = home_cover
+            final_edge = min(0.050, home_edge)
+        elif away_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) and away_edge > home_edge:
+            rec_team = away_team
+            rec_line = f"{away_team} {+canonical_spread:+g}"
+            cover_prob = away_cover
+            final_edge = min(0.050, away_edge)
+        else:
+            rec_team = "PASS"
+            rec_line = "PASS - No Edge"
+            cover_prob = max(home_cover, away_cover)
+            final_edge = max(home_edge, away_edge)
+
+        # Three-outcome Eighth-Kelly formula: f* = ((b * p - q) / b) * 0.125
+        b = 1.9091 - 1.0
+        q = max(0.0, 1.0 - cover_prob)
+        kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" and final_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) else 0.0
+
+        home_depth = resolve_autonomous_depth_chart(depth_charts, injury_map, home_team, week_num)
+        away_depth = resolve_autonomous_depth_chart(depth_charts, injury_map, away_team, week_num)
+
+        home_skills = generate_closed_loop_skill_projections(
+            home_team, implied_home, model_projected_margin, net_pass_edge, net_rush_edge,
+            home_depth, pbp, ttp_shift=injury_shifts["home_ttp_shift"], mofo_shift=injury_shifts["away_mofo_shift"]
+        )
+        away_skills = generate_closed_loop_skill_projections(
+            away_team, implied_away, -model_projected_margin, -net_pass_edge, -net_rush_edge,
+            away_depth, pbp, ttp_shift=injury_shifts["away_ttp_shift"], mofo_shift=injury_shifts["home_mofo_shift"]
+        )
+
+        pre_processed.append({
+            "game_id": str(game.get("game_id", f"{target_season}_{week_num}_{away_team}_{home_team}")),
+            "season": target_season,
+            "week": week_num,
+            "matchup": matchup,
+            "home_team": home_team,
+            "away_team": away_team,
+            "home_win_prob": calibrated_win_prob,
+            "market_prob": raw_market_prob,
+            "spread_cover_prob": cover_prob,
+            "spread_edge": final_edge,
+            "kelly_units": kelly_units,
+            "recommended_team": rec_team,
+            "recommended_line": rec_line,
+            "total_line": adjusted_total,
+            "spread_line": model_projected_margin,
+            "predicted_home_score": pred_home_score,
+            "predicted_away_score": pred_away_score,
+            "predicted_total_score": pred_total_score,
+            "player_projections": {"home": home_skills, "away": away_skills},
+            "matchup_context": {
+                "home_team": home_team,
+                "home_roster": {p["role"]: p["player"] for p in home_skills},
+                "away_team": away_team,
+                "away_roster": {p["role"]: p["player"] for p in away_skills}
+            },
+            "tape_metrics": {
+                "net_pass_epa_diff": f"{net_pass_edge:+.3f}",
+                "net_rush_epa_diff": f"{net_rush_edge:+.3f}",
+                "explosive_rate_diff": f"{diff_explosive:+.3f}",
+                "early_down_success_diff": f"{diff_success:+.3f}"
+            }
+        })
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def generate_matchup_analysis(item):
+        verdict_str = f"Bet {item['recommended_line']} - {item['kelly_units']:.2f}u" if item['recommended_team'] != "PASS" and item['kelly_units'] > 0.0 else "PASS - 0.00u"
+        prompt = f"""[MODE 1: NFL TACTICAL & STATISTICAL BREAKDOWN]
+SUBJECT: {item['matchup']} Quantitative Evaluation
 DOSSIER PAYLOAD:
-{json.dumps(dossier, indent=2)}
+{json.dumps(item, indent=2)}
 
-TASK:
-Provide an institutional film and sabermetric cross-examination detailing why the model's empirical Q-OVR diverges from EA Madden's commercial rating.
-1. The Executive Verdict (first 1-2 sentences).
-2. Trench Physics (Pass Protection TTP vs. Opposing Pass Rush).
-3. Coverage Shell Integrity (Secondary discipline vs. Madden physical ratings).
-Adhere strictly to operational protocols: no platitudes, no filler introductions, lead directly with the analytical edge."""
+CRITICAL NARRATIVE HARMONIZATION DIRECTIVE:
+- Home Team: {item['home_team']} | Projected Score: {item['predicted_home_score']}
+- Away Team: {item['away_team']} | Projected Score: {item['predicted_away_score']}
+- Win Probabilities: {item['home_team']} Model {item['home_win_prob']*100:.1f}%, Market {item['market_prob']*100:.1f}%
+- Stated Net Edge: {item['spread_edge']*100:+.1f}% | Kelly Stake: {item['kelly_units']:.2f}u
+- Actionable Verdict: {verdict_str}
+- Lead directly with the strategic conclusion in the first 1-2 sentences. Ensure the executive summary matches the projected scores and probabilities without contradictions.
 
+Output strictly valid JSON matching this schema:
+{{
+  "executive_summary": "Two-sentence strategic verdict detailing player matchups, trench leverage, and harmonized edge assessment.",
+  "schematic_matchup": {{
+    "away_offense_vs_home_defense": "Detailed film breakdown citing specific named players, pass protection, and coverage shells.",
+    "home_offense_vs_away_defense": "Detailed film breakdown citing specific named players, pass protection, and coverage shells."
+  }},
+  "actionable_verdict": "{verdict_str}"
+}}"""
+        async with semaphore:
+            for attempt in range(3):
                 try:
-                    audit_res = ai_client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=prompt_payload,
-                        config=types.GenerateContentConfig(
-                            system_instruction=NFL_GURU_FULL_SYSTEM_PROMPT,
-                            temperature=0.15
+                    loop = asyncio.get_running_loop()
+                    response = await loop.run_in_executor(
+                        None,
+                        lambda: ai_client.models.generate_content(
+                            model="gemini-3.8-flash",
+                            contents=prompt,
+                            config=types.GenerateContentConfig(
+                                system_instruction=NFL_GURU_FULL_SYSTEM_PROMPT,
+                                temperature=0.15,
+                                response_mime_type="application/json"
+                            )
                         )
                     )
-                    st.markdown(audit_res.text)
-                except Exception as e:
-                    st.error(f"Inference failure: {e}")
+                    parsed = json.loads(response.text)
+                    if parsed.get("executive_summary"):
+                        parsed["actionable_verdict"] = verdict_str
+                        return json.dumps(parsed)
+                except Exception:
+                    await asyncio.sleep(2 ** attempt)
+
+            return json.dumps({
+                "executive_summary": f"Neutral-down line leverage establishes foundational margin distribution for {item['matchup']}.",
+                "schematic_matchup": {
+                    "away_offense_vs_home_defense": f"{item['away_team']} must establish early-down efficiency against {item['home_team']}'s front.",
+                    "home_offense_vs_away_defense": f"{item['home_team']} leverages intermediate voids against split-safety coverage."
+                },
+                "actionable_verdict": verdict_str
+            })
+
+    results = await asyncio.gather(*[generate_matchup_analysis(item) for item in pre_processed])
+
+    records = []
+    for item, text_res in zip(pre_processed, results):
+        try:
+            parsed = json.loads(text_res)
+        except Exception:
+            parsed = {}
+
+        parsed["predicted_scores"] = {
+            "home_team": item["home_team"], "predicted_home_score": item["predicted_home_score"],
+            "away_team": item["away_team"], "predicted_away_score": item["predicted_away_score"],
+            "predicted_total": item["predicted_total_score"]
+        }
+        parsed["player_projections"] = item["player_projections"]
+
+        records.append({
+            "game_id": item["game_id"], "season": item["season"], "week": item["week"],
+            "matchup": item["matchup"], "home_win_prob": item["home_win_prob"],
+            "market_prob": item["market_prob"], "spread_cover_prob": item["spread_cover_prob"],
+            "spread_edge": item["spread_edge"], "kelly_units": item["kelly_units"],
+            "predicted_home_score": item["predicted_home_score"],
+            "predicted_away_score": item["predicted_away_score"],
+            "predicted_total_score": item["predicted_total_score"],
+            "analysis": json.dumps(parsed)
+        })
+
+    if records:
+        df_results = pd.DataFrame(records)
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS nfl_weekly_analysis (
+                    game_id TEXT PRIMARY KEY, week INTEGER, matchup TEXT,
+                    home_win_prob NUMERIC, market_prob NUMERIC, spread_cover_prob NUMERIC,
+                    spread_edge NUMERIC, kelly_units NUMERIC, analysis TEXT
+                );
+            """))
+            for stmt in [
+                "ALTER TABLE nfl_weekly_analysis ADD COLUMN IF NOT EXISTS season INTEGER DEFAULT 2026;",
+                "ALTER TABLE nfl_weekly_analysis ADD COLUMN IF NOT EXISTS predicted_home_score INTEGER;",
+                "ALTER TABLE nfl_weekly_analysis ADD COLUMN IF NOT EXISTS predicted_away_score INTEGER;",
+                "ALTER TABLE nfl_weekly_analysis ADD COLUMN IF NOT EXISTS predicted_total_score INTEGER;"
+            ]:
+                conn.execute(text(stmt))
+
+            conn.execute(text("DELETE FROM nfl_weekly_analysis WHERE season = :s AND week = :w;"), {"s": target_season, "w": target_week})
+
+        df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False, method="multi")
+        logging.info(f"Database sync verified: {len(df_results)} fixtures committed.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
