@@ -6,7 +6,7 @@ Production UI Architecture:
 - Tab 2: Market Steam & Sharp Line Movement Monitoring.
 - Tab 3: Strategic Research Director AI Workbench (Gemini 3.8 Flash via nfl_guru.py).
 - Tab 4: Airlocked Out-of-Sample Historical Simulation Engine.
-- Tab 5: 32-Team Q-OVR vs. EA Madden Ratings Comparison Lab (Self-Hydrating Cloud Layer).
+- Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab (Secondary-Weighted Ratings & Full Player Rosters).
 """
 
 import json
@@ -177,9 +177,6 @@ def load_predictions_data() -> pd.DataFrame:
 
 @st.cache_data(ttl=600)
 def load_ratings_data() -> pd.DataFrame:
-    """
-    Queries ratings comparisons with guaranteed idempotent DDL verification.
-    """
     init_ratings_schema(engine)
     query = text("""
         SELECT * FROM nfl_team_ratings_comparison
@@ -237,7 +234,7 @@ tab_slate, tab_steam, tab_guru, tab_sim, tab_ratings = st.tabs([
     "⚡ Market Steam & Consensus Deltas",
     "🧠 Strategic Guru Workbench",
     "🧪 Blind Historical Simulation",
-    "🎮 Model Q-OVR vs. Madden Ratings Lab"
+    "🎮 Model Q-OVR vs. Database Ratings Lab"
 ])
 
 # -------------------------------------------------------------------------
@@ -507,37 +504,40 @@ with tab_sim:
             r2.metric("Spread Cover Accuracy (ATS)", f"{ats_acc:.1f}%")
 
 # -------------------------------------------------------------------------
-# Tab 5: Model Q-OVR vs. Madden Ratings Lab (Self-Hydrating Cloud Layer)
+# Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab
 # -------------------------------------------------------------------------
 with tab_ratings:
-    st.subheader("🎮 Model Q-OVR vs. EA Madden Ratings Comparison Lab")
+    st.subheader("🎮 Model Q-OVR vs. Database Ratings & Roster Lab")
     st.caption(
-        "Audits commercial video game composite ratings against neutral-down line-of-scrimmage physics. "
-        "Model Q-OVR is derived from neutral-down EPA, CPOE, Success Rates, and Pass Block Win Rates."
+        "Audits Secondary-Weighted Database composite ratings against neutral-down line-of-scrimmage physics. "
+        "Individual roster ratings directly inform AI qualitative evaluations."
     )
 
     try:
         df_team_ratings = load_ratings_data()
+        with engine.connect() as conn:
+            df_rosters = pd.read_sql(text("SELECT * FROM nfl_team_rosters;"), conn)
     except Exception as e:
-        st.error(f"Ratings ledger query failure: {e}")
+        st.error(f"Ledger or Roster query failure: {e}")
         df_team_ratings = pd.DataFrame()
+        df_rosters = pd.DataFrame()
 
     if df_team_ratings.empty:
         st.warning("Ratings comparison ledger is currently empty in Neon PostgreSQL.")
-        if st.button("⚡ Compile & Hydrate 32-Team Ratings Ledger Now", type="primary", use_container_width=True):
-            with st.spinner("Ingesting play-by-play metrics, pulling Madden API, and calculating Q-OVR..."):
+        if st.button("⚡ Compile & Hydrate Database & Rosters Now", type="primary", use_container_width=True):
+            with st.spinner("Parsing Secondary Weighted Rankings spreadsheet and committing to database..."):
                 try:
-                    pipeline = QuantitativeRatingsPipeline(season=2026)
+                    pipeline = QuantitativeRatingsPipeline(season=2026, excel_path="Madden_27_Secondary_Weighted_Rankings.xlsx")
                     pipeline.sync_data()
                     df_calculated = pipeline.calculate_q_ovr()
                     pipeline.persist_to_database(df_calculated)
                     st.cache_data.clear()
-                    st.success("Ratings ledger compiled and committed to database.")
+                    st.success("Database successfully hydrated with team ratings and player rosters.")
                     st.rerun()
                 except Exception as ex:
                     st.error(f"Hydration failed: {ex}")
     else:
-        with st.expander("📋 View League-Wide 32-Team Ratings Ledger", expanded=False):
+        with st.expander("📋 View League-Wide 32-Team Database Ratings Ledger", expanded=False):
             st.dataframe(
                 df_team_ratings[[
                     "team", "model_q_ovr", "madden_ovr", "discrepancy", "signal",
@@ -546,13 +546,13 @@ with tab_ratings:
                 column_config={
                     "team": st.column_config.TextColumn("Franchise"),
                     "model_q_ovr": st.column_config.NumberColumn("Model Q-OVR", format="%.1f"),
-                    "madden_ovr": st.column_config.NumberColumn("Madden OVR", format="%.1f"),
-                    "discrepancy": st.column_config.NumberColumn("Delta (Model - EA)", format="%+.1f"),
+                    "madden_ovr": st.column_config.NumberColumn("Database Overall", format="%.1f"),
+                    "discrepancy": st.column_config.NumberColumn("Delta (Model - DB)", format="%+.1f"),
                     "signal": st.column_config.TextColumn("Market Signal"),
                     "model_offense": st.column_config.NumberColumn("Model Off", format="%.1f"),
-                    "madden_offense": st.column_config.NumberColumn("EA Off", format="%.1f"),
+                    "madden_offense": st.column_config.NumberColumn("DB Off", format="%.1f"),
                     "model_defense": st.column_config.NumberColumn("Model Def", format="%.1f"),
-                    "madden_defense": st.column_config.NumberColumn("EA Def", format="%.1f")
+                    "madden_defense": st.column_config.NumberColumn("DB Def", format="%.1f")
                 },
                 hide_index=True,
                 use_container_width=True
@@ -561,88 +561,53 @@ with tab_ratings:
         st.divider()
 
         team_choices = sorted(df_team_ratings["team"].unique().tolist())
-        target_team = st.selectbox("Select Franchise for Deep-Dive Audit:", team_choices, index=0)
+        target_team = st.selectbox("Select Franchise for Roster & Unit Deep-Dive:", team_choices, index=0)
         team_row = df_team_ratings[df_team_ratings["team"] == target_team].iloc[0]
 
         rc1, rc2, rc3, rc4 = st.columns(4)
         rc1.metric("Model Q-OVR", f"{float(team_row['model_q_ovr']):.1f}")
-        rc2.metric("Madden OVR", f"{float(team_row['madden_ovr']):.1f}", f"{float(team_row['discrepancy']):+.1f} vs Model")
-        rc3.metric("Neutral Dropback EPA", f"{float(team_row['net_dropback_epa']):+.3f}")
+        rc2.metric("Database Overall", f"{float(team_row['madden_ovr']):.1f}", f"{float(team_row['discrepancy']):+.1f} vs Model")
+        rc3.metric("Net Dropback EPA", f"{float(team_row['net_dropback_epa']):+.3f}")
         rc4.metric("Market Status", str(team_row["signal"]))
 
-        st.markdown("#### ⚔️ Unit-Level Trench & Coverage Discrepancies")
-        col_u_off, col_u_def = st.columns(2)
+        st.markdown("#### 🏈 Franchise Roster & Player Talent Pool")
+        team_players = df_rosters[df_rosters["team"] == target_team].sort_values("overall_rating", ascending=False) if not df_rosters.empty else pd.DataFrame()
+        
+        if not team_players.empty:
+            st.dataframe(
+                team_players[["player_name", "position", "overall_rating", "archetype", "tier_status"]],
+                column_config={
+                    "player_name": st.column_config.TextColumn("Player Name", width="medium"),
+                    "position": st.column_config.TextColumn("Position", width="small"),
+                    "overall_rating": st.column_config.NumberColumn("Overall OVR"),
+                    "archetype": st.column_config.TextColumn("Archetype", width="medium"),
+                    "tier_status": st.column_config.TextColumn("Tier / Status")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.caption("No individual player records found for this franchise.")
 
-        with col_u_off:
-            st.markdown("##### 🛡️ Offensive Line & Scoring Units")
-            off_table = pd.DataFrame([
-                {
-                    "Unit": "Total Offense",
-                    "Model Q-Score": float(team_row["model_offense"]),
-                    "Madden Score": float(team_row["madden_offense"]),
-                    "Delta": round(float(team_row["model_offense"]) - float(team_row["madden_offense"]), 1)
-                },
-                {
-                    "Unit": "Pass Protection (TTP/PBWR)",
-                    "Model Q-Score": float(team_row["model_pass_protection"]),
-                    "Madden Score": float(team_row["madden_pass_protection"]),
-                    "Delta": round(float(team_row["model_pass_protection"]) - float(team_row["madden_pass_protection"]), 1)
-                },
-            ])
-            st.dataframe(off_table, hide_index=True, use_container_width=True)
-
-        with col_u_def:
-            st.markdown("##### 🏹 Defensive Front & Coverage Units")
-            def_table = pd.DataFrame([
-                {
-                    "Unit": "Total Defense",
-                    "Model Q-Score": float(team_row["model_defense"]),
-                    "Madden Score": float(team_row["madden_defense"]),
-                    "Delta": round(float(team_row["model_defense"]) - float(team_row["madden_defense"]), 1)
-                },
-                {
-                    "Unit": "Front Pass Rush (PRWR)",
-                    "Model Q-Score": float(team_row["model_pass_rush"]),
-                    "Madden Score": float(team_row["madden_pass_rush"]),
-                    "Delta": round(float(team_row["model_pass_rush"]) - float(team_row["madden_pass_rush"]), 1)
-                },
-                {
-                    "Unit": "Secondary Shell (MOFO/MOFC)",
-                    "Model Q-Score": float(team_row["model_secondary"]),
-                    "Madden Score": float(team_row["madden_secondary"]),
-                    "Delta": round(float(team_row["model_secondary"]) - float(team_row["madden_secondary"]), 1)
-                },
-            ])
-            st.dataframe(def_table, hide_index=True, use_container_width=True)
-
-        st.markdown("#### 🧠 Research Director Tactical Cross-Examination")
-        if st.button(f"Generate AI Tape Audit: {target_team} Model vs. Madden", type="primary", use_container_width=True):
-            with st.spinner(f"Auditing trench and coverage discrepancies for {target_team}..."):
+        st.markdown("#### 🧠 Research Director Tactical Cross-Examination (AI-Informed)")
+        if st.button(f"Generate AI Audit with Roster Context: {target_team}", type="primary", use_container_width=True):
+            with st.spinner(f"Analyzing roster depth and spatiotemporal metrics for {target_team}..."):
+                top_stars = team_players.head(5).to_dict(orient="records") if not team_players.empty else []
                 dossier = {
                     "team": target_team,
                     "model_q_ovr": float(team_row["model_q_ovr"]),
-                    "madden_ovr": float(team_row["madden_ovr"]),
-                    "discrepancy": float(team_row["discrepancy"]),
+                    "database_overall": float(team_row["madden_ovr"]),
                     "net_dropback_epa": float(team_row["net_dropback_epa"]),
-                    "net_rush_epa": float(team_row["net_rush_epa"]),
-                    "units": {
-                        "pass_protection_delta": round(float(team_row["model_pass_protection"]) - float(team_row["madden_pass_protection"]), 1),
-                        "pass_rush_delta": round(float(team_row["model_pass_rush"]) - float(team_row["madden_pass_rush"]), 1),
-                        "secondary_coverage_delta": round(float(team_row["model_secondary"]) - float(team_row["madden_secondary"]), 1)
-                    }
+                    "top_roster_stars": top_stars
                 }
 
                 prompt_payload = f"""[MODE 1: NFL TACTICAL & STATISTICAL BREAKDOWN]
-SUBJECT: {target_team} Model Q-OVR vs. EA Madden Commercial Ratings Audit
+SUBJECT: {target_team} Model Q-OVR vs. Database Secondary-Weighted Overall Audit
 DOSSIER PAYLOAD:
 {json.dumps(dossier, indent=2)}
 
 TASK:
-Provide an institutional film and sabermetric cross-examination detailing why the model's empirical Q-OVR diverges from EA Madden's commercial rating.
-1. The Executive Verdict (first 1-2 sentences).
-2. Trench Physics (Pass Protection TTP vs. Opposing Pass Rush).
-3. Coverage Shell Integrity (Secondary discipline vs. Madden physical ratings).
-Adhere strictly to operational protocols: no platitudes, no filler introductions, lead directly with the analytical edge."""
+Provide an institutional film and sabermetric cross-examination. Evaluate how top roster players drive or constrain the franchise's Database Overall relative to neutral-down EPA mechanics."""
 
                 try:
                     audit_res = ai_client.models.generate_content(
