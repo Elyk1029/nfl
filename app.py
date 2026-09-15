@@ -2,13 +2,15 @@
 app.py - Institutional NFL Quantitative Terminal & Strategic Research Director Workbench.
 
 Production UI Architecture:
-- Tab 1: Weekly Board & Closed-Loop Sportsbook Skill Props (Enforces full air-yard conservation).
+- Dynamic Temporal Slate Resolution: Automatically filters to the latest active week.
+- Tab 1: Weekly Board & Closed-Loop Sportsbook Skill Props (Dirichlet Simplex Conservation).
 - Tab 2: Market Steam & Sharp Line Movement Monitoring.
 - Tab 3: Strategic Research Director AI Workbench (Gemini 3.8 Flash via nfl_guru.py).
 - Tab 4: Airlocked Out-of-Sample Historical Simulation Engine.
-- Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab (Secondary-Weighted Ratings & Full Player Rosters).
+- Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab (Secondary-Weighted Ratings & Rosters).
 """
 
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -139,11 +141,7 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> T
 
     for h in c_home:
         for a in c_away:
-            if h == a:
-                continue
-            if home_favored and h <= a:
-                continue
-            if not home_favored and a <= h:
+            if h == a or (home_favored and h <= a) or (not home_favored and a <= h):
                 continue
 
             pair_margin = abs(h - a)
@@ -162,18 +160,42 @@ def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> T
 # Data Layer & Cache Handlers
 # -------------------------------------------------------------------------
 @st.cache_data(ttl=300)
-def load_predictions_data() -> pd.DataFrame:
-    query = text("""
-        SELECT DISTINCT ON (game_id)
-            game_id, season, week, matchup, home_win_prob, market_prob,
-            spread_cover_prob, spread_edge, kelly_units,
-            predicted_home_score, predicted_away_score, predicted_total_score,
-            analysis
-        FROM nfl_weekly_analysis
-        ORDER BY game_id, week DESC;
-    """)
+def load_predictions_data(selected_week: Optional[int] = None) -> pd.DataFrame:
+    """
+    Queries active slate predictions. If selected_week is None, automatically
+    filters to the latest active week available in the database.
+    """
+    if selected_week is not None:
+        query = text("""
+            SELECT DISTINCT ON (game_id)
+                game_id, season, week, matchup, home_win_prob, market_prob,
+                spread_cover_prob, spread_edge, kelly_units,
+                predicted_home_score, predicted_away_score, predicted_total_score,
+                analysis
+            FROM nfl_weekly_analysis
+            WHERE week = :target_week
+            ORDER BY game_id;
+        """)
+        params = {"target_week": selected_week}
+    else:
+        query = text("""
+            WITH max_slate AS (
+                SELECT MAX(season) AS max_s, MAX(week) AS max_w
+                FROM nfl_weekly_analysis
+            )
+            SELECT DISTINCT ON (a.game_id)
+                a.game_id, a.season, a.week, a.matchup, a.home_win_prob, a.market_prob,
+                a.spread_cover_prob, a.spread_edge, a.kelly_units,
+                a.predicted_home_score, a.predicted_away_score, a.predicted_total_score,
+                a.analysis
+            FROM nfl_weekly_analysis a
+            JOIN max_slate m ON a.season = m.max_s AND a.week = m.max_w
+            ORDER BY a.game_id;
+        """)
+        params = {}
+
     with engine.connect() as conn:
-        return pd.read_sql(query, conn)
+        return pd.read_sql(query, conn, params=params)
 
 @st.cache_data(ttl=600)
 def load_ratings_data() -> pd.DataFrame:
@@ -185,17 +207,39 @@ def load_ratings_data() -> pd.DataFrame:
     with engine.connect() as conn:
         return pd.read_sql(query, conn)
 
-try:
-    df_predictions = load_predictions_data()
-except Exception as e:
-    st.error(f"PostgreSQL Query Failure: {e}")
-    st.stop()
+@st.cache_data(ttl=600)
+def load_rosters_data() -> pd.DataFrame:
+    with engine.connect() as conn:
+        return pd.read_sql(text("SELECT * FROM nfl_team_rosters ORDER BY overall_rating DESC;"), conn)
+
+@st.cache_data(ttl=300)
+def get_available_weeks() -> List[int]:
+    query = text("SELECT DISTINCT week FROM nfl_weekly_analysis ORDER BY week DESC;")
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn)
+            return df["week"].tolist() if not df.empty else [1]
+    except Exception:
+        return [1]
+
+available_weeks = get_available_weeks()
 
 # -------------------------------------------------------------------------
 # Sidebar Configuration & Execution Parameters
 # -------------------------------------------------------------------------
 with st.sidebar:
     st.title("🏈 Quant Risk Controls")
+    
+    current_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    st.caption(f"Engine Clock: {current_utc_str}")
+    
+    week_selection = st.selectbox(
+        "Active Slate Filter:",
+        options=["Auto-Detect (Latest Week)"] + [f"Week {w}" for w in available_weeks],
+        index=0
+    )
+    selected_week_int = None if week_selection.startswith("Auto") else int(week_selection.split()[1])
+
     show_only_actionable = st.checkbox("Show Actionable Positions Only", value=False)
     min_edge_threshold = st.slider("Minimum Net Edge %", 0.0, 6.0, 1.8, 0.1)
     max_stake_exposure = st.slider("Max Intra-Game Exposure (Units)", 0.5, 3.0, 2.0, 0.25)
@@ -211,12 +255,21 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
+try:
+    df_predictions = load_predictions_data(selected_week=selected_week_int)
+except Exception as e:
+    st.error(f"PostgreSQL Query Failure: {e}")
+    st.stop()
+
 st.title("🏈 Institutional NFL Quantitative Terminal")
 st.caption("Spatiotemporal Film Breakdown | Discrete Key-Margin Snapping | Closed Dirichlet Simplex Props")
 
 if df_predictions.empty:
-    st.info("No active slate records found in database. Run pipeline to compile upcoming fixtures.")
+    st.info("No active slate records found for the selected week. Run `update_nfl.py` to ingest upcoming fixtures.")
     st.stop()
+
+active_season = int(df_predictions['season'].max())
+active_week = int(df_predictions['week'].max())
 
 # Metric Summary Bar
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -224,7 +277,7 @@ col_m1.metric("Fixtures Modeled", len(df_predictions))
 max_edge_record = df_predictions.loc[df_predictions["spread_edge"].abs().idxmax()]
 col_m2.metric("Peak Spread Edge", f"{max_edge_record['matchup']}", f"{float(max_edge_record['spread_edge']) * 100:+.1f}%")
 col_m3.metric("Peak Single Stake", f"{min(float(df_predictions['kelly_units'].max()), max_stake_exposure):.2f}u")
-col_m4.metric("Active Slate", f"Season {int(df_predictions['season'].max())} W{int(df_predictions['week'].max())}")
+col_m4.metric("Active Slate", f"Season {active_season} Week {active_week}")
 
 st.divider()
 
@@ -515,8 +568,7 @@ with tab_ratings:
 
     try:
         df_team_ratings = load_ratings_data()
-        with engine.connect() as conn:
-            df_rosters = pd.read_sql(text("SELECT * FROM nfl_team_rosters;"), conn)
+        df_rosters = load_rosters_data()
     except Exception as e:
         st.error(f"Ledger or Roster query failure: {e}")
         df_team_ratings = pd.DataFrame()
@@ -592,7 +644,7 @@ with tab_ratings:
         st.markdown("#### 🧠 Research Director Tactical Cross-Examination (AI-Informed)")
         if st.button(f"Generate AI Audit with Roster Context: {target_team}", type="primary", use_container_width=True):
             with st.spinner(f"Analyzing roster depth and spatiotemporal metrics for {target_team}..."):
-                top_stars = team_players.head(5).to_dict(orient="records") if not team_players.empty else []
+                top_stars = team_players.head(6).to_dict(orient="records") if not team_players.empty else []
                 dossier = {
                     "team": target_team,
                     "model_q_ovr": float(team_row["model_q_ovr"]),
