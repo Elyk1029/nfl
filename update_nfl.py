@@ -1,7 +1,10 @@
 """
 update_nfl.py - Autonomous Temporal Live Slate Ingestion & Execution Engine.
-Resolves active NFL Week dynamically via system date/time verification.
-Automatically advances to Week 2 once Week 1 games conclude.
+Features:
+- Dynamic UTC calendar verification to auto-advance NFL weeks.
+- Bivariate discrete Poisson scoring drive convolution (No static common score arrays).
+- Closed-loop Dirichlet simplex skill player projections (Zero yardage void).
+- Automated Gemini 3.8 Flash tactical dossier synthesis with structural JSON validation.
 """
 
 import asyncio
@@ -18,7 +21,7 @@ from google.genai import types
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy.stats import norm, poisson
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
@@ -43,8 +46,6 @@ if os.path.exists(MODEL_FILE):
 else:
     raise FileNotFoundError(f"Required model artifact '{MODEL_FILE}' not found.")
 
-KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
-COMMON_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
 TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
 MIN_BETTABLE_EDGE_PCT = 1.8
 
@@ -60,10 +61,6 @@ def clean_team_abbr(team_str: str) -> str:
     return TEAM_ABBR_MAP.get(val, val)
 
 def determine_active_nfl_week(schedules_df: pd.DataFrame) -> Tuple[int, int]:
-    """
-    Evaluates current real-time UTC timestamp against NFL schedule kickoffs.
-    Skips past completed weeks immediately even if third-party result columns are delayed.
-    """
     now_utc = datetime.now(timezone.utc)
     target_season = 2026
 
@@ -71,7 +68,6 @@ def determine_active_nfl_week(schedules_df: pd.DataFrame) -> Tuple[int, int]:
     if df_season.empty:
         return target_season, 1
 
-    # Convert schedule dates to UTC datetime timestamps
     def parse_kickoff(row):
         gameday = str(row.get("gameday", "")).strip()
         gametime = str(row.get("gametime", "13:00")).strip()
@@ -79,25 +75,21 @@ def determine_active_nfl_week(schedules_df: pd.DataFrame) -> Tuple[int, int]:
             return datetime(target_season, 9, 1, tzinfo=timezone.utc)
         try:
             time_str = f"{gameday} {gametime}"
-            # nflreadpy times are Eastern Time (UTC-4 in September)
             dt_naive = pd.to_datetime(time_str)
             return dt_naive.tz_localize("America/New_York").tz_convert("UTC")
         except Exception:
             return pd.to_datetime(gameday).tz_localize("UTC")
 
     df_season["kickoff_utc"] = df_season.apply(parse_kickoff, axis=1)
-
-    # Filter games whose start time + 4 hours (game completion window) is in the future
     future_or_active_games = df_season[df_season["kickoff_utc"] + timedelta(hours=4) > now_utc]
 
     if not future_or_active_games.empty:
         active_week = int(future_or_active_games["week"].min())
     else:
-        # Fallback to result nulls
         unplayed = df_season[df_season["result"].isna()]
         active_week = int(unplayed["week"].min()) if not unplayed.empty else 18
 
-    logging.info(f"Temporal validation complete. Current UTC: {now_utc.isoformat()} -> Active NFL Week: {active_week}")
+    logging.info(f"Temporal calibration: Current UTC {now_utc.isoformat()} -> Target Active NFL Week: {active_week}")
     return target_season, active_week
 
 def resolve_directional_market_context(total_line: float, spread_line: float) -> Tuple[float, float, float, float]:
@@ -108,35 +100,99 @@ def resolve_directional_market_context(total_line: float, spread_line: float) ->
     market_home_prob = float(norm.cdf(home_margin / sigma))
     return home_margin, round(implied_home, 2), round(implied_away, 2), market_home_prob
 
-def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> Tuple[int, int]:
-    eff_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
-    home_favored = eff_margin > 0.0
+def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max_score: int = 58) -> np.ndarray:
+    pmf = np.zeros(max_score + 1, dtype=np.float64)
+    if implied_points <= 3.0:
+        pmf[0] = 0.40
+        pmf[3] = 0.40
+        pmf[6] = 0.20
+        return pmf
+
+    ev_per_score = (rz_td_rate * 6.95) + ((1.0 - rz_td_rate) * 3.0)
+    lambda_scores = max(0.8, implied_points / max(2.0, ev_per_score))
+
+    p_td7 = rz_td_rate * 0.92
+    p_td6 = rz_td_rate * 0.04
+    p_td8 = rz_td_rate * 0.04
+    p_fg3 = max(0.05, 1.0 - rz_td_rate - 0.01)
+    p_safety2 = 0.01
+
+    for n_drives in range(10):
+        prob_n = poisson.pmf(n_drives, lambda_scores)
+        if prob_n < 1e-6:
+            continue
+
+        drive_pmf = np.zeros(max_score + 1, dtype=np.float64)
+        drive_pmf[0] = 1.0
+
+        single_drive = np.zeros(9, dtype=np.float64)
+        single_drive[2] = p_safety2
+        single_drive[3] = p_fg3
+        single_drive[6] = p_td6
+        single_drive[7] = p_td7
+        single_drive[8] = p_td8
+
+        for _ in range(n_drives):
+            conv = np.convolve(drive_pmf, single_drive)
+            drive_pmf = conv[:max_score + 1]
+
+        pmf += prob_n * drive_pmf
+
+    total_mass = np.sum(pmf)
+    if total_mass > 0:
+        pmf /= total_mass
+    pmf[1] = 0.0
+    return pmf
+
+def project_dynamic_nfl_scores(
+    projected_margin: float,
+    total_line: float,
+    home_rz_td_rate: float = 0.58,
+    away_rz_td_rate: float = 0.52
+) -> Tuple[int, int]:
+    eff_margin = float(projected_margin)
+    implied_home = max(6.0, (total_line + eff_margin) / 2.0)
+    implied_away = max(6.0, (total_line - eff_margin) / 2.0)
+
+    home_pmf = generate_team_score_pmf(implied_home, rz_td_rate=home_rz_td_rate)
+    away_pmf = generate_team_score_pmf(implied_away, rz_td_rate=away_rz_td_rate)
+
+    joint_matrix = np.outer(home_pmf, away_pmf)
+    np.fill_diagonal(joint_matrix, joint_matrix.diagonal() * 0.08)
+
+    home_favored = eff_margin > 0.15
+    away_favored = eff_margin < -0.15
     abs_margin = abs(eff_margin)
 
-    selected_margin = min(KEY_MARGINS, key=lambda m: abs(m - abs_margin))
-    raw_home = (total_line + (selected_margin if home_favored else -selected_margin)) / 2.0
-    raw_away = (total_line - (selected_margin if home_favored else -selected_margin)) / 2.0
+    best_pair = (int(round(implied_home)), int(round(implied_away)))
+    best_utility = -1e9
 
-    best_pair = (27, 20) if home_favored else (20, 27)
-    min_loss = float("inf")
-
-    c_home = [s for s in COMMON_SCORES if abs(s - raw_home) <= 6.5] or [int(round(raw_home))]
-    c_away = [s for s in COMMON_SCORES if abs(s - raw_away) <= 6.5] or [int(round(raw_away))]
-
-    for h in c_home:
-        for a in c_away:
-            if h == a or (home_favored and h <= a) or (not home_favored and a <= h):
+    for h in range(len(home_pmf)):
+        for a in range(len(away_pmf)):
+            prob = joint_matrix[h, a]
+            if prob < 1e-5:
                 continue
-            pair_margin = abs(h - a)
-            pair_total = h + a
-            loss = (abs(pair_total - total_line) * 1.0) + (abs(pair_margin - abs_margin) * 1.5)
-            if pair_margin not in [3, 7, 6, 10, 4]:
-                loss += 3.0
-            if loss < min_loss:
-                min_loss = loss
-                best_pair = (h, a)
 
-    return int(best_pair[0]), int(best_pair[1])
+            if home_favored and h <= a:
+                continue
+            if away_favored and a <= h:
+                continue
+
+            score_margin = h - a
+            score_total = h + a
+
+            margin_err = abs(abs(score_margin) - abs_margin)
+            total_err = abs(score_total - total_line)
+            key_bonus = 1.35 if abs(score_margin) in [3, 7, 6, 10, 4, 14] else 1.0
+
+            utility = math.log(prob) * 1.5 - (margin_err * 0.18) - (total_err * 0.08)
+            utility *= key_bonus
+
+            if utility > best_utility:
+                best_utility = utility
+                best_pair = (int(h), int(a))
+
+    return best_pair[0], best_pair[1]
 
 def convert_mean_to_median(mean_val: float, role_key: str) -> float:
     if mean_val <= 0.0:
@@ -300,8 +356,10 @@ def generate_closed_loop_skill_projections(
 
     return [
         build_entry("WR1", depth_names.get("WR1", f"{team_abbr} WR1"), "Rec Yds", wr1_rec, 0.0, 0.0, wr1_rec, team_pass_tds * 0.35, p_wr1),
+        build_entry("WR2", depth_names.get("WR2", f"{team_abbr} WR2"), "Rec Yds", wr2_rec, 0.0, 0.0, wr2_rec, team_pass_tds * 0.20, p_wr1),
         build_entry("TE1", depth_names.get("TE1", f"{team_abbr} TE1"), "Rec Yds", te1_rec, 0.0, 0.0, te1_rec, team_pass_tds * 0.25, p_te1),
         build_entry("RB1", depth_names.get("RB1", f"{team_abbr} RB1"), "Rush Yds", rb1_rush, 0.0, rb1_rush, rb1_rec, team_rush_tds * 0.65, p_rb1),
+        build_entry("RB1_REC", f"{depth_names.get('RB1', 'RB1')} (Rec)", "Rec Yds", rb1_rec, 0.0, 0.0, rb1_rec, 0.0, p_rb1),
         build_entry("QB1", depth_names.get("QB1", f"{team_abbr} QB"), "Pass Yds", qb_pass, qb_pass, qb_rush, 0.0, team_rush_tds * 0.15, p_qb),
     ]
 
@@ -404,7 +462,7 @@ async def main():
         sigma = 13.45 * math.sqrt(max(32.0, raw_total) / 44.0)
         model_projected_margin = norm.ppf(calibrated_win_prob) * sigma
 
-        pred_home, pred_away = project_discrete_nfl_scores(model_projected_margin, raw_total)
+        pred_home, pred_away = project_dynamic_nfl_scores(model_projected_margin, raw_total)
         pred_total = pred_home + pred_away
 
         z_cover = (model_projected_margin - canonical_spread) / sigma
