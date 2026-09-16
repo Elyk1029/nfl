@@ -2,7 +2,8 @@
 update_nfl.py - Autonomous Temporal Live Slate Ingestion & Execution Engine.
 Features:
 - Dynamic UTC calendar verification to auto-advance NFL weeks.
-- Bivariate discrete Poisson scoring drive convolution (No static common score arrays).
+- Bivariate discrete Poisson scoring drive convolution with additive log-priors.
+- Exact discrete ATS cover, push, and Eighth-Kelly sizing (Zero Gaussian approximation).
 - Closed-loop Dirichlet simplex skill player projections (Zero yardage void).
 - Automated Gemini 3.8 Flash tactical dossier synthesis with structural JSON validation.
 """
@@ -49,6 +50,18 @@ else:
 TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
 MIN_BETTABLE_EDGE_PCT = 1.8
 
+# Empirical NFL Margin Log-Priors (Additively applied to avoid sign inversion)
+KEY_MARGIN_LOG_PRIORS: Dict[int, float] = {
+    3: 0.85,   # ~15.1% frequency
+    7: 0.65,   # ~9.2% frequency
+    6: 0.45,   # ~5.9% frequency
+    10: 0.40,  # ~5.7% frequency
+    4: 0.30,   # ~4.1% frequency
+    14: 0.25,  # ~3.8% frequency
+    1: 0.15,   # ~2.8% frequency
+    2: 0.15,   # ~2.5% frequency
+}
+
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48,
     "RB_Rec": 0.55, "WR_Rec": 0.58, "TE_Rec": 0.54
@@ -89,7 +102,7 @@ def determine_active_nfl_week(schedules_df: pd.DataFrame) -> Tuple[int, int]:
         unplayed = df_season[df_season["result"].isna()]
         active_week = int(unplayed["week"].min()) if not unplayed.empty else 18
 
-    logging.info(f"Temporal calibration: Current UTC {now_utc.isoformat()} -> Target Active NFL Week: {active_week}")
+    logging.info(f"Temporal calibration: Current UTC {now_utc.isoformat()} -> Active NFL Week: {active_week}")
     return target_season, active_week
 
 def resolve_directional_market_context(total_line: float, spread_line: float) -> Tuple[float, float, float, float]:
@@ -102,22 +115,26 @@ def resolve_directional_market_context(total_line: float, spread_line: float) ->
 
 def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max_score: int = 58) -> np.ndarray:
     pmf = np.zeros(max_score + 1, dtype=np.float64)
-    if implied_points <= 3.0:
-        pmf[0] = 0.40
-        pmf[3] = 0.40
-        pmf[6] = 0.20
+    if implied_points <= 2.0:
+        pmf[0] = 0.60
+        pmf[2] = 0.10
+        pmf[3] = 0.30
         return pmf
 
     ev_per_score = (rz_td_rate * 6.95) + ((1.0 - rz_td_rate) * 3.0)
-    lambda_scores = max(0.8, implied_points / max(2.0, ev_per_score))
+    lambda_scores = max(0.6, implied_points / max(2.0, ev_per_score))
 
-    p_td7 = rz_td_rate * 0.92
-    p_td6 = rz_td_rate * 0.04
-    p_td8 = rz_td_rate * 0.04
-    p_fg3 = max(0.05, 1.0 - rz_td_rate - 0.01)
-    p_safety2 = 0.01
+    # Empirical NFL Scoring Event Simplex:
+    # 7-pt (TD + PAT): ~97.5% of touchdowns
+    # 6-pt (Missed PAT / Failed 2pt): ~1.5%
+    # 8-pt (Successful 2pt): ~1.0%
+    p_td7 = rz_td_rate * 0.975
+    p_td6 = rz_td_rate * 0.015
+    p_td8 = rz_td_rate * 0.010
+    p_fg3 = max(0.04, 1.0 - rz_td_rate - 0.005)
+    p_safety2 = 0.005
 
-    for n_drives in range(10):
+    for n_drives in range(11):
         prob_n = poisson.pmf(n_drives, lambda_scores)
         if prob_n < 1e-6:
             continue
@@ -141,7 +158,7 @@ def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max
     total_mass = np.sum(pmf)
     if total_mass > 0:
         pmf /= total_mass
-    pmf[1] = 0.0
+    pmf[1] = 0.0  # Zero out unreachable score
     return pmf
 
 def project_dynamic_nfl_scores(
@@ -149,7 +166,11 @@ def project_dynamic_nfl_scores(
     total_line: float,
     home_rz_td_rate: float = 0.58,
     away_rz_td_rate: float = 0.52
-) -> Tuple[int, int]:
+) -> Tuple[int, int, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Selects the joint Maximum A Posteriori (MAP) discrete score pair without sign-inversion traps.
+    Returns (pred_home, pred_away, joint_matrix, home_pmf, away_pmf).
+    """
     eff_margin = float(projected_margin)
     implied_home = max(6.0, (total_line + eff_margin) / 2.0)
     implied_away = max(6.0, (total_line - eff_margin) / 2.0)
@@ -158,10 +179,14 @@ def project_dynamic_nfl_scores(
     away_pmf = generate_team_score_pmf(implied_away, rz_td_rate=away_rz_td_rate)
 
     joint_matrix = np.outer(home_pmf, away_pmf)
-    np.fill_diagonal(joint_matrix, joint_matrix.diagonal() * 0.08)
+    np.fill_diagonal(joint_matrix, joint_matrix.diagonal() * 0.05)  # Suppress regular-season ties
 
-    home_favored = eff_margin > 0.15
-    away_favored = eff_margin < -0.15
+    sum_joint = np.sum(joint_matrix)
+    if sum_joint > 0:
+        joint_matrix /= sum_joint
+
+    home_favored = eff_margin > 0.10
+    away_favored = eff_margin < -0.10
     abs_margin = abs(eff_margin)
 
     best_pair = (int(round(implied_home)), int(round(implied_away)))
@@ -178,21 +203,85 @@ def project_dynamic_nfl_scores(
             if away_favored and a <= h:
                 continue
 
-            score_margin = h - a
+            score_margin = abs(h - a)
             score_total = h + a
 
-            margin_err = abs(abs(score_margin) - abs_margin)
+            margin_err = abs(score_margin - abs_margin)
             total_err = abs(score_total - total_line)
-            key_bonus = 1.35 if abs(score_margin) in [3, 7, 6, 10, 4, 14] else 1.0
+            key_log_bonus = KEY_MARGIN_LOG_PRIORS.get(score_margin, 0.0)
 
-            utility = math.log(prob) * 1.5 - (margin_err * 0.18) - (total_err * 0.08)
-            utility *= key_bonus
+            # Additive utility eliminates the negative multiplier trap
+            utility = math.log(prob) - (margin_err * 0.22) - (total_err * 0.08) + key_log_bonus
 
             if utility > best_utility:
                 best_utility = utility
                 best_pair = (int(h), int(a))
 
-    return best_pair[0], best_pair[1]
+    return best_pair[0], best_pair[1], joint_matrix, home_pmf, away_pmf
+
+def calculate_calibrated_discrete_ats(
+    joint_matrix: np.ndarray,
+    canonical_spread: float
+) -> Dict[str, float]:
+    """
+    Computes exact discrete ATS Cover, Push, and Edge metrics by summing
+    joint discrete scoring probabilities across the target margin hurdle.
+    """
+    target_hurdle = -float(canonical_spread)  # Home covers if (h - a) > target_hurdle
+
+    p_home_cover = 0.0
+    p_push = 0.0
+    p_away_cover = 0.0
+
+    n_rows, n_cols = joint_matrix.shape
+    for h in range(n_rows):
+        for a in range(n_cols):
+            prob = joint_matrix[h, a]
+            actual_margin = h - a
+
+            if math.isclose(actual_margin, target_hurdle, abs_tol=1e-5):
+                p_push += prob
+            elif actual_margin > target_hurdle:
+                p_home_cover += prob
+            else:
+                p_away_cover += prob
+
+    break_even = 0.5238
+    home_net_edge = p_home_cover - break_even
+    away_net_edge = p_away_cover - break_even
+
+    # Fractional Eighth-Kelly Sizing accounting for push probability
+    b = 0.90909  # 100/110 juice
+    def calc_kelly(p_win: float) -> float:
+        q = max(0.0, 1.0 - p_win - p_push)
+        raw_kelly = ((b * p_win) - q) / b
+        return round(max(0.0, min(2.0, raw_kelly * 0.125 * 100.0)), 2)
+
+    if home_net_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) and home_net_edge > away_net_edge:
+        rec_team = "HOME"
+        cover_prob = p_home_cover
+        final_edge = min(0.080, home_net_edge)
+        stake_units = calc_kelly(p_home_cover)
+    elif away_net_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) and away_net_edge > home_net_edge:
+        rec_team = "AWAY"
+        cover_prob = p_away_cover
+        final_edge = min(0.080, away_net_edge)
+        stake_units = calc_kelly(p_away_cover)
+    else:
+        rec_team = "PASS"
+        cover_prob = max(p_home_cover, p_away_cover)
+        final_edge = max(home_net_edge, away_net_edge)
+        stake_units = 0.0
+
+    return {
+        "home_cover_prob": round(float(p_home_cover), 4),
+        "away_cover_prob": round(float(p_away_cover), 4),
+        "push_prob": round(float(p_push), 4),
+        "recommended_side": rec_team,
+        "spread_cover_prob": round(float(cover_prob), 4),
+        "spread_edge": round(float(final_edge), 4),
+        "kelly_units": float(stake_units)
+    }
 
 def convert_mean_to_median(mean_val: float, role_key: str) -> float:
     if mean_val <= 0.0:
@@ -462,35 +551,27 @@ async def main():
         sigma = 13.45 * math.sqrt(max(32.0, raw_total) / 44.0)
         model_projected_margin = norm.ppf(calibrated_win_prob) * sigma
 
-        pred_home, pred_away = project_dynamic_nfl_scores(model_projected_margin, raw_total)
+        # Bivariate Score Simulation & PMF Extraction
+        pred_home, pred_away, joint_matrix, _, _ = project_dynamic_nfl_scores(model_projected_margin, raw_total)
         pred_total = pred_home + pred_away
 
-        z_cover = (model_projected_margin - canonical_spread) / sigma
-        home_cover = float(norm.cdf(z_cover))
-        away_cover = 1.0 - home_cover
+        # Exact Discrete ATS Pricing
+        ats_metrics = calculate_calibrated_discrete_ats(joint_matrix, canonical_spread)
+        rec_side = ats_metrics["recommended_side"]
 
-        home_edge = home_cover - 0.5238
-        away_edge = away_cover - 0.5238
-
-        if home_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) and home_edge > away_edge:
+        if rec_side == "HOME":
             rec_team = home_team
             rec_line = f"{home_team} {-canonical_spread:+g}"
-            cover_prob = home_cover
-            final_edge = min(0.050, home_edge)
-        elif away_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) and away_edge > home_edge:
+        elif rec_side == "AWAY":
             rec_team = away_team
             rec_line = f"{away_team} {+canonical_spread:+g}"
-            cover_prob = away_cover
-            final_edge = min(0.050, away_edge)
         else:
             rec_team = "PASS"
             rec_line = "PASS - No Edge"
-            cover_prob = max(home_cover, away_cover)
-            final_edge = max(home_edge, away_edge)
 
-        b = 1.9091 - 1.0
-        q = max(0.0, 1.0 - cover_prob)
-        kelly_units = round(max(0.0, min(2.0, (((b * cover_prob) - q) / b) * 0.125 * 100.0)), 2) if rec_team != "PASS" and final_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) else 0.0
+        cover_prob = ats_metrics["spread_cover_prob"]
+        final_edge = ats_metrics["spread_edge"]
+        kelly_units = ats_metrics["kelly_units"]
 
         home_depth = resolve_depth(depth_charts, home_team)
         away_depth = resolve_depth(depth_charts, away_team)
@@ -508,6 +589,7 @@ async def main():
             "spread_line": model_projected_margin,
             "predicted_home_score": pred_home, "predicted_away_score": pred_away,
             "predicted_total_score": pred_total,
+            "push_prob": ats_metrics["push_prob"],
             "player_projections": {"home": home_skills, "away": away_skills}
         })
 
