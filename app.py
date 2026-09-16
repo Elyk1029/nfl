@@ -2,11 +2,11 @@
 app.py - Institutional NFL Quantitative Terminal & Strategic Research Director Workbench.
 
 Production UI Architecture:
-- Dynamic Temporal Slate Resolution: Automatically locks to active week post-Monday Night Football.
+- Dynamic Temporal Slate Resolution: Locks automatically to active week post-Monday Night Football.
 - Tab 1: Weekly Board & Closed-Loop Sportsbook Skill Props (Dirichlet Simplex Conservation).
 - Tab 2: Market Steam & Sharp Line Movement Monitoring.
 - Tab 3: Strategic Research Director AI Workbench (Gemini 2.5 Flash via nfl_guru.py).
-- Tab 4: Airlocked Out-of-Sample Historical Simulation Engine (Discrete Poisson Convolution).
+- Tab 4: Airlocked Out-of-Sample Historical Simulation Engine (Discrete Bivariate Kernel).
 - Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab (Secondary-Weighted Ratings & Rosters).
 """
 
