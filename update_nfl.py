@@ -1,13 +1,13 @@
 """
 update_nfl.py - Autonomous Temporal Live Slate Ingestion & Execution Engine.
-Architecture:
+Features:
 - Dynamic UTC calendar resolution to advance NFL weeks automatically.
 - Log-odds Bayesian shrinkage pooling for market and model win probabilities.
 - Vectorized bivariate discrete Poisson score convolution with additive log-priors.
 - Pure NumPy vectorized ATS cover, push, and Eighth-Kelly sizing.
 - Closed-loop Dirichlet skill projections with independent log-normal survival functions.
 - Native asynchronous Google GenAI SDK (client.aio) with strict Pydantic response schemas.
-- Atomic PostgreSQL transactions for idempotent database writes.
+- Scoped atomic PostgreSQL transactions with zero scope leakages.
 """
 
 import asyncio
@@ -496,7 +496,7 @@ async def main():
         home_team = clean_team_abbr(str(game["home_team"]))
         away_team = clean_team_abbr(str(game["away_team"]))
         matchup = f"{away_team} @ {home_team}"
-        game_id = str(game.get("game_id", f"{target_season}_{target_week}_{away_team}_{home_team}"))
+        game_id = str(game.get("game_id", f"{target_season}_{target_week:02d}_{away_team}_{home_team}"))
 
         raw_spread = float(game.get("spread_line", 0.0) or 0.0)
         raw_total = float(game.get("total_line", 44.0) or 44.0)
@@ -650,6 +650,8 @@ Provide an institutional film and sabermetric analysis detailing:
         })
 
     df_results = pd.DataFrame(records)
+    df_results = df_results.drop_duplicates(subset=["game_id"], keep="last").reset_index(drop=True)
+
     with engine.begin() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS nfl_weekly_analysis (
@@ -664,13 +666,10 @@ Provide an institutional film and sabermetric analysis detailing:
             text("DELETE FROM nfl_weekly_analysis WHERE season = :s AND week = :w;"),
             {"s": target_season, "w": target_week}
         )
-        df_results.to_sql("nfl_weekly_analysis", conn, if_exists="append", index=False, method="multi")
+        df_results.to_sql("nfl_weekly_analysis", con=conn, if_exists="append", index=False, method="multi")
 
     logging.info(f"Database successfully updated with Week {target_week} fixtures: {df_results['matchup'].tolist()}")
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    logging.info(f"Database successfully updated with Week {target_week} fixtures: {df_results['matchup'].tolist()}")
+    return target_season, target_week
 
 if __name__ == "__main__":
     asyncio.run(main())
