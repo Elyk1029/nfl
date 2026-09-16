@@ -2,11 +2,11 @@
 app.py - Institutional NFL Quantitative Terminal & Strategic Research Director Workbench.
 
 Production UI Architecture:
-- Dynamic Temporal Slate Resolution: Automatically filters to the latest active week.
+- Dynamic Temporal Slate Resolution: Automatically locks to active week post-Monday Night Football.
 - Tab 1: Weekly Board & Closed-Loop Sportsbook Skill Props (Dirichlet Simplex Conservation).
 - Tab 2: Market Steam & Sharp Line Movement Monitoring.
 - Tab 3: Strategic Research Director AI Workbench (Gemini 3.8 Flash via nfl_guru.py).
-- Tab 4: Airlocked Out-of-Sample Historical Simulation Engine.
+- Tab 4: Airlocked Out-of-Sample Historical Simulation Engine (Bivariate Score Discrete Integration).
 - Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab (Secondary-Weighted Ratings & Rosters).
 """
 
@@ -20,7 +20,7 @@ from google import genai
 from google.genai import types
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+from scipy.stats import norm, poisson
 from sqlalchemy import create_engine, text
 import streamlit as st
 
@@ -119,52 +119,110 @@ engine = get_db_engine(DB_URL)
 ai_client = get_genai_client(GEMINI_KEY)
 
 # -------------------------------------------------------------------------
-# Discrete Score Snapping Utility
+# Discrete Score Snapping & Simulation Engine
 # -------------------------------------------------------------------------
-KEY_MARGINS = [3, 7, 6, 10, 4, 1, 2, 14, 8, 11, 13, 17]
-COMMON_SCORES = [20, 24, 17, 23, 27, 30, 31, 13, 14, 10, 34, 38, 28, 16, 21]
+KEY_MARGIN_LOG_PRIORS: Dict[int, float] = {
+    3: 0.85, 7: 0.65, 6: 0.45, 10: 0.40, 4: 0.30, 14: 0.25, 1: 0.15, 2: 0.15
+}
 
-def project_discrete_nfl_scores(projected_margin: float, total_line: float) -> Tuple[int, int]:
-    eff_margin = projected_margin if abs(projected_margin) >= 0.10 else 0.50
-    home_favored = eff_margin > 0.0
+def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max_score: int = 58) -> np.ndarray:
+    pmf = np.zeros(max_score + 1, dtype=np.float64)
+    if implied_points <= 2.0:
+        pmf[0] = 0.60
+        pmf[2] = 0.10
+        pmf[3] = 0.30
+        return pmf
+
+    ev_per_score = (rz_td_rate * 6.95) + ((1.0 - rz_td_rate) * 3.0)
+    lambda_scores = max(0.6, implied_points / max(2.0, ev_per_score))
+
+    p_td7 = rz_td_rate * 0.975
+    p_td6 = rz_td_rate * 0.015
+    p_td8 = rz_td_rate * 0.010
+    p_fg3 = max(0.04, 1.0 - rz_td_rate - 0.005)
+    p_safety2 = 0.005
+
+    for n_drives in range(11):
+        prob_n = poisson.pmf(n_drives, lambda_scores)
+        if prob_n < 1e-6:
+            continue
+
+        drive_pmf = np.zeros(max_score + 1, dtype=np.float64)
+        drive_pmf[0] = 1.0
+
+        single_drive = np.zeros(9, dtype=np.float64)
+        single_drive[2] = p_safety2
+        single_drive[3] = p_fg3
+        single_drive[6] = p_td6
+        single_drive[7] = p_td7
+        single_drive[8] = p_td8
+
+        for _ in range(n_drives):
+            conv = np.convolve(drive_pmf, single_drive)
+            drive_pmf = conv[:max_score + 1]
+
+        pmf += prob_n * drive_pmf
+
+    total_mass = np.sum(pmf)
+    if total_mass > 0:
+        pmf /= total_mass
+    pmf[1] = 0.0
+    return pmf
+
+def project_dynamic_nfl_scores(
+    projected_margin: float,
+    total_line: float,
+    home_rz_td_rate: float = 0.58,
+    away_rz_td_rate: float = 0.52
+) -> Tuple[int, int]:
+    eff_margin = float(projected_margin)
+    implied_home = max(6.0, (total_line + eff_margin) / 2.0)
+    implied_away = max(6.0, (total_line - eff_margin) / 2.0)
+
+    home_pmf = generate_team_score_pmf(implied_home, rz_td_rate=home_rz_td_rate)
+    away_pmf = generate_team_score_pmf(implied_away, rz_td_rate=away_rz_td_rate)
+
+    joint_matrix = np.outer(home_pmf, away_pmf)
+    np.fill_diagonal(joint_matrix, joint_matrix.diagonal() * 0.05)
+
+    home_favored = eff_margin > 0.10
+    away_favored = eff_margin < -0.10
     abs_margin = abs(eff_margin)
 
-    selected_margin = min(KEY_MARGINS, key=lambda m: abs(m - abs_margin))
-    raw_home = (total_line + (selected_margin if home_favored else -selected_margin)) / 2.0
-    raw_away = (total_line - (selected_margin if home_favored else -selected_margin)) / 2.0
+    best_pair = (int(round(implied_home)), int(round(implied_away)))
+    best_utility = -1e9
 
-    best_pair = (27, 20) if home_favored else (20, 27)
-    min_loss = float("inf")
-
-    c_home = [s for s in COMMON_SCORES if abs(s - raw_home) <= 6.5] or [int(round(raw_home))]
-    c_away = [s for s in COMMON_SCORES if abs(s - raw_away) <= 6.5] or [int(round(raw_away))]
-
-    for h in c_home:
-        for a in c_away:
-            if h == a or (home_favored and h <= a) or (not home_favored and a <= h):
+    for h in range(len(home_pmf)):
+        for a in range(len(away_pmf)):
+            prob = joint_matrix[h, a]
+            if prob < 1e-5:
                 continue
 
-            pair_margin = abs(h - a)
-            pair_total = h + a
-            loss = (abs(pair_total - total_line) * 1.0) + (abs(pair_margin - abs_margin) * 1.5)
-            if pair_margin not in [3, 7, 6, 10, 4]:
-                loss += 3.0
+            if home_favored and h <= a:
+                continue
+            if away_favored and a <= h:
+                continue
 
-            if loss < min_loss:
-                min_loss = loss
-                best_pair = (h, a)
+            score_margin = abs(h - a)
+            score_total = h + a
 
-    return int(best_pair[0]), int(best_pair[1])
+            margin_err = abs(score_margin - abs_margin)
+            total_err = abs(score_total - total_line)
+            key_log_bonus = KEY_MARGIN_LOG_PRIORS.get(score_margin, 0.0)
+
+            utility = math.log(prob) - (margin_err * 0.22) - (total_err * 0.08) + key_log_bonus
+
+            if utility > best_utility:
+                best_utility = utility
+                best_pair = (int(h), int(a))
+
+    return best_pair[0], best_pair[1]
 
 # -------------------------------------------------------------------------
 # Data Layer & Cache Handlers
 # -------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_predictions_data(selected_week: Optional[int] = None) -> pd.DataFrame:
-    """
-    Queries active slate predictions. If selected_week is None, automatically
-    filters to the latest active week available in the database.
-    """
     if selected_week is not None:
         query = text("""
             SELECT DISTINCT ON (game_id)
@@ -229,7 +287,6 @@ available_weeks = get_available_weeks()
 # -------------------------------------------------------------------------
 with st.sidebar:
     st.title("🏈 Quant Risk Controls")
-    
     current_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     st.caption(f"Engine Clock: {current_utc_str}")
     
@@ -522,7 +579,7 @@ with tab_sim:
                 act_home = int(g["home_score"])
                 act_away = int(g["away_score"])
 
-                p_home, p_away = project_discrete_nfl_scores(spread_val, total_val)
+                p_home, p_away = project_dynamic_nfl_scores(spread_val, total_val)
                 pred_margin = float(p_home - p_away)
                 actual_margin = float(act_home - act_away)
 
