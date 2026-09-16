@@ -5,8 +5,8 @@ Production UI Architecture:
 - Dynamic Temporal Slate Resolution: Automatically locks to active week post-Monday Night Football.
 - Tab 1: Weekly Board & Closed-Loop Sportsbook Skill Props (Dirichlet Simplex Conservation).
 - Tab 2: Market Steam & Sharp Line Movement Monitoring.
-- Tab 3: Strategic Research Director AI Workbench (Gemini 3.8 Flash via nfl_guru.py).
-- Tab 4: Airlocked Out-of-Sample Historical Simulation Engine (Bivariate Score Discrete Integration).
+- Tab 3: Strategic Research Director AI Workbench (Gemini 2.5 Flash via nfl_guru.py).
+- Tab 4: Airlocked Out-of-Sample Historical Simulation Engine (Discrete Poisson Convolution).
 - Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab (Secondary-Weighted Ratings & Rosters).
 """
 
@@ -142,26 +142,21 @@ def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max
     p_fg3 = max(0.04, 1.0 - rz_td_rate - 0.005)
     p_safety2 = 0.005
 
+    single_drive = np.zeros(9, dtype=np.float64)
+    single_drive[2] = p_safety2
+    single_drive[3] = p_fg3
+    single_drive[6] = p_td6
+    single_drive[7] = p_td7
+    single_drive[8] = p_td8
+
+    drive_pmf = np.zeros(max_score + 1, dtype=np.float64)
+    drive_pmf[0] = 1.0
+
     for n_drives in range(11):
         prob_n = poisson.pmf(n_drives, lambda_scores)
-        if prob_n < 1e-6:
-            continue
-
-        drive_pmf = np.zeros(max_score + 1, dtype=np.float64)
-        drive_pmf[0] = 1.0
-
-        single_drive = np.zeros(9, dtype=np.float64)
-        single_drive[2] = p_safety2
-        single_drive[3] = p_fg3
-        single_drive[6] = p_td6
-        single_drive[7] = p_td7
-        single_drive[8] = p_td8
-
-        for _ in range(n_drives):
-            conv = np.convolve(drive_pmf, single_drive)
-            drive_pmf = conv[:max_score + 1]
-
-        pmf += prob_n * drive_pmf
+        if prob_n >= 1e-6:
+            pmf += prob_n * drive_pmf
+        drive_pmf = np.convolve(drive_pmf, single_drive)[:max_score + 1]
 
     total_mass = np.sum(pmf)
     if total_mass > 0:
@@ -253,6 +248,7 @@ def load_predictions_data(selected_week: Optional[int] = None) -> pd.DataFrame:
         params = {}
 
     with engine.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         return pd.read_sql(query, conn, params=params)
 
 @st.cache_data(ttl=600)
@@ -263,11 +259,13 @@ def load_ratings_data() -> pd.DataFrame:
         ORDER BY model_q_ovr DESC;
     """)
     with engine.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         return pd.read_sql(query, conn)
 
 @st.cache_data(ttl=600)
 def load_rosters_data() -> pd.DataFrame:
     with engine.connect() as conn:
+        conn = conn.execution_options(isolation_level="AUTOCOMMIT")
         return pd.read_sql(text("SELECT * FROM nfl_team_rosters ORDER BY overall_rating DESC;"), conn)
 
 @st.cache_data(ttl=300)
@@ -275,6 +273,7 @@ def get_available_weeks() -> List[int]:
     query = text("SELECT DISTINCT week FROM nfl_weekly_analysis ORDER BY week DESC;")
     try:
         with engine.connect() as conn:
+            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
             df = pd.read_sql(query, conn)
             return df["week"].tolist() if not df.empty else [1]
     except Exception:
@@ -522,13 +521,13 @@ with tab_guru:
 
     if st.button("Execute Strategic Breakdown", type="primary", use_container_width=True):
         if target_subject and dossier_body:
-            with st.spinner("Processing scheme mechanics via Gemini 3.8 Flash..."):
+            with st.spinner("Processing scheme mechanics via Gemini 2.5 Flash..."):
                 active_mode = "MODE 1: NFL TACTICAL & STATISTICAL BREAKDOWN" if "Mode 1" in guru_mode_selection else "MODE 2: AI & ANALYTICAL SYSTEM EVALUATION"
                 prompt_text = f"[{active_mode}]\nSUBJECT: {target_subject}\n\nINPUT PAYLOAD:\n{dossier_body}"
                 
                 try:
                     response = ai_client.models.generate_content(
-                        model="gemini-3.8-flash",
+                        model="gemini-2.5-flash",
                         contents=prompt_text,
                         config=types.GenerateContentConfig(
                             system_instruction=NFL_GURU_FULL_SYSTEM_PROMPT,
@@ -720,7 +719,7 @@ Provide an institutional film and sabermetric cross-examination. Evaluate how to
 
                 try:
                     audit_res = ai_client.models.generate_content(
-                        model="gemini-3.8-flash",
+                        model="gemini-2.5-flash",
                         contents=prompt_payload,
                         config=types.GenerateContentConfig(
                             system_instruction=NFL_GURU_FULL_SYSTEM_PROMPT,
