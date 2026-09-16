@@ -1,11 +1,13 @@
 """
 update_nfl.py - Autonomous Temporal Live Slate Ingestion & Execution Engine.
-Features:
-- Dynamic UTC calendar verification to auto-advance NFL weeks.
-- Bivariate discrete Poisson scoring drive convolution with additive log-priors.
-- Exact discrete ATS cover, push, and Eighth-Kelly sizing (Zero Gaussian approximation).
-- Closed-loop Dirichlet simplex skill player projections (Zero yardage void).
-- Automated Gemini 3.8 Flash tactical dossier synthesis with structural JSON validation.
+Architecture:
+- Dynamic UTC calendar resolution to advance NFL weeks automatically.
+- Log-odds Bayesian shrinkage pooling for market and model win probabilities.
+- Vectorized bivariate discrete Poisson score convolution with additive log-priors.
+- Pure NumPy vectorized ATS cover, push, and Eighth-Kelly sizing.
+- Closed-loop Dirichlet skill projections with independent log-normal survival functions.
+- Native asynchronous Google GenAI SDK (client.aio) with strict Pydantic response schemas.
+- Atomic PostgreSQL transactions for idempotent database writes.
 """
 
 import asyncio
@@ -15,13 +17,14 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from google import genai
 from google.genai import types
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, Field
 from scipy.stats import norm, poisson
 from sqlalchemy import create_engine, text
 import xgboost as xgb
@@ -50,22 +53,30 @@ else:
 TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
 MIN_BETTABLE_EDGE_PCT = 1.8
 
-# Empirical NFL Margin Log-Priors (Additively applied to avoid sign inversion)
 KEY_MARGIN_LOG_PRIORS: Dict[int, float] = {
-    3: 0.85,   # ~15.1% frequency
-    7: 0.65,   # ~9.2% frequency
-    6: 0.45,   # ~5.9% frequency
-    10: 0.40,  # ~5.7% frequency
-    4: 0.30,   # ~4.1% frequency
-    14: 0.25,  # ~3.8% frequency
-    1: 0.15,   # ~2.8% frequency
-    2: 0.15,   # ~2.5% frequency
+    3: 0.85,
+    7: 0.65,
+    6: 0.45,
+    10: 0.40,
+    4: 0.30,
+    14: 0.25,
+    1: 0.15,
+    2: 0.15,
 }
 
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48,
     "RB_Rec": 0.55, "WR_Rec": 0.58, "TE_Rec": 0.54
 }
+
+class SchematicMatchup(BaseModel):
+    away_offense_vs_home_defense: str = Field(..., description="Tactical trench, coverage, and explosive play breakdown.")
+    home_offense_vs_away_defense: str = Field(..., description="Tactical trench, coverage, and explosive play breakdown.")
+
+class MatchupDossier(BaseModel):
+    executive_summary: str = Field(..., description="Two-sentence analytical verdict synthesizing schematic leverage.")
+    schematic_matchup: SchematicMatchup
+    actionable_verdict: str = Field(..., description="Executable ticket recommendation and stake.")
 
 def clean_team_abbr(team_str: str) -> str:
     if not isinstance(team_str, str):
@@ -113,6 +124,15 @@ def resolve_directional_market_context(total_line: float, spread_line: float) ->
     market_home_prob = float(norm.cdf(home_margin / sigma))
     return home_margin, round(implied_home, 2), round(implied_away, 2), market_home_prob
 
+def blend_log_odds(p_model: float, p_mkt: float, w_mkt: float = 0.55) -> float:
+    eps = 1e-4
+    p_mod_clipped = np.clip(p_model, eps, 1.0 - eps)
+    p_mkt_clipped = np.clip(p_mkt, eps, 1.0 - eps)
+    lo_model = np.log(p_mod_clipped / (1.0 - p_mod_clipped))
+    lo_mkt = np.log(p_mkt_clipped / (1.0 - p_mkt_clipped))
+    blended_lo = ((1.0 - w_mkt) * lo_model) + (w_mkt * lo_mkt)
+    return float(1.0 / (1.0 + np.exp(-blended_lo)))
+
 def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max_score: int = 58) -> np.ndarray:
     pmf = np.zeros(max_score + 1, dtype=np.float64)
     if implied_points <= 2.0:
@@ -124,41 +144,32 @@ def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max
     ev_per_score = (rz_td_rate * 6.95) + ((1.0 - rz_td_rate) * 3.0)
     lambda_scores = max(0.6, implied_points / max(2.0, ev_per_score))
 
-    # Empirical NFL Scoring Event Simplex:
-    # 7-pt (TD + PAT): ~97.5% of touchdowns
-    # 6-pt (Missed PAT / Failed 2pt): ~1.5%
-    # 8-pt (Successful 2pt): ~1.0%
     p_td7 = rz_td_rate * 0.975
     p_td6 = rz_td_rate * 0.015
     p_td8 = rz_td_rate * 0.010
     p_fg3 = max(0.04, 1.0 - rz_td_rate - 0.005)
     p_safety2 = 0.005
 
+    single_drive = np.zeros(9, dtype=np.float64)
+    single_drive[2] = p_safety2
+    single_drive[3] = p_fg3
+    single_drive[6] = p_td6
+    single_drive[7] = p_td7
+    single_drive[8] = p_td8
+
+    drive_pmf = np.zeros(max_score + 1, dtype=np.float64)
+    drive_pmf[0] = 1.0
+
     for n_drives in range(11):
         prob_n = poisson.pmf(n_drives, lambda_scores)
-        if prob_n < 1e-6:
-            continue
-
-        drive_pmf = np.zeros(max_score + 1, dtype=np.float64)
-        drive_pmf[0] = 1.0
-
-        single_drive = np.zeros(9, dtype=np.float64)
-        single_drive[2] = p_safety2
-        single_drive[3] = p_fg3
-        single_drive[6] = p_td6
-        single_drive[7] = p_td7
-        single_drive[8] = p_td8
-
-        for _ in range(n_drives):
-            conv = np.convolve(drive_pmf, single_drive)
-            drive_pmf = conv[:max_score + 1]
-
-        pmf += prob_n * drive_pmf
+        if prob_n >= 1e-6:
+            pmf += prob_n * drive_pmf
+        drive_pmf = np.convolve(drive_pmf, single_drive)[:max_score + 1]
 
     total_mass = np.sum(pmf)
     if total_mass > 0:
         pmf /= total_mass
-    pmf[1] = 0.0  # Zero out unreachable score
+    pmf[1] = 0.0
     return pmf
 
 def project_dynamic_nfl_scores(
@@ -166,11 +177,7 @@ def project_dynamic_nfl_scores(
     total_line: float,
     home_rz_td_rate: float = 0.58,
     away_rz_td_rate: float = 0.52
-) -> Tuple[int, int, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Selects the joint Maximum A Posteriori (MAP) discrete score pair without sign-inversion traps.
-    Returns (pred_home, pred_away, joint_matrix, home_pmf, away_pmf).
-    """
+) -> Tuple[int, int, np.ndarray]:
     eff_margin = float(projected_margin)
     implied_home = max(6.0, (total_line + eff_margin) / 2.0)
     implied_away = max(6.0, (total_line - eff_margin) / 2.0)
@@ -179,7 +186,7 @@ def project_dynamic_nfl_scores(
     away_pmf = generate_team_score_pmf(implied_away, rz_td_rate=away_rz_td_rate)
 
     joint_matrix = np.outer(home_pmf, away_pmf)
-    np.fill_diagonal(joint_matrix, joint_matrix.diagonal() * 0.05)  # Suppress regular-season ties
+    np.fill_diagonal(joint_matrix, joint_matrix.diagonal() * 0.05)
 
     sum_joint = np.sum(joint_matrix)
     if sum_joint > 0:
@@ -210,76 +217,63 @@ def project_dynamic_nfl_scores(
             total_err = abs(score_total - total_line)
             key_log_bonus = KEY_MARGIN_LOG_PRIORS.get(score_margin, 0.0)
 
-            # Additive utility eliminates the negative multiplier trap
             utility = math.log(prob) - (margin_err * 0.22) - (total_err * 0.08) + key_log_bonus
 
             if utility > best_utility:
                 best_utility = utility
                 best_pair = (int(h), int(a))
 
-    return best_pair[0], best_pair[1], joint_matrix, home_pmf, away_pmf
+    return best_pair[0], best_pair[1], joint_matrix
 
-def calculate_calibrated_discrete_ats(
+def calculate_calibrated_discrete_ats_fast(
     joint_matrix: np.ndarray,
     canonical_spread: float
 ) -> Dict[str, float]:
-    """
-    Computes exact discrete ATS Cover, Push, and Edge metrics by summing
-    joint discrete scoring probabilities across the target margin hurdle.
-    """
-    target_hurdle = -float(canonical_spread)  # Home covers if (h - a) > target_hurdle
+    h_idx, a_idx = np.indices(joint_matrix.shape)
+    margins = h_idx - a_idx
+    target_hurdle = -float(canonical_spread)
 
-    p_home_cover = 0.0
-    p_push = 0.0
-    p_away_cover = 0.0
+    push_mask = np.isclose(margins, target_hurdle, atol=1e-5)
+    home_mask = margins > target_hurdle
+    away_mask = margins < target_hurdle
 
-    n_rows, n_cols = joint_matrix.shape
-    for h in range(n_rows):
-        for a in range(n_cols):
-            prob = joint_matrix[h, a]
-            actual_margin = h - a
-
-            if math.isclose(actual_margin, target_hurdle, abs_tol=1e-5):
-                p_push += prob
-            elif actual_margin > target_hurdle:
-                p_home_cover += prob
-            else:
-                p_away_cover += prob
+    p_push = float(joint_matrix[push_mask].sum())
+    p_home_cover = float(joint_matrix[home_mask].sum())
+    p_away_cover = float(joint_matrix[away_mask].sum())
 
     break_even = 0.5238
     home_net_edge = p_home_cover - break_even
     away_net_edge = p_away_cover - break_even
 
-    # Fractional Eighth-Kelly Sizing accounting for push probability
-    b = 0.90909  # 100/110 juice
+    b = 0.90909
     def calc_kelly(p_win: float) -> float:
         q = max(0.0, 1.0 - p_win - p_push)
         raw_kelly = ((b * p_win) - q) / b
         return round(max(0.0, min(2.0, raw_kelly * 0.125 * 100.0)), 2)
 
     if home_net_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) and home_net_edge > away_net_edge:
-        rec_team = "HOME"
+        rec_side = "HOME"
         cover_prob = p_home_cover
         final_edge = min(0.080, home_net_edge)
         stake_units = calc_kelly(p_home_cover)
     elif away_net_edge >= (MIN_BETTABLE_EDGE_PCT / 100.0) and away_net_edge > home_net_edge:
-        rec_team = "AWAY"
+        rec_side = "AWAY"
         cover_prob = p_away_cover
         final_edge = min(0.080, away_net_edge)
         stake_units = calc_kelly(p_away_cover)
     else:
-        rec_team = "PASS"
+        rec_side = "PASS"
         cover_prob = max(p_home_cover, p_away_cover)
         final_edge = max(home_net_edge, away_net_edge)
         stake_units = 0.0
 
     return {
-        "home_cover_prob": round(float(p_home_cover), 4),
-        "away_cover_prob": round(float(p_away_cover), 4),
-        "push_prob": round(float(p_push), 4),
-        "recommended_side": rec_team,
-        "spread_cover_prob": round(float(cover_prob), 4),
-        "spread_edge": round(float(final_edge), 4),
+        "home_cover_prob": round(p_home_cover, 4),
+        "away_cover_prob": round(p_away_cover, 4),
+        "push_prob": round(p_push, 4),
+        "recommended_side": rec_side,
+        "spread_cover_prob": round(cover_prob, 4),
+        "spread_edge": round(final_edge, 4),
         "kelly_units": float(stake_units)
     }
 
@@ -441,11 +435,12 @@ def generate_closed_loop_skill_projections(
     p_qb = calculate_lognormal_cover_probability(gross_pass_mean, synthesize_line("Pass Yds", "QB1", qb_pass), LOG_SIGMA["QB_Pass"])
     p_rb1 = calculate_lognormal_cover_probability(rush_means["RB1"], synthesize_line("Rush Yds", "RB1", rb1_rush), LOG_SIGMA["RB_Rush"])
     p_wr1 = calculate_lognormal_cover_probability(rec_means["WR1"], synthesize_line("Rec Yds", "WR1", wr1_rec), LOG_SIGMA["WR_Rec"])
+    p_wr2 = calculate_lognormal_cover_probability(rec_means["WR2"], synthesize_line("Rec Yds", "WR2", wr2_rec), LOG_SIGMA["WR_Rec"])
     p_te1 = calculate_lognormal_cover_probability(rec_means["TE1"], synthesize_line("Rec Yds", "TE1", te1_rec), LOG_SIGMA["TE_Rec"])
 
     return [
         build_entry("WR1", depth_names.get("WR1", f"{team_abbr} WR1"), "Rec Yds", wr1_rec, 0.0, 0.0, wr1_rec, team_pass_tds * 0.35, p_wr1),
-        build_entry("WR2", depth_names.get("WR2", f"{team_abbr} WR2"), "Rec Yds", wr2_rec, 0.0, 0.0, wr2_rec, team_pass_tds * 0.20, p_wr1),
+        build_entry("WR2", depth_names.get("WR2", f"{team_abbr} WR2"), "Rec Yds", wr2_rec, 0.0, 0.0, wr2_rec, team_pass_tds * 0.20, p_wr2),
         build_entry("TE1", depth_names.get("TE1", f"{team_abbr} TE1"), "Rec Yds", te1_rec, 0.0, 0.0, te1_rec, team_pass_tds * 0.25, p_te1),
         build_entry("RB1", depth_names.get("RB1", f"{team_abbr} RB1"), "Rush Yds", rb1_rush, 0.0, rb1_rush, rb1_rec, team_rush_tds * 0.65, p_rb1),
         build_entry("RB1_REC", f"{depth_names.get('RB1', 'RB1')} (Rec)", "Rec Yds", rb1_rec, 0.0, 0.0, rb1_rec, 0.0, p_rb1),
@@ -538,25 +533,14 @@ async def main():
         feature_row = pd.DataFrame([[feature_dict[f] for f in EXPECTED_FEATURES]], columns=EXPECTED_FEATURES)
         raw_prob = float(model.predict_proba(feature_row)[0][1])
 
-        if canonical_spread >= 3.0:
-            weight = 0.70 if abs(raw_prob - market_prob) > 0.25 else 0.50
-            calibrated_win_prob = (1.0 - weight) * max(raw_prob, 1.0 - raw_prob) + (weight * market_prob)
-        elif canonical_spread <= -3.0:
-            weight = 0.70 if abs(raw_prob - market_prob) > 0.25 else 0.50
-            calibrated_win_prob = (1.0 - weight) * min(raw_prob, 1.0 - raw_prob) + (weight * market_prob)
-        else:
-            calibrated_win_prob = (0.50 * raw_prob) + (0.50 * market_prob)
-
-        calibrated_win_prob = max(0.02, min(0.98, calibrated_win_prob))
+        calibrated_win_prob = blend_log_odds(raw_prob, market_prob, w_mkt=0.55)
         sigma = 13.45 * math.sqrt(max(32.0, raw_total) / 44.0)
         model_projected_margin = norm.ppf(calibrated_win_prob) * sigma
 
-        # Bivariate Score Simulation & PMF Extraction
-        pred_home, pred_away, joint_matrix, _, _ = project_dynamic_nfl_scores(model_projected_margin, raw_total)
+        pred_home, pred_away, joint_matrix = project_dynamic_nfl_scores(model_projected_margin, raw_total)
         pred_total = pred_home + pred_away
 
-        # Exact Discrete ATS Pricing
-        ats_metrics = calculate_calibrated_discrete_ats(joint_matrix, canonical_spread)
+        ats_metrics = calculate_calibrated_discrete_ats_fast(joint_matrix, canonical_spread)
         rec_side = ats_metrics["recommended_side"]
 
         if rec_side == "HOME":
@@ -593,7 +577,7 @@ async def main():
             "player_projections": {"home": home_skills, "away": away_skills}
         })
 
-    semaphore = asyncio.Semaphore(4)
+    semaphore = asyncio.Semaphore(5)
 
     async def generate_matchup_analysis(item):
         verdict_str = f"Bet {item['recommended_line']} - {item['kelly_units']:.2f}u" if item['recommended_team'] != "PASS" and item['kelly_units'] > 0.0 else "PASS - 0.00u"
@@ -602,46 +586,41 @@ SUBJECT: {item['matchup']} Quantitative Evaluation Week {item['week']}
 DOSSIER PAYLOAD:
 {json.dumps(item, indent=2)}
 
-Output strictly valid JSON:
-{{
-  "executive_summary": "Two-sentence strategic verdict detailing player matchups, trench leverage, and harmonized edge assessment.",
-  "schematic_matchup": {{
-    "away_offense_vs_home_defense": "Detailed film breakdown citing specific named players, pass protection, and coverage shells.",
-    "home_offense_vs_away_defense": "Detailed film breakdown citing specific named players, pass protection, and coverage shells."
-  }},
-  "actionable_verdict": "{verdict_str}"
-}}"""
+TASK:
+Provide an institutional film and sabermetric analysis detailing:
+1. Executive summary evaluating whether the line value represents actionable market inefficiency.
+2. Schematic breakdown for both offensive dropback scripts against opponent coverage shells.
+3. Actionable verdict string confirming: '{verdict_str}'."""
+
         async with semaphore:
             for attempt in range(3):
                 try:
-                    loop = asyncio.get_running_loop()
-                    response = await loop.run_in_executor(
-                        None,
-                        lambda: ai_client.models.generate_content(
-                            model="gemini-3.8-flash",
-                            contents=prompt,
-                            config=types.GenerateContentConfig(
-                                system_instruction=NFL_GURU_FULL_SYSTEM_PROMPT,
-                                temperature=0.15,
-                                response_mime_type="application/json"
-                            )
+                    response = await ai_client.aio.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            system_instruction=NFL_GURU_FULL_SYSTEM_PROMPT,
+                            temperature=0.15,
+                            response_mime_type="application/json",
+                            response_schema=MatchupDossier
                         )
                     )
                     parsed = json.loads(response.text)
-                    if parsed.get("executive_summary"):
-                        parsed["actionable_verdict"] = verdict_str
-                        return json.dumps(parsed)
-                except Exception:
+                    parsed["actionable_verdict"] = verdict_str
+                    return json.dumps(parsed)
+                except Exception as ex:
+                    logging.warning(f"Async LLM inference attempt {attempt+1} failed for {item['matchup']}: {ex}")
                     await asyncio.sleep(2 ** attempt)
 
-            return json.dumps({
-                "executive_summary": f"Line-of-scrimmage leverage on neutral downs establishes baseline edge on {item['matchup']}.",
-                "schematic_matchup": {
-                    "away_offense_vs_home_defense": f"{item['away_team']} must sustain early-down push to keep dropbacks on schedule.",
-                    "home_offense_vs_away_defense": f"{item['home_team']} attacks intermediate boundary voids against split-safety shells."
-                },
-                "actionable_verdict": verdict_str
-            })
+            fallback = MatchupDossier(
+                executive_summary=f"Line-of-scrimmage leverage on neutral downs establishes baseline edge on {item['matchup']}.",
+                schematic_matchup=SchematicMatchup(
+                    away_offense_vs_home_defense=f"{item['away_team']} must sustain early-down push to keep dropbacks on schedule.",
+                    home_offense_vs_away_defense=f"{item['home_team']} attacks intermediate boundary voids against split-safety shells."
+                ),
+                actionable_verdict=verdict_str
+            )
+            return fallback.model_dump_json()
 
     results = await asyncio.gather(*[generate_matchup_analysis(item) for item in pre_processed])
 
@@ -681,9 +660,16 @@ Output strictly valid JSON:
                 predicted_total_score INTEGER, analysis TEXT
             );
         """))
-        conn.execute(text("DELETE FROM nfl_weekly_analysis WHERE season = :s AND week = :w;"), {"s": target_season, "w": target_week})
+        conn.execute(
+            text("DELETE FROM nfl_weekly_analysis WHERE season = :s AND week = :w;"),
+            {"s": target_season, "w": target_week}
+        )
+        df_results.to_sql("nfl_weekly_analysis", conn, if_exists="append", index=False, method="multi")
 
-    df_results.to_sql("nfl_weekly_analysis", engine, if_exists="append", index=False, method="multi")
+    logging.info(f"Database successfully updated with Week {target_week} fixtures: {df_results['matchup'].tolist()}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
     logging.info(f"Database successfully updated with Week {target_week} fixtures: {df_results['matchup'].tolist()}")
 
 if __name__ == "__main__":
