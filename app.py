@@ -121,23 +121,22 @@ def simulate_fast_possession_scores(
     implied_h = max(6.0, (total_line + projected_margin) / 2.0)
     implied_a = max(6.0, (total_line - projected_margin) / 2.0)
 
-    # Dynamic Poisson-gamma variation across 11 possessions
-    lambda_h = implied_h / 11.0
-    lambda_a = implied_a / 11.0
+    # Dynamic possession expectation with turnover/short-field variance
+    lambda_h = implied_h / 11.5
+    lambda_a = implied_a / 11.5
 
     scores_h, scores_a = [], []
-    for _ in range(1500):
-        h_drives = rng.poisson(lambda_h, size=11)
-        a_drives = rng.poisson(lambda_a, size=11)
+    for _ in range(2000):
+        h_drives = rng.poisson(lambda_h, size=12)
+        a_drives = rng.poisson(lambda_a, size=12)
 
-        # Map drive successes to discrete football values (7, 3, 6, 8)
         def convert_drives(drives):
             pts = 0
             for d in drives:
                 if d >= 2:
                     pts += 7 if rng.random() < 0.94 else 6
                 elif d == 1:
-                    pts += 7 if rng.random() < 0.55 else 3
+                    pts += 7 if rng.random() < 0.58 else 3
             return pts
 
         tot_h = convert_drives(h_drives)
@@ -151,9 +150,16 @@ def simulate_fast_possession_scores(
         scores_h.append(tot_h)
         scores_a.append(tot_a)
 
-    pairs, counts = np.unique(np.column_stack((scores_h, scores_a)), axis=0, return_counts=True)
-    modal = pairs[np.argmax(counts)]
-    return int(modal[0]), int(modal[1])
+    pred_h = int(np.round(np.median(scores_h)))
+    pred_a = int(np.round(np.median(scores_a)))
+    
+    if pred_h == pred_a:
+        if projected_margin >= 0:
+            pred_h += 3
+        else:
+            pred_a += 3
+
+    return pred_h, pred_a
 
 @st.cache_data(ttl=300)
 def load_predictions_data(selected_week: Optional[int] = None) -> pd.DataFrame:
