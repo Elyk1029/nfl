@@ -1,23 +1,18 @@
 """
 team_ratings_engine.py - Excel-Integrated Database Overall & Roster Pipeline.
-Parses Madden_27_Secondary_Weighted_Rankings.xlsx for Database Overalls, unit ratings,
-and full player rosters to power the institutional terminal and AI research assistant.
+Sanitizes PostgreSQL dialect strings to psycopg2 and prevents eager top-level connection crashes.
 """
 
 import logging
 import os
+from typing import Optional
 import nflreadpy as nfl
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-DB_URL = os.environ.get("DATABASE_URL")
-if not DB_URL:
-    raise ValueError("FATAL: DATABASE_URL must be configured in environment.")
-
-engine = create_engine(DB_URL, pool_size=5, max_overflow=10, pool_pre_ping=True)
 
 TEAM_ABBR_MAP = {
     "LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"
@@ -39,11 +34,32 @@ SUMMARY_TEAM_TO_ABBR = {
 
 ALL_32_TEAMS = list(SUMMARY_TEAM_TO_ABBR.values())
 
+def sanitize_db_url(raw_url: str) -> str:
+    """
+    Normalizes Postgres URLs to use the psycopg2 driver explicitly.
+    Prevents ModuleNotFoundError: No module named 'psycopg'.
+    """
+    if not raw_url:
+        return ""
+    url = raw_url.strip()
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgresql://") and not url.startswith("postgresql+"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
+def get_engine(db_url: Optional[str] = None) -> Engine:
+    target_url = sanitize_db_url(db_url or os.environ.get("DATABASE_URL", ""))
+    if not target_url:
+        raise ValueError("FATAL: DATABASE_URL must be configured.")
+    return create_engine(target_url, pool_size=5, max_overflow=10, pool_pre_ping=True)
+
 def clean_team_abbr(t: str) -> str:
     c = str(t).strip().upper()
     return TEAM_ABBR_MAP.get(c, c)
 
-def init_ratings_schema(db_engine=engine) -> None:
+def init_ratings_schema(db_engine: Optional[Engine] = None) -> None:
+    eng = db_engine or get_engine()
     ddl = """
     CREATE TABLE IF NOT EXISTS nfl_team_ratings_comparison (
         team TEXT PRIMARY KEY,
@@ -82,17 +98,18 @@ def init_ratings_schema(db_engine=engine) -> None:
     CREATE INDEX IF NOT EXISTS idx_nfl_rosters_team 
     ON nfl_team_rosters (team);
     """
-    with db_engine.begin() as conn:
+    with eng.begin() as conn:
         conn.execute(text(ddl))
 
 class QuantitativeRatingsPipeline:
-    def __init__(self, season: int = 2026, excel_path: str = "Madden_27_Secondary_Weighted_Rankings.xlsx"):
+    def __init__(self, season: int = 2026, excel_path: str = "Madden_27_Secondary_Weighted_Rankings.xlsx", db_engine: Optional[Engine] = None):
         self.season = season
         self.excel_path = excel_path
+        self.engine = db_engine or get_engine()
         self.pbp_df = pd.DataFrame()
         self.summary_df = pd.DataFrame()
         self.roster_df = pd.DataFrame()
-        init_ratings_schema(engine)
+        init_ratings_schema(self.engine)
 
     def sync_data(self) -> None:
         logging.info("Syncing tracking data and parsing Secondary Weighted Rankings Excel file...")
@@ -151,7 +168,6 @@ class QuantitativeRatingsPipeline:
                 ~((clean.get("qtr", 1) == 4) & (clean.get("score_differential", 0).abs() >= 16))
             ].copy()
 
-        # Build summary lookup
         summary_map = {}
         if not self.summary_df.empty:
             for _, r in self.summary_df.iterrows():
@@ -185,7 +201,6 @@ class QuantitativeRatingsPipeline:
             q_sec = max(55.0, min(99.0, 75.0 - (def_drop_epa * 40.0)))
             q_overall = round(0.52 * q_off + 0.48 * q_def, 1)
 
-            # Get Database Overall from Excel Summary
             t_sum = summary_map.get(team, {"ovr": 80.0, "off": 80.0, "def": 80.0})
             m_ovr, m_off, m_def = t_sum["ovr"], t_sum["off"], t_sum["def"]
             m_pass_pro = round(m_off - 2.0, 1)
@@ -193,7 +208,6 @@ class QuantitativeRatingsPipeline:
             m_sec = round(m_def - 1.5, 1)
 
             discrepancy = round(q_overall - m_ovr, 1)
-
             if discrepancy >= 3.0:
                 signal = "🔥 High Quant Upside (Database Undervalued)"
             elif discrepancy <= -3.0:
@@ -204,7 +218,7 @@ class QuantitativeRatingsPipeline:
             records.append({
                 "team": team,
                 "model_q_ovr": q_overall,
-                "madden_ovr": m_ovr, # Renamed in UI to Database Overall
+                "madden_ovr": m_ovr,
                 "discrepancy": discrepancy,
                 "signal": signal,
                 "model_offense": round(q_off, 1),
@@ -226,17 +240,17 @@ class QuantitativeRatingsPipeline:
     def persist_to_database(self, df_ratings: pd.DataFrame) -> None:
         if df_ratings.empty:
             return
-        init_ratings_schema(engine)
-        with engine.begin() as conn:
+        init_ratings_schema(self.engine)
+        with self.engine.begin() as conn:
             conn.execute(text("TRUNCATE TABLE nfl_team_ratings_comparison RESTART IDENTITY CASCADE;"))
             conn.execute(text("TRUNCATE TABLE nfl_team_rosters RESTART IDENTITY CASCADE;"))
             
-        df_ratings.to_sql("nfl_team_ratings_comparison", engine, if_exists="append", index=False, method="multi")
+        df_ratings.to_sql("nfl_team_ratings_comparison", self.engine, if_exists="append", index=False, method="multi")
         if not self.roster_df.empty:
-            self.roster_df.to_sql("nfl_team_rosters", engine, if_exists="append", index=False, method="multi")
+            self.roster_df.to_sql("nfl_team_rosters", self.engine, if_exists="append", index=False, method="multi")
 
 if __name__ == "__main__":
-    pipeline = QuantitativeRatingsPipeline(season=2026, excel_path="Madden_27_Secondary_Weighted_Rankings.xlsx")
+    pipeline = QuantitativeRatingsPipeline(season=2026)
     pipeline.sync_data()
     df_eval = pipeline.calculate_q_ovr()
     pipeline.persist_to_database(df_eval)
