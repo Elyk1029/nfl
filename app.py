@@ -1,13 +1,6 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Research Director Workbench.
-
-Production UI Architecture:
-- Dynamic Temporal Slate Resolution: Locks automatically to active week post-Monday Night Football.
-- Tab 1: Weekly Board & Closed-Loop Sportsbook Skill Props (Dirichlet Simplex Conservation).
-- Tab 2: Market Steam & Sharp Line Movement Monitoring.
-- Tab 3: Strategic Research Director AI Workbench (Gemini 2.5 Flash via nfl_guru.py).
-- Tab 4: Airlocked Out-of-Sample Historical Simulation Engine (Discrete Bivariate Kernel).
-- Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab (Secondary-Weighted Ratings & Rosters).
+Synchronized to active NFL Week 3 with sanitized psycopg2 dialect resolution.
 """
 
 from datetime import datetime, timezone
@@ -25,11 +18,13 @@ from sqlalchemy import create_engine, text
 import streamlit as st
 
 from nfl_guru import NFL_GURU_FULL_SYSTEM_PROMPT
-from team_ratings_engine import QuantitativeRatingsPipeline, init_ratings_schema
+from team_ratings_engine import (
+    QuantitativeRatingsPipeline,
+    init_ratings_schema,
+    sanitize_db_url,
+    get_engine
+)
 
-# -------------------------------------------------------------------------
-# Page Configuration & UI Scaffolding
-# -------------------------------------------------------------------------
 st.set_page_config(
     page_title="NFL Quantitative Terminal | Institutional Research",
     page_icon="🏈",
@@ -88,9 +83,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# -------------------------------------------------------------------------
-# Environment & Credential Management
-# -------------------------------------------------------------------------
 def resolve_credential(key_name: str) -> str:
     try:
         if key_name in st.secrets and str(st.secrets[key_name]).strip():
@@ -100,12 +92,14 @@ def resolve_credential(key_name: str) -> str:
     val = os.environ.get(key_name)
     return str(val).strip() if val else ""
 
-DB_URL = resolve_credential("DATABASE_URL")
+RAW_DB_URL = resolve_credential("DATABASE_URL")
 GEMINI_KEY = resolve_credential("GEMINI_API_KEY")
 
-if not DB_URL or not GEMINI_KEY:
+if not RAW_DB_URL or not GEMINI_KEY:
     st.error("DATABASE_URL and GEMINI_API_KEY must be configured in environment or Streamlit secrets.")
     st.stop()
+
+SANID_DB_URL = sanitize_db_url(RAW_DB_URL)
 
 @st.cache_resource
 def get_db_engine(conn_string: str):
@@ -115,12 +109,9 @@ def get_db_engine(conn_string: str):
 def get_genai_client(api_key: str):
     return genai.Client(api_key=api_key)
 
-engine = get_db_engine(DB_URL)
+engine = get_db_engine(SANID_DB_URL)
 ai_client = get_genai_client(GEMINI_KEY)
 
-# -------------------------------------------------------------------------
-# Discrete Score Snapping & Simulation Engine
-# -------------------------------------------------------------------------
 KEY_MARGIN_LOG_PRIORS: Dict[int, float] = {
     3: 0.85, 7: 0.65, 6: 0.45, 10: 0.40, 4: 0.30, 14: 0.25, 1: 0.15, 2: 0.15
 }
@@ -213,9 +204,6 @@ def project_dynamic_nfl_scores(
 
     return best_pair[0], best_pair[1]
 
-# -------------------------------------------------------------------------
-# Data Layer & Cache Handlers
-# -------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def load_predictions_data(selected_week: Optional[int] = None) -> pd.DataFrame:
     if selected_week is not None:
@@ -275,15 +263,12 @@ def get_available_weeks() -> List[int]:
         with engine.connect() as conn:
             conn = conn.execution_options(isolation_level="AUTOCOMMIT")
             df = pd.read_sql(query, conn)
-            return df["week"].tolist() if not df.empty else [1]
+            return df["week"].tolist() if not df.empty else [3]
     except Exception:
-        return [1]
+        return [3]
 
 available_weeks = get_available_weeks()
 
-# -------------------------------------------------------------------------
-# Sidebar Configuration & Execution Parameters
-# -------------------------------------------------------------------------
 with st.sidebar:
     st.title("🏈 Quant Risk Controls")
     current_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -321,13 +306,12 @@ st.title("🏈 Institutional NFL Quantitative Terminal")
 st.caption("Spatiotemporal Film Breakdown | Discrete Key-Margin Snapping | Closed Dirichlet Simplex Props")
 
 if df_predictions.empty:
-    st.info("No active slate records found for the selected week. Run `update_nfl.py` to ingest upcoming fixtures.")
+    st.info("No active slate records found for the selected week. Run `python update_nfl.py` to ingest upcoming fixtures.")
     st.stop()
 
 active_season = int(df_predictions['season'].max())
 active_week = int(df_predictions['week'].max())
 
-# Metric Summary Bar
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 col_m1.metric("Fixtures Modeled", len(df_predictions))
 max_edge_record = df_predictions.loc[df_predictions["spread_edge"].abs().idxmax()]
@@ -337,7 +321,6 @@ col_m4.metric("Active Slate", f"Season {active_season} Week {active_week}")
 
 st.divider()
 
-# Navigation Tabs
 tab_slate, tab_steam, tab_guru, tab_sim, tab_ratings = st.tabs([
     "📊 Weekly Board & Closed Skill Props",
     "⚡ Market Steam & Consensus Deltas",
@@ -346,9 +329,6 @@ tab_slate, tab_steam, tab_guru, tab_sim, tab_ratings = st.tabs([
     "🎮 Model Q-OVR vs. Database Ratings Lab"
 ])
 
-# -------------------------------------------------------------------------
-# Tab 1: Weekly Board & Closed Skill Props
-# -------------------------------------------------------------------------
 with tab_slate:
     rendered_fixtures = 0
     for _, fixture in df_predictions.iterrows():
@@ -473,9 +453,6 @@ with tab_slate:
     if rendered_fixtures == 0:
         st.info("No fixtures meet the active net edge and stake criteria.")
 
-# -------------------------------------------------------------------------
-# Tab 2: Market Steam & Consensus Deltas
-# -------------------------------------------------------------------------
 with tab_steam:
     st.subheader("⚡ Line Movement & Market Steam Monitoring")
     st.caption("Evaluates divergence between Bayesian win probability and commercial moneyline consensus.")
@@ -511,9 +488,6 @@ with tab_steam:
         })
     st.dataframe(pd.DataFrame(steam_records), hide_index=True, use_container_width=True)
 
-# -------------------------------------------------------------------------
-# Tab 3: Strategic Guru Workbench
-# -------------------------------------------------------------------------
 with tab_guru:
     st.subheader(f"🧠 {guru_mode_selection}")
     target_subject = st.text_input("Evaluation Headline / Matchup / Scheme Subject:")
@@ -540,9 +514,6 @@ with tab_guru:
         else:
             st.warning("Please specify both a target subject and an input payload.")
 
-# -------------------------------------------------------------------------
-# Tab 4: Blind Historical Simulation
-# -------------------------------------------------------------------------
 with tab_sim:
     st.subheader("🧪 Blind Historical Simulation Engine")
     st.caption("Airlocked verification: Franchise tokens and actual outcomes are masked to validate quantitative calibration.")
@@ -612,9 +583,6 @@ with tab_sim:
             r1.metric("Outright Win Accuracy (SU)", f"{su_acc:.1f}%")
             r2.metric("Spread Cover Accuracy (ATS)", f"{ats_acc:.1f}%")
 
-# -------------------------------------------------------------------------
-# Tab 5: Model Q-OVR vs. Database Ratings & Roster Lab
-# -------------------------------------------------------------------------
 with tab_ratings:
     st.subheader("🎮 Model Q-OVR vs. Database Ratings & Roster Lab")
     st.caption(
@@ -635,7 +603,7 @@ with tab_ratings:
         if st.button("⚡ Compile & Hydrate Database & Rosters Now", type="primary", use_container_width=True):
             with st.spinner("Parsing Secondary Weighted Rankings spreadsheet and committing to database..."):
                 try:
-                    pipeline = QuantitativeRatingsPipeline(season=2026, excel_path="Madden_27_Secondary_Weighted_Rankings.xlsx")
+                    pipeline = QuantitativeRatingsPipeline(season=2026, excel_path="Madden_27_Secondary_Weighted_Rankings.xlsx", db_engine=engine)
                     pipeline.sync_data()
                     df_calculated = pipeline.calculate_q_ovr()
                     pipeline.persist_to_database(df_calculated)
