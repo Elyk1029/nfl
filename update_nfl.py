@@ -1,6 +1,6 @@
 """
 update_nfl.py - Autonomous Temporal Live Slate Ingestion & Execution Engine.
-Calibrated for Season 2026 Week 3.
+Calibrated for Dynamic Drive-Level Monte Carlo Scoring & Automated Active Week Ingestion.
 """
 
 import asyncio
@@ -18,7 +18,7 @@ import nflreadpy as nfl
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
-from scipy.stats import norm, poisson
+from scipy.stats import norm
 from sqlalchemy import create_engine, text
 import xgboost as xgb
 
@@ -56,10 +56,6 @@ else:
 
 TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA", "JAC": "JAX"}
 MIN_BETTABLE_EDGE_PCT = 1.8
-
-KEY_MARGIN_LOG_PRIORS: Dict[int, float] = {
-    3: 0.85, 7: 0.65, 6: 0.45, 10: 0.40, 4: 0.30, 14: 0.25, 1: 0.15, 2: 0.15
-}
 
 LOG_SIGMA = {
     "QB_Pass": 0.32, "QB_Rush": 0.52, "RB_Rush": 0.48,
@@ -102,8 +98,6 @@ def determine_active_nfl_week(schedules_df: pd.DataFrame) -> Tuple[int, int]:
             return pd.to_datetime(gameday).tz_localize("UTC")
 
     df_season["kickoff_utc"] = df_season.apply(parse_kickoff, axis=1)
-    
-    # Active games: games where kickoff + 4 hours has not passed
     active_unplayed = df_season[df_season["kickoff_utc"] + timedelta(hours=4) > now_utc]
 
     if not active_unplayed.empty:
@@ -132,113 +126,159 @@ def blend_log_odds(p_model: float, p_mkt: float, w_mkt: float = 0.55) -> float:
     blended_lo = ((1.0 - w_mkt) * lo_model) + (w_mkt * lo_mkt)
     return float(1.0 / (1.0 + np.exp(-blended_lo)))
 
-def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max_score: int = 58) -> np.ndarray:
-    pmf = np.zeros(max_score + 1, dtype=np.float64)
-    if implied_points <= 2.0:
-        pmf[0] = 0.60
-        pmf[2] = 0.10
-        pmf[3] = 0.30
-        return pmf
+def simulate_drive_outcome(
+    off_drop_epa: float,
+    def_drop_epa: float,
+    off_rush_epa: float,
+    def_rush_epa: float,
+    trench_pressure_delta: float,
+    rz_td_rate: float,
+    score_diff: int,
+    quarter: int,
+    clock_seconds_remaining: float,
+    rng: np.random.Generator
+) -> Tuple[int, float]:
+    pass_advantage = off_drop_epa - def_drop_epa
+    rush_advantage = off_rush_epa - def_rush_epa
+    net_efficiency = (0.60 * pass_advantage) + (0.40 * rush_advantage) - (0.25 * trench_pressure_delta)
 
-    ev_per_score = (rz_td_rate * 6.95) + ((1.0 - rz_td_rate) * 3.0)
-    lambda_scores = max(0.6, implied_points / max(2.0, ev_per_score))
+    base_turnover_prob = np.clip(0.11 + (0.08 * trench_pressure_delta) - (0.05 * pass_advantage), 0.03, 0.28)
+    base_score_territory_prob = np.clip(0.38 + (0.42 * net_efficiency), 0.15, 0.72)
 
-    p_td7 = rz_td_rate * 0.975
-    p_td6 = rz_td_rate * 0.015
-    p_td8 = rz_td_rate * 0.010
-    p_fg3 = max(0.04, 1.0 - rz_td_rate - 0.005)
-    p_safety2 = 0.005
+    if quarter == 4 and score_diff < 0:
+        base_score_territory_prob = np.clip(base_score_territory_prob + 0.08, 0.20, 0.80)
+        base_turnover_prob = np.clip(base_turnover_prob + 0.04, 0.05, 0.32)
 
-    single_drive = np.zeros(9, dtype=np.float64)
-    single_drive[2] = p_safety2
-    single_drive[3] = p_fg3
-    single_drive[6] = p_td6
-    single_drive[7] = p_td7
-    single_drive[8] = p_td8
+    roll = rng.random()
+    if roll < base_turnover_prob:
+        return 0, rng.uniform(45.0, 150.0)
+    if roll >= (base_turnover_prob + base_score_territory_prob):
+        return 0, rng.uniform(90.0, 210.0)
 
-    drive_pmf = np.zeros(max_score + 1, dtype=np.float64)
-    drive_pmf[0] = 1.0
+    drive_duration = rng.uniform(120.0, 310.0)
+    td_probability = np.clip(rz_td_rate + (0.20 * rush_advantage), 0.35, 0.80)
+    
+    if quarter == 4 and score_diff <= -9 and clock_seconds_remaining < 600.0:
+        td_probability = np.clip(td_probability + 0.15, 0.40, 0.88)
 
-    for n_drives in range(11):
-        prob_n = poisson.pmf(n_drives, lambda_scores)
-        if prob_n >= 1e-6:
-            pmf += prob_n * drive_pmf
-        drive_pmf = np.convolve(drive_pmf, single_drive)[:max_score + 1]
+    if rng.random() < td_probability:
+        go_for_two = False
+        if quarter == 4:
+            if score_diff + 6 in [-2, 0, 1]:
+                go_for_two = True
+            elif score_diff + 6 == -9 and clock_seconds_remaining < 300.0:
+                go_for_two = True
 
-    total_mass = np.sum(pmf)
-    if total_mass > 0:
-        pmf /= total_mass
-    pmf[1] = 0.0
-    return pmf
+        if go_for_two:
+            points = 8 if (rng.random() < 0.485) else 6
+        else:
+            points = 7 if (rng.random() < 0.955) else 6
+        return points, drive_duration
+    else:
+        if quarter == 4 and score_diff < -3 and clock_seconds_remaining < 180.0:
+            return (7, drive_duration + 30.0) if (rng.random() < 0.42) else (0, drive_duration)
+        return (3 if (rng.random() < 0.845) else 0), drive_duration
 
-def project_dynamic_nfl_scores(
-    projected_margin: float,
-    total_line: float,
-    home_rz_td_rate: float = 0.58,
-    away_rz_td_rate: float = 0.52
-) -> Tuple[int, int, np.ndarray]:
-    eff_margin = float(projected_margin)
-    implied_home = max(6.0, (total_line + eff_margin) / 2.0)
-    implied_away = max(6.0, (total_line - eff_margin) / 2.0)
+def execute_possession_matchup_sim(
+    home_drop_epa: float,
+    away_drop_epa: float,
+    home_def_drop_epa: float,
+    away_def_drop_epa: float,
+    home_rush_epa: float,
+    away_rush_epa: float,
+    home_def_rush_epa: float,
+    away_def_rush_epa: float,
+    home_prwr: float = 0.42,
+    away_prwr: float = 0.40,
+    home_pbwr: float = 0.60,
+    away_pbwr: float = 0.58,
+    home_rz_td: float = 0.58,
+    away_rz_td: float = 0.52,
+    home_pace_sec: float = 27.5,
+    away_pace_sec: float = 28.2,
+    num_simulations: int = 4000,
+    seed: int = 42
+) -> Dict[str, Any]:
+    rng = np.random.default_rng(seed)
+    home_scores = np.zeros(num_simulations, dtype=np.int32)
+    away_scores = np.zeros(num_simulations, dtype=np.int32)
 
-    home_pmf = generate_team_score_pmf(implied_home, rz_td_rate=home_rz_td_rate)
-    away_pmf = generate_team_score_pmf(implied_away, rz_td_rate=away_rz_td_rate)
+    home_trench_delta = float(home_prwr - away_pbwr)
+    away_trench_delta = float(away_prwr - home_pbwr)
 
-    joint_matrix = np.outer(home_pmf, away_pmf)
-    np.fill_diagonal(joint_matrix, joint_matrix.diagonal() * 0.05)
+    for i in range(num_simulations):
+        game_clock = 3600.0
+        h_pts, a_pts = 0, 0
+        possession = "HOME" if rng.random() < 0.50 else "AWAY"
 
-    sum_joint = np.sum(joint_matrix)
-    if sum_joint > 0:
-        joint_matrix /= sum_joint
+        while game_clock > 0:
+            quarter = 4 - int(game_clock // 900)
+            score_diff = (h_pts - a_pts) if possession == "HOME" else (a_pts - h_pts)
 
-    home_favored = eff_margin > 0.10
-    away_favored = eff_margin < -0.10
-    abs_margin = abs(eff_margin)
+            if possession == "HOME":
+                pts, duration = simulate_drive_outcome(
+                    home_drop_epa, away_def_drop_epa, home_rush_epa, away_def_rush_epa,
+                    away_trench_delta, home_rz_td, score_diff, quarter, game_clock, rng
+                )
+                h_pts += pts
+                pace = home_pace_sec
+                if quarter == 4 and score_diff < 0:
+                    pace = max(18.0, pace - 8.0)
+                elif quarter == 4 and score_diff > 0:
+                    pace = min(38.0, pace + 7.0)
+                possession = "AWAY"
+            else:
+                pts, duration = simulate_drive_outcome(
+                    away_drop_epa, home_def_drop_epa, away_rush_epa, home_def_rush_epa,
+                    home_trench_delta, away_rz_td, score_diff, quarter, game_clock, rng
+                )
+                a_pts += pts
+                pace = away_pace_sec
+                if quarter == 4 and score_diff < 0:
+                    pace = max(18.0, pace - 8.0)
+                elif quarter == 4 and score_diff > 0:
+                    pace = min(38.0, pace + 7.0)
+                possession = "HOME"
 
-    best_pair = (int(round(implied_home)), int(round(implied_away)))
-    best_utility = -1e9
+            game_clock -= (duration + pace)
 
-    for h in range(len(home_pmf)):
-        for a in range(len(away_pmf)):
-            prob = joint_matrix[h, a]
-            if prob < 1e-5:
-                continue
+        if h_pts == a_pts:
+            if rng.random() < 0.53:
+                h_pts += 3
+            else:
+                a_pts += 3
 
-            if home_favored and h <= a:
-                continue
-            if away_favored and a <= h:
-                continue
+        home_scores[i] = h_pts
+        away_scores[i] = a_pts
 
-            score_margin = abs(h - a)
-            score_total = h + a
+    margins = home_scores - away_scores
+    totals = home_scores + away_scores
+    unique_pairs, counts = np.unique(np.column_stack((home_scores, away_scores)), axis=0, return_counts=True)
+    modal_pair = unique_pairs[np.argmax(counts)]
 
-            margin_err = abs(score_margin - abs_margin)
-            total_err = abs(score_total - total_line)
-            key_log_bonus = KEY_MARGIN_LOG_PRIORS.get(score_margin, 0.0)
+    return {
+        "median_home_score": int(np.round(np.median(home_scores))),
+        "median_away_score": int(np.round(np.median(away_scores))),
+        "modal_home_score": int(modal_pair[0]),
+        "modal_away_score": int(modal_pair[1]),
+        "mean_margin": float(np.mean(margins)),
+        "mean_total": float(np.mean(totals)),
+        "home_win_prob": float(np.mean(margins > 0)),
+        "margins_raw": margins
+    }
 
-            utility = math.log(prob) - (margin_err * 0.22) - (total_err * 0.08) + key_log_bonus
-
-            if utility > best_utility:
-                best_utility = utility
-                best_pair = (int(h), int(a))
-
-    return best_pair[0], best_pair[1], joint_matrix
-
-def calculate_calibrated_discrete_ats_fast(
-    joint_matrix: np.ndarray,
+def compute_monte_carlo_ats_metrics(
+    margins: np.ndarray,
     canonical_spread: float
 ) -> Dict[str, float]:
-    h_idx, a_idx = np.indices(joint_matrix.shape)
-    margins = h_idx - a_idx
-    target_hurdle = -float(canonical_spread)
+    hurdle = -float(canonical_spread)
+    pushes = np.isclose(margins, hurdle, atol=1e-5)
+    home_covers = margins > hurdle
+    away_covers = margins < hurdle
 
-    push_mask = np.isclose(margins, target_hurdle, atol=1e-5)
-    home_mask = margins > target_hurdle
-    away_mask = margins < target_hurdle
-
-    p_push = float(joint_matrix[push_mask].sum())
-    p_home_cover = float(joint_matrix[home_mask].sum())
-    p_away_cover = float(joint_matrix[away_mask].sum())
+    p_push = float(np.mean(pushes))
+    p_home_cover = float(np.mean(home_covers))
+    p_away_cover = float(np.mean(away_covers))
 
     break_even = 0.5238
     home_net_edge = p_home_cover - break_even
@@ -339,10 +379,10 @@ def compute_opponent_adjusted_epa(pbp_df: pd.DataFrame) -> pd.DataFrame:
 def extract_empirical_team_pace(pbp_df: pd.DataFrame, team_abbr: str) -> Dict[str, float]:
     neutral_pbp = filter_neutral_game_states(pbp_df)
     if neutral_pbp.empty:
-        return {"neutral_plays": 63.5, "neutral_pass_rate": 0.56, "ypa": 7.10, "ypc": 4.20}
+        return {"neutral_plays": 63.5, "neutral_pass_rate": 0.56, "ypa": 7.10, "ypc": 4.20, "pace_sec": 27.5}
     t_pbp = neutral_pbp[neutral_pbp["posteam"] == team_abbr]
     if t_pbp.empty:
-        return {"neutral_plays": 63.5, "neutral_pass_rate": 0.56, "ypa": 7.10, "ypc": 4.20}
+        return {"neutral_plays": 63.5, "neutral_pass_rate": 0.56, "ypa": 7.10, "ypc": 4.20, "pace_sec": 27.5}
 
     recent = t_pbp[t_pbp["week"].isin(sorted(t_pbp["week"].unique())[-6:])]
     n_plays = len(recent)
@@ -353,7 +393,8 @@ def extract_empirical_team_pace(pbp_df: pd.DataFrame, team_abbr: str) -> Dict[st
         "neutral_plays": float(max(55.0, min(75.0, n_plays / max(1, recent["game_id"].nunique())))),
         "neutral_pass_rate": float(max(0.44, min(0.70, len(passes) / max(1, n_plays)))),
         "ypa": float(max(5.5, min(9.5, passes["yards_gained"].mean() if not passes.empty else 7.10))),
-        "ypc": float(max(3.2, min(5.8, runs["yards_gained"].mean() if not runs.empty else 4.20)))
+        "ypc": float(max(3.2, min(5.8, runs["yards_gained"].mean() if not runs.empty else 4.20))),
+        "pace_sec": float(max(22.0, min(33.0, 27.5)))
     }
 
 def generate_closed_loop_skill_projections(
@@ -509,10 +550,18 @@ async def main():
             val = row.sort_values(["season", "week"], ascending=[False, False]).iloc[0].get(col, 0.0)
             return float(val) if pd.notna(val) else 0.0
 
-        net_pass = (get_stat(home_team, "roll_off_dropback_epa") - get_stat(away_team, "roll_def_dropback_epa")) - \
-                   (get_stat(away_team, "roll_off_dropback_epa") - get_stat(home_team, "roll_def_dropback_epa"))
-        net_rush = (get_stat(home_team, "roll_off_rush_epa") - get_stat(away_team, "roll_def_rush_epa")) - \
-                   (get_stat(away_team, "roll_off_rush_epa") - get_stat(home_team, "roll_def_rush_epa"))
+        h_off_drop = get_stat(home_team, "roll_off_dropback_epa")
+        a_off_drop = get_stat(away_team, "roll_off_dropback_epa")
+        h_def_drop = get_stat(home_team, "roll_def_dropback_epa")
+        a_def_drop = get_stat(away_team, "roll_def_dropback_epa")
+
+        h_off_rush = get_stat(home_team, "roll_off_rush_epa")
+        a_off_rush = get_stat(away_team, "roll_off_rush_epa")
+        h_def_rush = get_stat(home_team, "roll_def_rush_epa")
+        a_def_rush = get_stat(away_team, "roll_def_rush_epa")
+
+        net_pass = (h_off_drop - a_def_drop) - (a_off_drop - h_def_drop)
+        net_rush = (h_off_rush - a_def_rush) - (a_off_rush - h_def_rush)
         net_late = (get_stat(home_team, "roll_off_late_down_epa") - get_stat(away_team, "roll_def_late_down_epa")) - \
                    (get_stat(away_team, "roll_off_late_down_epa") - get_stat(home_team, "roll_def_late_down_epa"))
 
@@ -533,13 +582,36 @@ async def main():
         raw_prob = float(model.predict_proba(feature_row)[0][1])
 
         calibrated_win_prob = blend_log_odds(raw_prob, market_prob, w_mkt=0.55)
-        sigma = 13.45 * math.sqrt(max(32.0, raw_total) / 44.0)
-        model_projected_margin = norm.ppf(calibrated_win_prob) * sigma
 
-        pred_home, pred_away, joint_matrix = project_dynamic_nfl_scores(model_projected_margin, raw_total)
+        h_pace = extract_empirical_team_pace(pbp, home_team)
+        a_pace = extract_empirical_team_pace(pbp, away_team)
+
+        sim_res = execute_possession_matchup_sim(
+            home_drop_epa=h_off_drop,
+            away_drop_epa=a_off_drop,
+            home_def_drop_epa=h_def_drop,
+            away_def_drop_epa=a_def_drop,
+            home_rush_epa=h_off_rush,
+            away_rush_epa=a_off_rush,
+            home_def_rush_epa=h_def_rush,
+            away_def_rush_epa=a_def_rush,
+            home_prwr=0.42,
+            away_prwr=0.40,
+            home_pbwr=0.60,
+            away_pbwr=0.58,
+            home_rz_td=0.58,
+            away_rz_td=0.52,
+            home_pace_sec=h_pace["pace_sec"],
+            away_pace_sec=a_pace["pace_sec"],
+            num_simulations=4000
+        )
+
+        pred_home = sim_res["modal_home_score"]
+        pred_away = sim_res["modal_away_score"]
         pred_total = pred_home + pred_away
+        model_projected_margin = sim_res["mean_margin"]
 
-        ats_metrics = calculate_calibrated_discrete_ats_fast(joint_matrix, canonical_spread)
+        ats_metrics = compute_monte_carlo_ats_metrics(sim_res["margins_raw"], canonical_spread)
         rec_side = ats_metrics["recommended_side"]
 
         if rec_side == "HOME":
