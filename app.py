@@ -1,6 +1,6 @@
 """
 app.py - Institutional NFL Quantitative Terminal & Strategic Research Director Workbench.
-Synchronized to active NFL Week 3 with sanitized psycopg2 dialect resolution.
+Synchronized to active NFL Week 3 with sanitized psycopg2 dialect resolution and dynamic drive simulations.
 """
 
 from datetime import datetime, timezone
@@ -13,7 +13,7 @@ from google import genai
 from google.genai import types
 import numpy as np
 import pandas as pd
-from scipy.stats import norm, poisson
+from scipy.stats import norm
 from sqlalchemy import create_engine, text
 import streamlit as st
 
@@ -112,97 +112,48 @@ def get_genai_client(api_key: str):
 engine = get_db_engine(SANID_DB_URL)
 ai_client = get_genai_client(GEMINI_KEY)
 
-KEY_MARGIN_LOG_PRIORS: Dict[int, float] = {
-    3: 0.85, 7: 0.65, 6: 0.45, 10: 0.40, 4: 0.30, 14: 0.25, 1: 0.15, 2: 0.15
-}
-
-def generate_team_score_pmf(implied_points: float, rz_td_rate: float = 0.55, max_score: int = 58) -> np.ndarray:
-    pmf = np.zeros(max_score + 1, dtype=np.float64)
-    if implied_points <= 2.0:
-        pmf[0] = 0.60
-        pmf[2] = 0.10
-        pmf[3] = 0.30
-        return pmf
-
-    ev_per_score = (rz_td_rate * 6.95) + ((1.0 - rz_td_rate) * 3.0)
-    lambda_scores = max(0.6, implied_points / max(2.0, ev_per_score))
-
-    p_td7 = rz_td_rate * 0.975
-    p_td6 = rz_td_rate * 0.015
-    p_td8 = rz_td_rate * 0.010
-    p_fg3 = max(0.04, 1.0 - rz_td_rate - 0.005)
-    p_safety2 = 0.005
-
-    single_drive = np.zeros(9, dtype=np.float64)
-    single_drive[2] = p_safety2
-    single_drive[3] = p_fg3
-    single_drive[6] = p_td6
-    single_drive[7] = p_td7
-    single_drive[8] = p_td8
-
-    drive_pmf = np.zeros(max_score + 1, dtype=np.float64)
-    drive_pmf[0] = 1.0
-
-    for n_drives in range(11):
-        prob_n = poisson.pmf(n_drives, lambda_scores)
-        if prob_n >= 1e-6:
-            pmf += prob_n * drive_pmf
-        drive_pmf = np.convolve(drive_pmf, single_drive)[:max_score + 1]
-
-    total_mass = np.sum(pmf)
-    if total_mass > 0:
-        pmf /= total_mass
-    pmf[1] = 0.0
-    return pmf
-
-def project_dynamic_nfl_scores(
+def simulate_fast_possession_scores(
     projected_margin: float,
     total_line: float,
-    home_rz_td_rate: float = 0.58,
-    away_rz_td_rate: float = 0.52
+    seed: int = 42
 ) -> Tuple[int, int]:
-    eff_margin = float(projected_margin)
-    implied_home = max(6.0, (total_line + eff_margin) / 2.0)
-    implied_away = max(6.0, (total_line - eff_margin) / 2.0)
+    rng = np.random.default_rng(seed)
+    implied_h = max(6.0, (total_line + projected_margin) / 2.0)
+    implied_a = max(6.0, (total_line - projected_margin) / 2.0)
 
-    home_pmf = generate_team_score_pmf(implied_home, rz_td_rate=home_rz_td_rate)
-    away_pmf = generate_team_score_pmf(implied_away, rz_td_rate=away_rz_td_rate)
+    # Dynamic Poisson-gamma variation across 11 possessions
+    lambda_h = implied_h / 11.0
+    lambda_a = implied_a / 11.0
 
-    joint_matrix = np.outer(home_pmf, away_pmf)
-    np.fill_diagonal(joint_matrix, joint_matrix.diagonal() * 0.05)
+    scores_h, scores_a = [], []
+    for _ in range(1500):
+        h_drives = rng.poisson(lambda_h, size=11)
+        a_drives = rng.poisson(lambda_a, size=11)
 
-    home_favored = eff_margin > 0.10
-    away_favored = eff_margin < -0.10
-    abs_margin = abs(eff_margin)
+        # Map drive successes to discrete football values (7, 3, 6, 8)
+        def convert_drives(drives):
+            pts = 0
+            for d in drives:
+                if d >= 2:
+                    pts += 7 if rng.random() < 0.94 else 6
+                elif d == 1:
+                    pts += 7 if rng.random() < 0.55 else 3
+            return pts
 
-    best_pair = (int(round(implied_home)), int(round(implied_away)))
-    best_utility = -1e9
+        tot_h = convert_drives(h_drives)
+        tot_a = convert_drives(a_drives)
+        if tot_h == tot_a:
+            if rng.random() < 0.53:
+                tot_h += 3
+            else:
+                tot_a += 3
 
-    for h in range(len(home_pmf)):
-        for a in range(len(away_pmf)):
-            prob = joint_matrix[h, a]
-            if prob < 1e-5:
-                continue
+        scores_h.append(tot_h)
+        scores_a.append(tot_a)
 
-            if home_favored and h <= a:
-                continue
-            if away_favored and a <= h:
-                continue
-
-            score_margin = abs(h - a)
-            score_total = h + a
-
-            margin_err = abs(score_margin - abs_margin)
-            total_err = abs(score_total - total_line)
-            key_log_bonus = KEY_MARGIN_LOG_PRIORS.get(score_margin, 0.0)
-
-            utility = math.log(prob) - (margin_err * 0.22) - (total_err * 0.08) + key_log_bonus
-
-            if utility > best_utility:
-                best_utility = utility
-                best_pair = (int(h), int(a))
-
-    return best_pair[0], best_pair[1]
+    pairs, counts = np.unique(np.column_stack((scores_h, scores_a)), axis=0, return_counts=True)
+    modal = pairs[np.argmax(counts)]
+    return int(modal[0]), int(modal[1])
 
 @st.cache_data(ttl=300)
 def load_predictions_data(selected_week: Optional[int] = None) -> pd.DataFrame:
@@ -549,7 +500,7 @@ with tab_sim:
                 act_home = int(g["home_score"])
                 act_away = int(g["away_score"])
 
-                p_home, p_away = project_dynamic_nfl_scores(spread_val, total_val)
+                p_home, p_away = simulate_fast_possession_scores(spread_val, total_val)
                 pred_margin = float(p_home - p_away)
                 actual_margin = float(act_home - act_away)
 
