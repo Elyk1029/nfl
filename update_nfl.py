@@ -126,58 +126,98 @@ def blend_log_odds(p_model: float, p_mkt: float, w_mkt: float = 0.55) -> float:
     blended_lo = ((1.0 - w_mkt) * lo_model) + (w_mkt * lo_mkt)
     return float(1.0 / (1.0 + np.exp(-blended_lo)))
 
-def simulate_drive_outcome(
+def simulate_possession_drive(
     off_drop_epa: float,
     def_drop_epa: float,
     off_rush_epa: float,
     def_rush_epa: float,
+    off_explosive_rate: float,
+    def_explosive_allowed: float,
     trench_pressure_delta: float,
     rz_td_rate: float,
+    starting_yardline: float,
     score_diff: int,
     quarter: int,
-    clock_seconds_remaining: float,
+    clock_seconds: float,
     rng: np.random.Generator
-) -> Tuple[int, float]:
-    pass_advantage = off_drop_epa - def_drop_epa
-    rush_advantage = off_rush_epa - def_rush_epa
-    net_efficiency = (0.60 * pass_advantage) + (0.40 * rush_advantage) - (0.25 * trench_pressure_delta)
-
-    base_turnover_prob = np.clip(0.11 + (0.08 * trench_pressure_delta) - (0.05 * pass_advantage), 0.03, 0.28)
-    base_score_territory_prob = np.clip(0.38 + (0.42 * net_efficiency), 0.15, 0.72)
-
-    if quarter == 4 and score_diff < 0:
-        base_score_territory_prob = np.clip(base_score_territory_prob + 0.08, 0.20, 0.80)
-        base_turnover_prob = np.clip(base_turnover_prob + 0.04, 0.05, 0.32)
-
-    roll = rng.random()
-    if roll < base_turnover_prob:
-        return 0, rng.uniform(45.0, 150.0)
-    if roll >= (base_turnover_prob + base_score_territory_prob):
-        return 0, rng.uniform(90.0, 210.0)
-
-    drive_duration = rng.uniform(120.0, 310.0)
-    td_probability = np.clip(rz_td_rate + (0.20 * rush_advantage), 0.35, 0.80)
+) -> Tuple[int, float, float]:
+    yards_to_goal = 100.0 - starting_yardline
+    pass_edge = off_drop_epa - def_drop_epa
+    rush_edge = off_rush_epa - def_rush_epa
+    net_efficiency = (0.65 * pass_edge) + (0.35 * rush_edge) - (0.30 * trench_pressure_delta)
     
-    if quarter == 4 and score_diff <= -9 and clock_seconds_remaining < 600.0:
-        td_probability = np.clip(td_probability + 0.15, 0.40, 0.88)
+    net_explosive = np.clip(off_explosive_rate + (def_explosive_allowed - 0.12), 0.05, 0.25)
+    turnover_prob = np.clip(0.10 + (0.09 * trench_pressure_delta) - (0.04 * pass_edge), 0.02, 0.24)
+    
+    if rng.random() < turnover_prob:
+        duration = rng.uniform(30.0, 110.0)
+        end_pos = np.clip(starting_yardline + rng.normal(12.0, 8.0), 5.0, 95.0)
+        return 0, duration, end_pos
 
-    if rng.random() < td_probability:
-        go_for_two = False
-        if quarter == 4:
-            if score_diff + 6 in [-2, 0, 1]:
-                go_for_two = True
-            elif score_diff + 6 == -9 and clock_seconds_remaining < 300.0:
-                go_for_two = True
+    if rng.random() < net_explosive:
+        chunk_yards = rng.uniform(25.0, 75.0)
+        yards_to_goal -= chunk_yards
+        if yards_to_goal <= 0:
+            duration = rng.uniform(20.0, 65.0)
+            pat = 7 if (rng.random() < 0.95) else 6
+            return pat, duration, 25.0
 
-        if go_for_two:
-            points = 8 if (rng.random() < 0.485) else 6
+    down_conversion_prob = np.clip(0.44 + (0.35 * net_efficiency), 0.20, 0.72)
+    if quarter == 4 and score_diff < 0:
+        down_conversion_prob = np.clip(down_conversion_prob + 0.07, 0.25, 0.78)
+
+    accumulated_yards = 0.0
+    drive_plays = 0
+    max_series = 6
+    
+    for series in range(max_series):
+        drive_plays += rng.integers(3, 5)
+        if rng.random() < down_conversion_prob:
+            gain = rng.uniform(10.0, 22.0)
+            accumulated_yards += gain
+            yards_to_goal -= gain
+            if yards_to_goal <= 20.0:
+                break
         else:
-            points = 7 if (rng.random() < 0.955) else 6
-        return points, drive_duration
-    else:
-        if quarter == 4 and score_diff < -3 and clock_seconds_remaining < 180.0:
-            return (7, drive_duration + 30.0) if (rng.random() < 0.42) else (0, drive_duration)
-        return (3 if (rng.random() < 0.845) else 0), drive_duration
+            break
+
+    duration = np.clip(drive_plays * rng.uniform(24.0, 38.0), 45.0, 360.0)
+    final_yardline = 100.0 - yards_to_goal
+
+    if yards_to_goal <= 20.0:
+        effective_td_rate = np.clip(rz_td_rate + (0.18 * rush_edge), 0.38, 0.78)
+        if rng.random() < effective_td_rate:
+            go_for_two = False
+            if quarter == 4:
+                if score_diff + 6 in [-2, 0, 1]:
+                    go_for_two = True
+                elif score_diff + 6 == -9 and clock_seconds < 300.0:
+                    go_for_two = True
+
+            if go_for_two:
+                pts = 8 if (rng.random() < 0.485) else 6
+            else:
+                pts = 7 if (rng.random() < 0.955) else 6
+            return pts, duration, 25.0
+        else:
+            if quarter == 4 and score_diff < -3 and clock_seconds < 180.0:
+                td_gamble = rng.random() < 0.40
+                return (7 if td_gamble else 0), duration, 25.0
+            return 3, duration, 25.0
+
+    elif yards_to_goal <= 38.0:
+        fg_distance = yards_to_goal + 17.0
+        fg_prob = np.clip(0.92 - (fg_distance - 35.0) * 0.022, 0.40, 0.88)
+        if quarter == 4 and score_diff < -3 and clock_seconds < 180.0:
+            return 0, duration, final_yardline
+        if rng.random() < fg_prob:
+            return 3, duration, 25.0
+        else:
+            return 0, duration, final_yardline
+
+    net_punt = rng.normal(41.5, 6.0)
+    opp_field_pos = np.clip(final_yardline + net_punt, 1.0, 80.0)
+    return 0, duration, 100.0 - opp_field_pos
 
 def execute_possession_matchup_sim(
     home_drop_epa: float,
@@ -188,6 +228,10 @@ def execute_possession_matchup_sim(
     away_rush_epa: float,
     home_def_rush_epa: float,
     away_def_rush_epa: float,
+    home_explosive: float = 0.12,
+    away_explosive: float = 0.11,
+    home_def_explosive: float = 0.11,
+    away_def_explosive: float = 0.12,
     home_prwr: float = 0.42,
     away_prwr: float = 0.40,
     home_pbwr: float = 0.60,
@@ -196,7 +240,7 @@ def execute_possession_matchup_sim(
     away_rz_td: float = 0.52,
     home_pace_sec: float = 27.5,
     away_pace_sec: float = 28.2,
-    num_simulations: int = 4000,
+    num_simulations: int = 5000,
     seed: int = 42
 ) -> Dict[str, Any]:
     rng = np.random.default_rng(seed)
@@ -209,6 +253,7 @@ def execute_possession_matchup_sim(
     for i in range(num_simulations):
         game_clock = 3600.0
         h_pts, a_pts = 0, 0
+        curr_field_pos = 25.0
         possession = "HOME" if rng.random() < 0.50 else "AWAY"
 
         while game_clock > 0:
@@ -216,29 +261,30 @@ def execute_possession_matchup_sim(
             score_diff = (h_pts - a_pts) if possession == "HOME" else (a_pts - h_pts)
 
             if possession == "HOME":
-                pts, duration = simulate_drive_outcome(
+                pts, duration, next_field_pos = simulate_possession_drive(
                     home_drop_epa, away_def_drop_epa, home_rush_epa, away_def_rush_epa,
-                    away_trench_delta, home_rz_td, score_diff, quarter, game_clock, rng
+                    home_explosive, away_def_explosive, away_trench_delta, home_rz_td,
+                    curr_field_pos, score_diff, quarter, game_clock, rng
                 )
                 h_pts += pts
-                pace = home_pace_sec
-                if quarter == 4 and score_diff < 0:
-                    pace = max(18.0, pace - 8.0)
-                elif quarter == 4 and score_diff > 0:
-                    pace = min(38.0, pace + 7.0)
                 possession = "AWAY"
+                curr_field_pos = next_field_pos
+                pace = home_pace_sec
             else:
-                pts, duration = simulate_drive_outcome(
+                pts, duration, next_field_pos = simulate_possession_drive(
                     away_drop_epa, home_def_drop_epa, away_rush_epa, home_def_rush_epa,
-                    home_trench_delta, away_rz_td, score_diff, quarter, game_clock, rng
+                    away_explosive, home_def_explosive, home_trench_delta, away_rz_td,
+                    curr_field_pos, score_diff, quarter, game_clock, rng
                 )
                 a_pts += pts
-                pace = away_pace_sec
-                if quarter == 4 and score_diff < 0:
-                    pace = max(18.0, pace - 8.0)
-                elif quarter == 4 and score_diff > 0:
-                    pace = min(38.0, pace + 7.0)
                 possession = "HOME"
+                curr_field_pos = next_field_pos
+                pace = away_pace_sec
+
+            if quarter == 4 and score_diff < 0:
+                pace = max(18.0, pace - 8.0)
+            elif quarter == 4 and score_diff > 0:
+                pace = min(38.0, pace + 7.0)
 
             game_clock -= (duration + pace)
 
@@ -253,14 +299,19 @@ def execute_possession_matchup_sim(
 
     margins = home_scores - away_scores
     totals = home_scores + away_scores
-    unique_pairs, counts = np.unique(np.column_stack((home_scores, away_scores)), axis=0, return_counts=True)
-    modal_pair = unique_pairs[np.argmax(counts)]
+
+    pred_home = int(np.round(np.median(home_scores)))
+    pred_away = int(np.round(np.median(away_scores)))
+    
+    if pred_home == pred_away:
+        if np.mean(margins) >= 0:
+            pred_home += 3
+        else:
+            pred_away += 3
 
     return {
-        "median_home_score": int(np.round(np.median(home_scores))),
-        "median_away_score": int(np.round(np.median(away_scores))),
-        "modal_home_score": int(modal_pair[0]),
-        "modal_away_score": int(modal_pair[1]),
+        "predicted_home_score": pred_home,
+        "predicted_away_score": pred_away,
         "mean_margin": float(np.mean(margins)),
         "mean_total": float(np.mean(totals)),
         "home_win_prob": float(np.mean(margins > 0)),
@@ -365,13 +416,14 @@ def compute_opponent_adjusted_epa(pbp_df: pd.DataFrame) -> pd.DataFrame:
         def_rush_epa=("epa", lambda x: x[neutral_pbp.loc[x.index, "play_type"] == "run"].mean()),
         def_early_down_success=("success", lambda x: x[neutral_pbp.loc[x.index, "is_early_down"] == 1].mean()),
         def_late_down_epa=("epa", lambda x: x[neutral_pbp.loc[x.index, "is_late_down"] == 1].mean()),
+        def_explosive=("is_explosive", "mean"),
     ).reset_index().rename(columns={"defteam": "team"})
 
     merged = pd.merge(off_stats, def_stats, on=["season", "week", "team"], how="outer").fillna(0)
     merged.sort_values(["team", "season", "week"], inplace=True)
     for col in [
         "off_dropback_epa", "off_rush_epa", "off_early_down_success", "off_late_down_epa", "off_explosive",
-        "def_dropback_epa", "def_rush_epa", "def_early_down_success", "def_late_down_epa"
+        "def_dropback_epa", "def_rush_epa", "def_early_down_success", "def_late_down_epa", "def_explosive"
     ]:
         merged[f"roll_{col}"] = merged.groupby("team")[col].transform(lambda x: x.shift(1).ewm(span=6, min_periods=1).mean())
     return merged
@@ -560,13 +612,18 @@ async def main():
         h_def_rush = get_stat(home_team, "roll_def_rush_epa")
         a_def_rush = get_stat(away_team, "roll_def_rush_epa")
 
+        h_off_expl = get_stat(home_team, "roll_off_explosive") or 0.12
+        a_off_expl = get_stat(away_team, "roll_off_explosive") or 0.11
+        h_def_expl = get_stat(home_team, "roll_def_explosive") or 0.11
+        a_def_expl = get_stat(away_team, "roll_def_explosive") or 0.12
+
         net_pass = (h_off_drop - a_def_drop) - (a_off_drop - h_def_drop)
         net_rush = (h_off_rush - a_def_rush) - (a_off_rush - h_def_rush)
         net_late = (get_stat(home_team, "roll_off_late_down_epa") - get_stat(away_team, "roll_def_late_down_epa")) - \
                    (get_stat(away_team, "roll_off_late_down_epa") - get_stat(home_team, "roll_def_late_down_epa"))
 
         diff_succ = get_stat(home_team, "roll_off_early_down_success") - get_stat(away_team, "roll_off_early_down_success")
-        diff_expl = get_stat(home_team, "roll_off_explosive") - get_stat(away_team, "roll_off_explosive")
+        diff_expl = h_off_expl - a_off_expl
         rest_diff = float(game.get("home_rest", 7.0) or 7.0) - float(game.get("away_rest", 7.0) or 7.0)
         is_div = int(game.get("div_game", 0) or 0)
 
@@ -595,6 +652,10 @@ async def main():
             away_rush_epa=a_off_rush,
             home_def_rush_epa=h_def_rush,
             away_def_rush_epa=a_def_rush,
+            home_explosive=h_off_expl,
+            away_explosive=a_off_expl,
+            home_def_explosive=h_def_expl,
+            away_def_explosive=a_def_expl,
             home_prwr=0.42,
             away_prwr=0.40,
             home_pbwr=0.60,
@@ -603,11 +664,11 @@ async def main():
             away_rz_td=0.52,
             home_pace_sec=h_pace["pace_sec"],
             away_pace_sec=a_pace["pace_sec"],
-            num_simulations=4000
+            num_simulations=5000
         )
 
-        pred_home = sim_res["modal_home_score"]
-        pred_away = sim_res["modal_away_score"]
+        pred_home = sim_res["predicted_home_score"]
+        pred_away = sim_res["predicted_away_score"]
         pred_total = pred_home + pred_away
         model_projected_margin = sim_res["mean_margin"]
 
