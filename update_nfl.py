@@ -1,13 +1,6 @@
 """
 update_nfl.py - Autonomous Temporal Live Slate Ingestion & Execution Engine.
-Features:
-- Dynamic UTC calendar resolution to advance NFL weeks automatically.
-- Log-odds Bayesian shrinkage pooling for market and model win probabilities.
-- Vectorized bivariate discrete Poisson score convolution with additive log-priors.
-- Pure NumPy vectorized ATS cover, push, and Eighth-Kelly sizing.
-- Closed-loop Dirichlet skill projections with independent log-normal survival functions.
-- Native asynchronous Google GenAI SDK (client.aio) with strict Pydantic response schemas.
-- Scoped atomic PostgreSQL transactions with zero scope leakages.
+Calibrated for Season 2026 Week 3.
 """
 
 import asyncio
@@ -33,12 +26,23 @@ from nfl_guru import NFL_GURU_FULL_SYSTEM_PROMPT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-DB_URL = os.environ.get("DATABASE_URL")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+def sanitize_db_url(raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    url = raw_url.strip()
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+    elif url.startswith("postgresql://") and not url.startswith("postgresql+"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
 
-if not DB_URL or not GEMINI_KEY:
+RAW_DB_URL = os.environ.get("DATABASE_URL", "")
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+if not RAW_DB_URL or not GEMINI_KEY:
     raise ValueError("FATAL: DATABASE_URL and GEMINI_API_KEY must be configured in environment.")
 
+DB_URL = sanitize_db_url(RAW_DB_URL)
 engine = create_engine(DB_URL, pool_size=5, max_overflow=10, pool_pre_ping=True)
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
@@ -54,14 +58,7 @@ TEAM_ABBR_MAP = {"LAR": "LA", "WSH": "WAS", "OAK": "LV", "SD": "LAC", "STL": "LA
 MIN_BETTABLE_EDGE_PCT = 1.8
 
 KEY_MARGIN_LOG_PRIORS: Dict[int, float] = {
-    3: 0.85,
-    7: 0.65,
-    6: 0.45,
-    10: 0.40,
-    4: 0.30,
-    14: 0.25,
-    1: 0.15,
-    2: 0.15,
+    3: 0.85, 7: 0.65, 6: 0.45, 10: 0.40, 4: 0.30, 14: 0.25, 1: 0.15, 2: 0.15
 }
 
 LOG_SIGMA = {
@@ -90,13 +87,13 @@ def determine_active_nfl_week(schedules_df: pd.DataFrame) -> Tuple[int, int]:
 
     df_season = schedules_df[schedules_df["season"] == target_season].copy()
     if df_season.empty:
-        return target_season, 1
+        return target_season, 3
 
     def parse_kickoff(row):
         gameday = str(row.get("gameday", "")).strip()
         gametime = str(row.get("gametime", "13:00")).strip()
         if not gameday or gameday == "None":
-            return datetime(target_season, 9, 1, tzinfo=timezone.utc)
+            return datetime(target_season, 9, 27, tzinfo=timezone.utc)
         try:
             time_str = f"{gameday} {gametime}"
             dt_naive = pd.to_datetime(time_str)
@@ -105,15 +102,17 @@ def determine_active_nfl_week(schedules_df: pd.DataFrame) -> Tuple[int, int]:
             return pd.to_datetime(gameday).tz_localize("UTC")
 
     df_season["kickoff_utc"] = df_season.apply(parse_kickoff, axis=1)
-    future_or_active_games = df_season[df_season["kickoff_utc"] + timedelta(hours=4) > now_utc]
+    
+    # Active games: kickoff + 4 hours has not passed
+    active_unplayed = df_season[df_season["kickoff_utc"] + timedelta(hours=4) > now_utc]
 
-    if not future_or_active_games.empty:
-        active_week = int(future_or_active_games["week"].min())
+    if not active_unplayed.empty:
+        active_week = int(active_unplayed["week"].min())
     else:
         unplayed = df_season[df_season["result"].isna()]
-        active_week = int(unplayed["week"].min()) if not unplayed.empty else 18
+        active_week = int(unplayed["week"].min()) if not unplayed.empty else 3
 
-    logging.info(f"Temporal calibration: Current UTC {now_utc.isoformat()} -> Active NFL Week: {active_week}")
+    logging.info(f"Temporal calibration: Current UTC {now_utc.isoformat()} -> Target Active NFL Week: {active_week}")
     return target_season, active_week
 
 def resolve_directional_market_context(total_line: float, spread_line: float) -> Tuple[float, float, float, float]:
