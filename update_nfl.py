@@ -103,7 +103,7 @@ def determine_active_nfl_week(schedules_df: pd.DataFrame) -> Tuple[int, int]:
 
     df_season["kickoff_utc"] = df_season.apply(parse_kickoff, axis=1)
     
-    # Active games: kickoff + 4 hours has not passed
+    # Active games: games where kickoff + 4 hours has not passed
     active_unplayed = df_season[df_season["kickoff_utc"] + timedelta(hours=4) > now_utc]
 
     if not active_unplayed.empty:
